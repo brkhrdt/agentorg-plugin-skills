@@ -4,8 +4,13 @@ import { homedir } from "node:os";
 import { join, resolve, parse, sep } from "node:path";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
 import { parse as yaml } from "yaml";
-import type { PluginHost, ServerPlugin, SkillsChange } from "agent-organization/plugin";
-import type { AgentRecord, Settings, SkillStates } from "agent-organization/types";
+import type { ServerPlugin, MutationChange } from "agent-organization/plugin";
+import type { AgentRecord, Settings } from "agent-organization/types";
+import { z } from "zod";
+import { isDeepStrictEqual } from "node:util";
+export const skillStatesSchema = z.record(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64), z.enum(["unavailable", "available", "installed"]));
+export type SkillStates = z.infer<typeof skillStatesSchema>;
+export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
 import { git } from "./git.ts";
 
 export interface Skill { name: string; gitUrl: string; description: string; createdAt: string; path: string }
@@ -160,12 +165,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       dropJournal(journal.id);
     }
-    async function prepare(settings: Settings, agent: Readonly<AgentRecord>, context: { caller: { kind: string; id: string }; selectionSupplied: boolean; creating: boolean }): Promise<SkillsChange> {
-      for (const name of Object.keys(settings.skills ?? {})) skill(name);
+    async function prepare(settings: Settings, agent: Readonly<AgentRecord>, context: { caller: { kind: string; id: string }; selectionSupplied: boolean; creating: boolean }): Promise<MutationChange> {
+      for (const name of Object.keys(states(settings) ?? {})) skill(name);
       if (context.selectionSupplied && context.caller.kind === "agent") {
         const parent = await host.request("agent.get", { agentId: context.caller.id }, server) as AgentRecord;
-        for (const [name] of selected(settings.skills)) {
-          if (!["available", "installed"].includes(parent.settings.skills?.[name] ?? "unavailable"))
+        for (const [name] of selected(states(settings))) {
+          if (!["available", "installed"].includes(states(parent.settings)?.[name] ?? "unavailable"))
             fail(`Caller cannot delegate ${name}`, "FORBIDDEN");
         }
       }
@@ -177,7 +182,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       try {
         const active = installations().filter(i => i.agentId === agent.id && i.status === "active");
         for (const i of active) {
-          if (settings.skills?.[i.skill] === "installed" && i.path === join(installRoot(cwd), i.skill)) {
+          if (states(settings)?.[i.skill] === "installed" && i.path === join(installRoot(cwd), i.skill)) {
             await own(i); await metadata(i.path, i.skill); continue;
           }
           await own(i);
@@ -185,7 +190,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           journal.actions.push({ generation: i.generation, from: i.path, to, old: true });
           put("journal", journal.id, journal);
         }
-        for (const [name, state] of selected(settings.skills)) {
+        for (const [name, state] of selected(states(settings))) {
           if (state !== "installed") continue;
           const dest = join(installRoot(cwd), name);
           if (active.some(i => i.skill === name && i.path === dest && !journal.actions.some(a => a.generation === i.generation))) continue;
@@ -219,12 +224,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       };
     }
     async function launchPaths(agent: Readonly<AgentRecord>) {
-      if (selected(agent.settings.skills).some(([, state]) => state === "installed")) {
+      if (selected(states(agent.settings)).some(([, state]) => state === "installed")) {
         await privateDirectory(join(agent.settings.cwd!, ".agents"));
         await privateDirectory(installRoot(agent.settings.cwd!));
       }
       const result: string[] = [];
-      for (const [name, state] of selected(agent.settings.skills)) {
+      for (const [name, state] of selected(states(agent.settings))) {
         skill(name);
         if (state !== "installed") continue;
         const path = join(installRoot(agent.settings.cwd!), name);
@@ -235,10 +240,71 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       return result;
     }
-    host.registerSkills({
-      prepare: (settings, agent, context) => exclusive(() => prepare(settings, agent, context)),
-      launchPaths: agent => exclusive(() => launchPaths(agent)),
-      reconcile: agents => exclusive(async () => {
+    host.registerSettings({
+      namespace: "skills",
+      validate(value) {
+        const parsed = skillStatesSchema.parse(value);
+        for (const name of Object.keys(parsed)) skill(name);
+        return parsed;
+      },
+      launchKey: value => selected(value as SkillStates).filter(([, state]) => state === "installed").map(([name]) => name).sort(),
+      migrate(settings) {
+        if (!Object.hasOwn(settings, "skills")) return settings;
+        const legacy = skillStatesSchema.parse(settings.skills);
+        const extensions = { ...(settings.extensions as Record<string, unknown> ?? {}) };
+        if (Object.hasOwn(extensions, "skills") && !isDeepStrictEqual(skillStatesSchema.parse(extensions.skills), legacy))
+          fail("Ambiguous legacy and namespaced skill selections; resolve both explicitly", "MIGRATION_CONFLICT");
+        const { skills: _legacy, ...rest } = settings;
+        return { ...rest, extensions: { ...extensions, skills: legacy } };
+      },
+    });
+    host.registerCapability("skills", { settingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add" }, version: 1 });
+    async function uniqueCwd(settings: Settings, agent: Readonly<AgentRecord>, agents: Readonly<AgentRecord>[]) {
+      const cwd = await realpath(settings.cwd ?? process.cwd());
+      if (!(await lstat(cwd)).isDirectory()) fail("cwd must be a directory");
+      for (const other of agents) {
+        if (other.id === agent.id || other.removedAt) continue;
+        if (await realpath(other.settings.cwd ?? process.cwd()).catch(() => null) === cwd)
+          fail(`cwd already belongs to ${other.id}`, "CWD_CONFLICT");
+      }
+      return { ...settings, cwd };
+    }
+    host.beforeMutation(async context => {
+      if (!["agent.create", "agent.modify"].includes(context.method)) return;
+      const settings = await uniqueCwd(context.agent.settings, context.agent, context.agents);
+      const selectionSupplied = context.settingsPatch?.extensions?.skills !== undefined;
+      // Build grants before staging so validation failures do not leave an unowned journal.
+      const updates: NonNullable<MutationChange["updates"]> = [];
+      if (selectionSupplied && context.caller.kind === "client") {
+        let parentId = context.agent.parentId;
+        while (parentId) {
+          const parent = context.agents.find(a => a.id === parentId)!;
+          const skills = { ...states(parent.settings) };
+          let changed = false;
+          for (const [name] of selected(states(settings))) {
+            if (!["available", "installed"].includes(skills[name] ?? "unavailable")) { skills[name] = "available"; changed = true; }
+          }
+          if (changed) updates.push({ agentId: parent.id, expectedRevision: parent.revision, settings: { ...parent.settings, extensions: { ...parent.settings.extensions, skills } } });
+          parentId = parent.parentId;
+        }
+      }
+      const change = await exclusive(() => prepare(settings, context.previous ?? context.agent, { caller: context.caller, selectionSupplied, creating: context.method === "agent.create" }));
+      return { ...change, settings, updates };
+    });
+    host.prepareLaunch(async context => {
+      const snapshot = await host.request("organization.snapshot", {}, server) as { agents: AgentRecord[] };
+      await uniqueCwd(context.agent.settings, context.agent, snapshot.agents);
+      context.env.AGENTORG_SKILL_FILES = JSON.stringify(await exclusive(() => launchPaths(context.agent)));
+    });
+    host.validateLaunch(async (spec, { agent }) => {
+      if (selected(states(agent.settings)).some(([, state]) => state === "installed") && !spec.consumesEnv?.includes("AGENTORG_SKILL_FILES"))
+        fail("Harness does not consume explicit managed skill files", "SKILL_NOT_READY");
+      if (spec.env?.AGENTORG_SKILL_FILES !== JSON.stringify(await exclusive(() => launchPaths(agent))))
+        fail("Explicit managed launch files were changed by another plugin", "SKILL_NOT_READY");
+      if (await realpath(spec.cwd!) !== await realpath(agent.settings.cwd ?? process.cwd()))
+        fail("Harness cwd must match the managed workspace", "CWD_CONFLICT");
+    });
+    host.onInitialize(agents => exclusive(async () => {
         for (const j of rows<Journal>("journal")) {
           if (j.path) {
             report(new Error(`Interrupted catalog clone retained at ${j.path}; not registered`));
@@ -284,8 +350,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
             }
           }
         }
-      }),
-    });
+      }));
     function clientOnly(caller: { kind: string }) { if (caller.kind !== "client") fail("Catalog endpoints are client-only", "FORBIDDEN"); }
     host.registerEndpoint("skills.list", (_params, caller) => { clientOnly(caller); return { skills: catalog(), recovery: installations().filter(i => i.pending).map(i => ({ agentId: i.agentId, skill: i.skill, path: i.path, error: i.error })) }; });
     host.registerEndpoint("skills.add", (params, caller) => exclusive(async () => {
@@ -313,14 +378,15 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         return record;
       } catch (error) { report(new Error(`Catalog add failed; any partial checkout retained at ${path}: ${(error as Error).message}`)); throw error; }
     }));
-    host.registerTool({ name: "skills_list", description: "List catalog and your skill states. Only available/installed skills may be delegated; children default to no selections. settings.skills explicitly replaces all states.", inputSchema: { type: "object", additionalProperties: false }, async execute(_args, caller) {
+    host.registerTool({ name: "skills_list", description: "List catalog and your skill states. Only available/installed skills may be delegated; children default to no selections. settings.extensions.skills explicitly replaces all states.", inputSchema: { type: "object", additionalProperties: false }, async execute(_args, caller) {
       const agent = await host.request("agent.get", { agentId: caller.id }, caller) as AgentRecord;
-      return { skills: catalog().map(s => ({ ...s, state: Object.hasOwn(agent.settings.skills ?? {}, s.name) ? agent.settings.skills![s.name] : "unavailable" })) };
+      return { skills: catalog().map(s => ({ ...s, state: Object.hasOwn(states(agent.settings) ?? {}, s.name) ? states(agent.settings)![s.name] : "unavailable" })) };
     } });
     for (const name of ["child_create", "descendant_modify"]) host.transformTool(name, tool => {
       const properties = { ...tool.inputSchema.properties };
       const settings = properties.settings as { properties?: Record<string, unknown> };
-      properties.settings = { ...settings, properties: { ...settings.properties, skills: { type: "object", additionalProperties: { type: "string", enum: ["unavailable", "available", "installed"] }, description: "Complete replacement selection; omitted on modify leaves unchanged. Only your available/installed skills can be delegated." } } };
+      const extensions = (settings.properties?.extensions ?? { type: "object" }) as { properties?: Record<string, unknown> };
+      properties.settings = { ...settings, properties: { ...settings.properties, extensions: { ...extensions, properties: { ...extensions.properties, skills: { type: "object", additionalProperties: { type: "string", enum: ["unavailable", "available", "installed"] }, description: "Complete replacement selection; omitted on modify leaves unchanged. Only your available/installed skills can be delegated." } } } } };
       return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
     });
     host.onEvent(event => {

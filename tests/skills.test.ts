@@ -9,7 +9,7 @@ import { OrganizationClient } from "../../agentorg/src/client.ts";
 import { cwdPlugin } from "../../agentorg/src/plugins/cwd.ts";
 import type { ServerPlugin } from "../../agentorg/src/plugin.ts";
 import type { AgentRecord, Operation } from "../../agentorg/src/types.ts";
-import { createSkillsPlugin, installRoot, type Skill } from "../src/index.ts";
+import { createSkillsPlugin, installRoot, states, type Skill } from "../src/index.ts";
 import { git } from "../src/git.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
@@ -22,8 +22,8 @@ async function fixture(order = false) {
   const paths = new Map<string, string[]>();
   const harness: ServerPlugin = { apiVersion: 1, name: "fixture", setup(host) {
     host.registerHarness({ name: "fixture", launch(ctx) {
-      paths.set(ctx.agent.id, ctx.skillPaths ?? []);
-      return { command: process.execPath, args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")] };
+      paths.set(ctx.agent.id, JSON.parse(ctx.env.AGENTORG_SKILL_FILES ?? "[]"));
+      return { consumesEnv: ["AGENTORG_SKILL_FILES"], command: process.execPath, args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")] };
     } });
   } };
   const plugin = () => createSkillsPlugin({ home: dir, allowLocalSources: true });
@@ -36,7 +36,7 @@ async function fixture(order = false) {
     const accepted = caller ? await server.organization.request(method, params, caller) as Operation : await client.request<Operation>(method, params);
     return client.wait(accepted);
   };
-  const create = (parentId: string | null, cwd: string, skills?: Record<string, string>, caller?: any) => run("agent.create", { parentId, settings: { harness: "fixture", model: "test", cwd, ...(skills === undefined ? {} : { skills }) } }, caller);
+  const create = (parentId: string | null, cwd: string, skills?: Record<string, string>, caller?: any) => run("agent.create", { parentId, settings: { harness: "fixture", model: "test", cwd, ...(skills === undefined ? {} : { extensions: { skills } }) } }, caller);
   const root = (await create(null, workspace)).result as AgentRecord;
   async function add(name = "alpha", invalid = false) {
     const repo = join(dir, "source-" + name);
@@ -62,7 +62,7 @@ test("catalog validation, duplicate/source policy, durable catalog and scoped ca
   const f = await fixture();
   const skill = await f.add();
   expect(skill.description).toBe("alpha fixture");
-  expect((await f.client.request<any>("organization.snapshot")).capabilities.skills).toBe(true);
+  expect((await f.client.request<any>("organization.snapshot")).capabilities.plugins.skills.settingsNamespace).toBe("skills");
   await expect(f.client.request("skills.add", { name: "alpha", gitUrl: skill.gitUrl })).rejects.toThrow("already registered");
   for (const [name, gitUrl] of [["../escape", skill.gitUrl], ["bad", "https://localhost/x/y"], ["bad", "ssh://github.com/x/y"], ["bad", "https://github.com/x/y?branch=main"], ["bad", "https://u:p@github.com/x/y"]])
     await expect(f.client.request("skills.add", { name, gitUrl })).rejects.toThrow();
@@ -78,37 +78,37 @@ test("public grants, complete replacement, omission, persisted installed states 
   const leaf = (await f.create(child.id, "leaf", { alpha: "installed", beta: "available" })).result as AgentRecord;
   expect(f.paths.get(leaf.id)).toEqual([join(installRoot(leaf.settings.cwd!), "alpha/SKILL.md")]);
   for (const id of [f.root.id, child.id]) {
-    expect((await f.client.request<AgentRecord>("agent.get", { agentId: id })).settings.skills).toEqual({ alpha: "available", beta: "available" });
+    expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: id })).settings)).toEqual({ alpha: "available", beta: "available" });
   }
   expect(await readFile(join(installRoot(leaf.settings.cwd!), "alpha/SKILL.md"), "utf8")).toContain("Instructions");
   const omitted = await f.run("agent.modify", { agentId: leaf.id, name: "renamed" });
-  expect((omitted.result as AgentRecord).settings.skills).toEqual({ alpha: "installed", beta: "available" });
+  expect(states((omitted.result as AgentRecord).settings)).toEqual({ alpha: "installed", beta: "available" });
   await f.restart();
-  expect((await f.client.request<AgentRecord>("agent.get", { agentId: leaf.id })).settings.skills?.alpha).toBe("installed");
-  const empty = await f.run("agent.modify", { agentId: leaf.id, settings: { skills: {} } });
+  expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: leaf.id })).settings)?.alpha).toBe("installed");
+  const empty = await f.run("agent.modify", { agentId: leaf.id, settings: { extensions: { skills: {} } } });
   expect(empty.status).toBe("completed");
   expect(await readdir(installRoot(leaf.settings.cwd!))).toEqual([]);
-  expect((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings.skills?.alpha).toBe("available");
+  expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings)?.alpha).toBe("available");
 });
 
 test("MCP delegation is checked inside queue, transforms compose in either plugin order, omitted selections aren't regrants", async () => {
   const f = await fixture(true); await f.add(); await f.add("beta"); await f.add("constructor");
-  await f.run("agent.modify", { agentId: f.root.id, settings: { skills: { alpha: "available" } } });
+  await f.run("agent.modify", { agentId: f.root.id, settings: { extensions: { skills: { alpha: "available" } } } });
   const caller = { kind: "agent", id: f.root.id } as const;
   const tools = await f.server.organization.request("mcp.list", {}, caller) as any;
-  expect(tools.tools.find((t: any) => t.name === "child_create").inputSchema.properties.settings.properties.skills).toBeDefined();
+  expect(tools.tools.find((t: any) => t.name === "child_create").inputSchema.properties.settings.properties.extensions.properties.skills).toBeDefined();
   expect(tools.tools.find((t: any) => t.name === "child_create").inputSchema.required).toContain("cwd");
-  const mcp = await f.server.organization.request("mcp.call", { name: "child_create", arguments: { cwd: "child", settings: { harness: "fixture", model: "test", skills: { alpha: "installed" } } } }, caller) as any;
+  const mcp = await f.server.organization.request("mcp.call", { name: "child_create", arguments: { cwd: "child", settings: { harness: "fixture", model: "test", extensions: { skills: { alpha: "installed" } } } } }, caller) as any;
   const op = await f.client.wait(JSON.parse(mcp.content[0].text));
   expect(op.status).toBe("completed"); const child = op.result as AgentRecord;
-  const denied = await f.run("agent.modify", { agentId: child.id, settings: { skills: { beta: "available" } } }, caller);
+  const denied = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { beta: "available" } } } }, caller);
   expect(denied.error?.code).toBe("FORBIDDEN");
-  expect((await f.run("agent.modify", { agentId: child.id, settings: { skills: { constructor: "available" } } }, caller)).error?.code).toBe("FORBIDDEN");
-  await f.run("agent.modify", { agentId: child.id, settings: { skills: { alpha: "installed", constructor: "available" } } });
-  expect(Object.entries((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings.skills ?? {})).toContainEqual(["constructor", "available"]);
-  await f.run("agent.modify", { agentId: f.root.id, settings: { skills: {} } });
+  expect((await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { constructor: "available" } } } }, caller)).error?.code).toBe("FORBIDDEN");
+  await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "installed", constructor: "available" } } } });
+  expect(Object.entries(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings) ?? {})).toContainEqual(["constructor", "available"]);
+  await f.run("agent.modify", { agentId: f.root.id, settings: { extensions: { skills: {} } } });
   expect((await f.run("agent.modify", { agentId: child.id, name: "unchanged-skills" }, caller)).status).toBe("completed");
-  expect((await f.run("agent.modify", { agentId: child.id, settings: { skills: { alpha: "installed" } } }, caller)).error?.code).toBe("FORBIDDEN");
+  expect((await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "installed" } } } }, caller)).error?.code).toBe("FORBIDDEN");
   const list = await f.server.organization.request("mcp.call", { name: "skills_list", arguments: {} }, caller) as any;
   expect(JSON.parse(list.content[0].text).skills[0].state).toBe("unavailable");
 });
@@ -119,7 +119,7 @@ test("canonical cwd uniqueness includes stopped agents, symlink aliases, launche
   await f.run("agent.stop", { agentId: child.id });
   await symlink(join(f.workspace, "child"), join(f.workspace, "alias"));
   expect((await f.create(f.root.id, "alias")).error?.code).toBe("CWD_CONFLICT");
-  expect((await f.run("agent.modify", { agentId: child.id, settings: { skills: { missing: "unavailable" } } })).error?.code).toBe("INVALID_PARAMS");
+  expect((await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { missing: "unavailable" } } } })).error?.code).toBe("INVALID_PARAMS");
   const other = (await f.create(f.root.id, "other")).result as AgentRecord;
   expect((await f.run("agent.modify", { agentId: other.id, settings: { cwd: "alias" } })).error?.code).toBe("CWD_CONFLICT");
 });
@@ -144,8 +144,8 @@ test("dirty checkout preservation, committed recovery refs, cwd change and every
   const tracked = await Promise.all(generations.map(g => readFile(join(recovery, scope, g, "SKILL.md"), "utf8").catch(() => "")));
   expect(tracked).toContain("dirty tracked instructions");
   const newCwd = (moved.result as AgentRecord).settings.cwd!;
-  await f.run("agent.modify", { agentId: child.id, settings: { skills: {} } });
-  await f.run("agent.modify", { agentId: child.id, settings: { skills: { alpha: "installed" } } });
+  await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: {} } } });
+  await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "installed" } } } });
   expect((await git(s.path, "remote")).split("\n").filter(r => r.startsWith("agent-")).length).toBe(3);
   await f.run("agent.remove", { agentId: child.id });
   await f.restart(); // drains asynchronous removal recovery and retries after restart
@@ -157,10 +157,10 @@ test("collision and staged failure compensate without changing settings or ances
   const child = (await f.create(f.root.id, "child")).result as AgentRecord;
   await mkdir(join(installRoot(child.settings.cwd!), "alpha"));
   await writeFile(join(installRoot(child.settings.cwd!), "alpha/keep"), "unrelated");
-  const op = await f.run("agent.modify", { agentId: child.id, settings: { skills: { alpha: "installed" } } });
+  const op = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "installed" } } } });
   expect(op.error?.code).toBe("COLLISION");
   expect((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).revision).toBe(child.revision);
-  expect((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings.skills).toBeUndefined();
+  expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings)).toBeUndefined();
   expect(await readFile(join(installRoot(child.settings.cwd!), "alpha/keep"), "utf8")).toBe("unrelated");
 });
 
@@ -174,10 +174,10 @@ test("post-staging collision compensates, retains staged clone and preserves rec
       sabotaged = true; mkdirSync(destination); writeFileSync(join(destination, "keep"), "collision");
     }
   });
-  const op = await f.run("agent.modify", { agentId: child.id, settings: { skills: { alpha: "installed" } } });
+  const op = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "installed" } } } });
   expect(op.status).toBe("failed");
   expect((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).revision).toBe(child.revision);
-  expect((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings.skills).toBeUndefined();
+  expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings)).toBeUndefined();
   expect(await readFile(join(destination, "keep"), "utf8")).toBe("collision");
   const recovery = join(child.settings.cwd!, ".agents/agentorg-recovery");
   const scopes = await readdir(recovery);
@@ -209,9 +209,9 @@ test("disabled plugin preserves selections and rejects launches, damaged reposit
   const f = await fixture(); await f.add();
   const child = (await f.create(f.root.id, "child", { alpha: "installed" })).result as AgentRecord;
   await f.restart(false);
-  expect((await f.client.request<any>("organization.snapshot")).capabilities.skills).toBe(false);
+  expect((await f.client.request<any>("organization.snapshot")).capabilities.plugins.skills).toBeUndefined();
   expect((await f.run("agent.restart", { agentId: child.id })).error?.message).toContain("Enable the skills plugin");
-  expect((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).settings.skills?.alpha).toBe("installed");
+  expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).settings)?.alpha).toBe("installed");
   await rename(join(installRoot(child.settings.cwd!), "alpha"), join(child.settings.cwd!, "saved"));
   await f.restart();
   expect((await f.run("agent.restart", { agentId: child.id })).status).toBe("failed");
@@ -235,4 +235,75 @@ test("durable interrupted move journal is compensated at startup without losing 
   await f.restart();
   expect(await readFile(join(path, "dirty"), "utf8")).toBe("preserve me");
   expect((await f.run("agent.restart", { agentId: child.id })).status).toBe("completed");
+});
+
+test("legacy selections survive disabled launch and migrate without changing journal revision fences", async () => {
+  const f = await fixture(); const s = await f.add();
+  const child = (await f.create(f.root.id, "child", { alpha: "installed" })).result as AgentRecord;
+  await f.run("agent.stop", { agentId: child.id });
+  const legacy = structuredClone(f.server.organization.agents.get(child.id)!);
+  const { extensions, ...builtin } = legacy.settings;
+  (legacy as any).settings = { ...builtin, skills: extensions!.skills };
+  f.server.organization.agents.set(child.id, legacy);
+  f.server.organization.store.saveAgent(legacy);
+  await f.restart(false);
+  expect((await f.client.request<any>("agent.get", { agentId: child.id })).settings.skills).toEqual({ alpha: "installed" });
+  expect((await f.run("agent.restart", { agentId: child.id })).status).toBe("failed");
+  // Interrupted move expects the *next* user revision. Migration must not make it committed.
+  const path = join(installRoot(child.settings.cwd!), "alpha");
+  await writeFile(join(path, "dirty"), "migration preserves dirty files");
+  const db = new Database(join(s.path, "../skills.sqlite"));
+  const i = JSON.parse((db.query("SELECT data FROM installations").get() as any).data);
+  const to = join(child.settings.cwd!, ".agents/agentorg-recovery/migration-interrupted");
+  db.query("INSERT INTO journal VALUES (?,?)").run("migration", JSON.stringify({ id: "migration", agentId: child.id, revision: child.revision + 1, actions: [{ generation: i.generation, from: path, to, old: true }] }));
+  db.close(); await rename(path, to);
+  await f.restart();
+  const migrated = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
+  expect(states(migrated.settings)).toEqual({ alpha: "installed" });
+  expect(Object.hasOwn(migrated.settings, "skills")).toBe(false);
+  expect(migrated.revision).toBe(child.revision);
+  expect(await readFile(join(path, "dirty"), "utf8")).toBe("migration preserves dirty files");
+  expect((await f.run("agent.restart", { agentId: child.id })).status).toBe("completed");
+});
+
+test("ambiguous migration aborts startup atomically without losing either selection", async () => {
+  const f = await fixture(); await f.add();
+  await f.run("agent.stop", { agentId: f.root.id });
+  const row = structuredClone(f.server.organization.agents.get(f.root.id)!);
+  (row.settings as any).skills = { alpha: "installed" };
+  row.settings.extensions = { skills: { alpha: "available" } };
+  f.server.organization.agents.set(row.id, row); f.server.organization.store.saveAgent(row);
+  await expect(f.restart()).rejects.toThrow("Ambiguous");
+  const db = new Database(join(f.dir, "data/organization.sqlite"));
+  const persisted = JSON.parse((db.query("SELECT data FROM agents WHERE id=?").get(row.id) as any).data);
+  expect(persisted.settings).toEqual(row.settings);
+  db.close();
+});
+
+test("installed ancestor states survive grants, SQLite failure compensates staged plugin work", async () => {
+  const f = await fixture(); await f.add(); await f.add("beta");
+  await f.run("agent.modify", { agentId: f.root.id, settings: { extensions: { skills: { alpha: "installed" } } } });
+  const child = (await f.create(f.root.id, "child")).result as AgentRecord;
+  const root = await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id });
+  f.server.organization.store.db.exec(`CREATE TRIGGER reject_grant BEFORE INSERT ON agents WHEN NEW.id='${root.id}' BEGIN SELECT RAISE(ABORT, 'grant failure'); END;`);
+  const failed = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { beta: "installed" } } } });
+  expect(failed.status).toBe("failed");
+  expect((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).revision).toBe(child.revision);
+  expect(await readdir(installRoot(child.settings.cwd!))).toEqual([]);
+  f.server.organization.store.db.exec("DROP TRIGGER reject_grant");
+  expect((await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "available", beta: "installed" } } } })).status).toBe("completed");
+  expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: root.id })).settings)).toEqual({ alpha: "installed", beta: "available" });
+});
+
+test("unsupported harness and overwritten generic resources fail closed after preserving committed selections", async () => {
+  const f = await fixture(); await f.add();
+  f.server.organization.registerHarness({ name: "unsupported", launch: () => ({ command: process.execPath, args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")] }) });
+  const unsupported = await f.run("agent.create", { parentId: f.root.id, settings: { harness: "unsupported", model: "test", cwd: "child", extensions: { skills: { alpha: "installed" } } } });
+  expect(unsupported.error?.code).toBe("SKILL_NOT_READY");
+  const record = (await f.client.request<any>("organization.snapshot")).agents.find((a: AgentRecord) => a.parentId === f.root.id) as AgentRecord;
+  expect(states(record.settings)?.alpha).toBe("installed");
+  expect(await readFile(join(installRoot(record.settings.cwd!), "alpha/SKILL.md"), "utf8")).toContain("Instructions");
+  f.server.organization.prepareLaunch(context => { context.env.AGENTORG_SKILL_FILES = "[]"; });
+  const tampered = await f.create(f.root.id, "other", { alpha: "installed" });
+  expect(tampered.error?.code).toBe("SKILL_NOT_READY");
 });

@@ -28,7 +28,7 @@ test.skipIf(!process.env.ORG_BINARY)("compiled host loads the separate skills mo
       try { snapshot = await client.request("organization.snapshot"); break; }
       catch (error: any) { if (error.code !== "NOT_READY") throw error; await Bun.sleep(20); }
     }
-    expect(snapshot.capabilities.skills).toBe(true);
+    expect(snapshot.capabilities.plugins.skills.settingsNamespace).toBe("skills");
     expect(await client.request<{ skills: unknown[]; recovery: unknown[] }>("skills.list")).toEqual({ skills: [], recovery: [] });
     try {
       await client.request("skills.add", { name: "bad", gitUrl: "ssh://localhost/skill" });

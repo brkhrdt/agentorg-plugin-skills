@@ -6,6 +6,7 @@
       "name": "@agentorg/plugin-skills",
       "dependencies": {
         "yaml": "^2.8.0",
+        "zod": "^4.1.5",
       },
       "devDependencies": {
         "@types/bun": "^1.3.0",

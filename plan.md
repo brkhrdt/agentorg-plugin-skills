@@ -4,7 +4,7 @@
 
 Create a trusted `@agentorg/plugin-skills` API-v1 server plugin, loaded by AgentOrg through `--plugin`, that manages an organization-wide catalog of Git-backed skills and each agent's skill state. Skills live in the server-side catalog and persistence database; agent skill selections persist with their agent records. The plugin exposes skills to public clients and agents, and augments agent creation/modification MCP tools. It is a separately loadable plugin, not a new service or harness.
 
-Implementation is now in `src/index.ts`; see `README.md` for the shipped contract, source policy, storage scope, recovery behavior and limitations. The original design below is retained for context. Core provides the narrow `registerSkills` lifecycle contract and `settings.skills`; the TUI discovers `snapshot.capabilities.skills`.
+Implementation is now in `src/index.ts`; see `README.md` for the shipped contract, source policy, storage scope, recovery behavior and limitations. The original design below is retained for context. The shipped implementation now uses core's generic namespaced settings, lifecycle transactions, launch environment and capability discovery. The plugin owns `settings.extensions.skills` and its migration from legacy records. The older design below is historical, not the current host contract.
 
 ## Current project integration points
 

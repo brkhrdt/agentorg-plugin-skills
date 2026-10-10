@@ -1,6 +1,6 @@
 # @agentorg/plugin-skills
 
-Trusted, separately loadable AgentOrg API-v1 plugin. Requires Bun, Git and the additive skills host contract in this checkout. Pi 1.0.2+ supports explicit `--skill` with ambient discovery disabled.
+Trusted, separately loadable AgentOrg API-v1 plugin. Requires Bun, Git and the generic API-v1 extension contract in this checkout. Pi 1.0.2+ supports explicit `--skill` with ambient discovery disabled.
 
 ```sh
 cd agentorg-plugin-skills && bun install --frozen-lockfile
@@ -11,7 +11,7 @@ bun start --plugin ../agentorg-plugin-pi-agent/src/index.ts --plugin ../agentorg
 bun start --plugin ../agentorg-plugin-pi-agent/src/index.ts --plugin ./src/plugins/cwd.ts --plugin ../agentorg-plugin-skills/src/index.ts
 ```
 
-The plugin has no runtime dependency on core internals; core imports are type-only. For a compiled AgentOrg binary, run `bun run build` here and load `--plugin /absolute/path/dist/skills.js`. Ship that single bundled module: it includes `yaml`, since compiled Bun hosts do not reliably resolve external plugins' npm dependencies. Source-mode servers can load `src/index.ts` with its installed dependencies. Core adds `settings.skills`, `registerSkills`, `LaunchContext.skillPaths`, atomic multi-record writes and `snapshot.capabilities.skills`. It never exposes its database to the plugin. Other harnesses must explicitly consume `LaunchContext.skillPaths` to load skills; the separate `@agentorg/plugin-pi-agent` adapter already does. Core no longer implicitly loads Pi; see [Pi plugin setup](../agentorg-plugin-pi-agent/README.md).
+The plugin has no runtime dependency on core internals; core imports are type-only. For a compiled AgentOrg binary, run `bun run build` here and load `--plugin /absolute/path/dist/skills.js`. Ship that single bundled module: it includes `yaml` and `zod`, since compiled Bun hosts do not reliably resolve external plugins' npm dependencies. Source-mode servers can load `src/index.ts` with its installed dependencies. The plugin uses generic namespaced settings, lifecycle participants, atomic multi-record writes, initialization, launch environment and capability discovery ([host contract](../agentorg/EXTENSIONS.md)). Core has no skills semantics and never exposes its database. Other harnesses must explicitly consume the JSON `AGENTORG_SKILL_FILES` launch environment and declare it in `LaunchSpec.consumesEnv`; the separate Pi adapter already does. Installed selections fail safely for unsupported harnesses. Final validation rejects overwritten managed environment or cwd. Core no longer implicitly loads Pi; see [Pi plugin setup](../agentorg-plugin-pi-agent/README.md).
 
 ## API
 
@@ -19,26 +19,32 @@ Socket clients only:
 
 - `skills.add`: `{name, gitUrl}` → `{name, gitUrl, description, createdAt, path}`. Names use lowercase letters/numbers and single hyphens, at most 64 characters. Both names and canonical URL strings must be unique; duplicates are errors, not updates. The clone uses the default branch. No delete/update/revision-selection API.
 - `skills.list`: `{}` → `{skills: Skill[], recovery: {agentId, skill, path, error?}[]}`. Recovery includes pending fetch/readiness failures.
-- `organization.snapshot` advertises `capabilities: {skills: true}` while enabled; older servers may omit this field.
+- `organization.snapshot.capabilities.plugins.skills` advertises `{version: 1, settingsNamespace: "skills", endpoints: {list: "skills.list", add: "skills.add"}}`. Absent/older descriptors mean unsupported.
 
-`agent.create` / `agent.modify` accept `settings.skills`:
+`agent.create` / `agent.modify` accept `settings.extensions.skills`:
 
 ```json
 {"alpha":"installed","beta":"available"}
 ```
 
-Missing IDs are `unavailable`. New agents select nothing; children do not inherit selections. An explicit map replaces **all** states; `{}` clears them. Omission during modification preserves the existing map (and other omitted options). All IDs, even explicit `unavailable` entries, must exist in the catalog. Existing records need no database migration: settings are JSON and the optional field defaults semantically to an empty map.
+Missing IDs are `unavailable`. New agents select nothing; children do not inherit selections. An explicit map replaces **all** states; `{}` clears them. Omission during modification preserves the existing map (and other omitted options). All IDs, even explicit `unavailable` entries, must exist in the catalog. An absent namespace means no selection. Existing records are migrated conservatively as described below.
 
 `available` is delegable but not loaded. `installed` is loaded and delegable. `unavailable` is neither. Public-client grants add at least `available` to **every ancestor**, preserving installed states. These records and the target commit in one core SQLite transaction inside the lifecycle queue; ancestor revisions increment and modified events are emitted. Removing a selection does not revoke earlier ancestor grants or descendant selections. Installed ancestor grants do not happen implicitly.
 
 Agent MCP tools:
 
 - `skills_list`: catalog with the caller's effective `state` on each record.
-- `child_create` and `descendant_modify`: `settings.skills` uses the same replacement semantics. Explicit selections may delegate only the caller's currently available/installed skills, checked inside the serialized mutation. Omitted modification selections are not reauthorized. Core still enforces direct-child creation / strict-descendant mutation.
+- `child_create` and `descendant_modify`: `settings.extensions.skills` uses the same replacement semantics. Explicit selections may delegate only the caller's currently available/installed skills, checked inside the serialized mutation. Omitted modification selections are not reauthorized. Core still enforces direct-child creation / strict-descendant mutation.
 
-Create/modify still return lifecycle operations. Await them; filesystem or validation errors fail the operation, not a second socket response. Launch failures **after** records commit leave the agent failed with its selections preserved. Without the plugin, nonempty selections cannot be newly granted, and launches with existing nonempty selections fail with `SKILLS_DISABLED`; records/files remain intact. Explicit unavailable-only maps are harmless.
+Create/modify still return lifecycle operations. Await them; filesystem or validation errors fail the operation, not a second socket response. Launch failures **after** records commit leave the agent failed with its selections preserved. Without the plugin, namespaced selections cannot be newly granted; existing namespaces and legacy fields block launches/modification with the generic `EXTENSION_REQUIRED` error. Even retained empty/unavailable-only namespaces require their owner, conservatively. Stop/removal remain possible; records/files remain intact.
 
 The TUI discovers the snapshot capability, shows `s skills`, edits selections with a captured revision, and adds catalog entries with `+`. It never automatically retries a mutation.
+
+## Migration and compatibility
+
+Selections remain API-visible in `settings.extensions.skills`, not in plugin-private storage. Old `settings.skills` is converted by the plugin during host initialization. State validation precedes an atomic core write of all migrated records. Equal dual representations are accepted; unequal ones abort startup with `MIGRATION_CONFLICT`, preserving both for operator repair. Representation-only migration retains revisions so interrupted filesystem journals keep their commit fences. Legacy mutation payloads are no longer accepted; upgrade clients to the namespace and generic capability descriptor.
+
+Without this plugin, legacy fields remain byte-for-byte in records and block modification/launch; core never drops them. Plugin-owned SQLite schema, scope hashes, installation markers, filesystem locations and recovery journals are unchanged. No checkouts, untracked files or Git refs are destroyed during migration. Back up core rows, plugin storage and workspaces together. The removed pre-1.0 manager API requires coordinated plugin upgrades despite the retained API-v1 version; the new primitives are generic and additive for other v1 plugins.
 
 ## Repositories and source policy
 
