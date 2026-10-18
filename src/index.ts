@@ -388,10 +388,14 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         throw new Error(`Catalog checkout for ${name} retained at ${path}: ${(error as Error).message}`);
       }
       const record: Skill = { name, gitUrl: url, description, path, createdAt: new Date().toISOString() };
-      db.transaction(() => {
-        db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, url, JSON.stringify(record));
-        dropJournal(journalId);
-      })();
+      try {
+        db.transaction(() => {
+          db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, url, JSON.stringify(record));
+          dropJournal(journalId);
+        })();
+      } catch (error) {
+        throw new Error(`Catalog registration for ${name} (${url}) failed; checkout and journal retained at ${path}: ${(error as Error).message}`);
+      }
       host.emit("skills.catalog_added", record);
       return record;
     }
@@ -403,7 +407,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const { name, gitUrl } = params as any;
       try { return await registerCatalog(name, gitUrl, false); }
       catch (error) {
-        if (!(error as any).code) report(new Error(`Catalog add failed: ${(error as Error).message}`));
+        const code = (error as any)?.code;
+        if (!['INVALID_PARAMS', 'DUPLICATE', 'LIMIT'].includes(code))
+          report(new Error(`Catalog add failed for ${String(name)} (${String(gitUrl)}): ${(error as Error).message}`));
         throw error;
       }
     }));

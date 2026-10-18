@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { access, chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerPlugin } from "agent-organization/plugin";
@@ -126,16 +128,37 @@ test.serial("invalid configured checkout remains unregistered with an actionable
   await plugin.shutdown();
 });
 
+test.serial("catalog write failures report source and retain the checkout and journal", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const plugin = await f.start();
+  const scope = createHash("sha256").update(await realpath(join(f.root, "data"))).digest("hex");
+  const db = new Database(join(f.root, "home", ".agentorg", "skills", scope, "skills.sqlite"));
+  db.exec("CREATE TRIGGER fail_catalog_insert BEFORE INSERT ON catalog BEGIN SELECT RAISE(ABORT, 'injected catalog write failure'); END;");
+  await plugin.initialize([]);
+  const listed = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+  expect(listed.skills).toHaveLength(0);
+  const journals = db.query("SELECT data FROM journal").all() as Array<{ data: string }>;
+  expect(journals).toHaveLength(1);
+  const journal = JSON.parse(journals[0]!.data);
+  await access(journal.path);
+  expect(plugin.events.some(event => event.type === "skills.error" &&
+    JSON.stringify(event.payload).includes("alpha") && JSON.stringify(event.payload).includes("https://github.com/example/alpha") &&
+    JSON.stringify(event.payload).includes(journal.path))).toBe(true);
+  db.close();
+  await plugin.shutdown();
+});
+
 test.serial("lower admission limits reject new catalog entries without evicting existing entries", async () => {
   const f = await fixture({
     repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }],
-    gitTimeoutMs: 60_000, maxCatalogEntries: 1,
+    gitTimeoutMs: 60_000, maxCatalogEntries: 4,
   }, true);
   const betaSource = join(f.root, "source-beta");
   await mkdir(betaSource);
   await writeFile(join(betaSource, "SKILL.md"), "---\nname: beta\ndescription: Beta fixture\n---\n# Instructions\n");
   const plugin = await f.start();
   await plugin.initialize([]);
+  (f.config as any).maxCatalogEntries = 1;
   const list = plugin.endpoints.get("skills.list")!;
   const add = plugin.endpoints.get("skills.add")!;
   await expect(add({ name: "alpha", gitUrl: betaSource }, caller)).rejects.toMatchObject({ code: "DUPLICATE" });
@@ -145,8 +168,9 @@ test.serial("lower admission limits reject new catalog entries without evicting 
 });
 
 test.serial("configured Git timeout bounds subsequent clone work using a controlled local runner", async () => {
-  const f = await fixture({ repositories: [], gitTimeoutMs: 1_000, maxCatalogEntries: 4 }, true);
+  const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
   const plugin = await f.start();
+  (f.config as any).gitTimeoutMs = 1_000;
   await writeFile(join(f.root, "bin", "delay"), "1200");
   const started = Date.now();
   await expect(plugin.endpoints.get("skills.add")!({ name: "alpha", gitUrl: f.source }, caller)).rejects.toThrow(/timed out|timeout/i);
