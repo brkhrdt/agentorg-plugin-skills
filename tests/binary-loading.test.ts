@@ -28,7 +28,15 @@ test.skipIf(!process.env.ORG_BINARY)("compiled host loads the separate skills mo
       try { snapshot = await client.request("organization.snapshot"); break; }
       catch (error: any) { if (error.code !== "NOT_READY") throw error; await Bun.sleep(20); }
     }
-    expect(snapshot.capabilities.plugins.skills.settingsNamespace).toBe("skills");
+    expect(snapshot.capabilities.plugins.skills).toEqual({
+      settingsNamespace: "skills", serverSettingsNamespace: "skills",
+      endpoints: { list: "skills.list", add: "skills.add" }, version: 1,
+    });
+    const settings = await client.request<any>("organization.settings.list");
+    expect(settings.groups.find((group: any) => group.namespace === "skills")).toMatchObject({
+      defaults: { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
+      fields: [{ key: "repositories", effect: "restart" }, { key: "gitTimeoutMs", effect: "immediate" }, { key: "maxCatalogEntries", effect: "immediate" }],
+    });
     expect(await client.request<{ skills: unknown[]; recovery: unknown[] }>("skills.list")).toEqual({ skills: [], recovery: [] });
     try {
       await client.request("skills.add", { name: "bad", gitUrl: "ssh://localhost/skill" });

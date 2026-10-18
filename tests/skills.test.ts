@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { OrganizationServer } from "../../agentorg/src/server.ts";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
-import { cwdPlugin } from "../../agentorg/src/plugins/cwd.ts";
+import { cwdPlugin } from "@agentorg/plugin-unique-cwd";
 import type { ServerPlugin } from "../../agentorg/src/plugin.ts";
 import type { AgentRecord, Operation } from "../../agentorg/src/types.ts";
 import { createSkillsPlugin, installRoot, states, type Skill } from "../src/index.ts";

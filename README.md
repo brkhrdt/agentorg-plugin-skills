@@ -8,7 +8,7 @@ cd ../agentorg
 # Load the separate Pi harness too if using harness: "pi" (install its deps first).
 bun start --plugin ../agentorg-plugin-pi-agent/src/index.ts --plugin ../agentorg-plugin-skills/src/index.ts
 # Optional containment (either plugin order works):
-bun start --plugin ../agentorg-plugin-pi-agent/src/index.ts --plugin ./src/plugins/cwd.ts --plugin ../agentorg-plugin-skills/src/index.ts
+bun start --plugin ../agentorg-plugin-pi-agent/src/index.ts --plugin ../agentorg-plugin-unique-cwd/src/index.ts --plugin ../agentorg-plugin-skills/src/index.ts
 ```
 
 The plugin has no runtime dependency on core internals; core imports are type-only. For a compiled AgentOrg binary, run `bun run build` here and load `--plugin /absolute/path/dist/skills.js`. Ship that single bundled module: it includes `yaml` and `zod`, since compiled Bun hosts do not reliably resolve external plugins' npm dependencies. Source-mode servers can load `src/index.ts` with its installed dependencies. The plugin uses generic namespaced settings, lifecycle participants, atomic multi-record writes, initialization, launch environment and capability discovery ([host contract](../agentorg/EXTENSIONS.md)). Core has no skills semantics and never exposes its database. Other harnesses must explicitly consume the JSON `AGENTORG_SKILL_FILES` launch environment and declare it in `LaunchSpec.consumesEnv`; the separate Pi adapter already does. Installed selections fail safely for unsupported harnesses. Final validation rejects overwritten managed environment or cwd. Core no longer implicitly loads Pi; see [Pi plugin setup](../agentorg-plugin-pi-agent/README.md).
@@ -19,7 +19,7 @@ Socket clients only:
 
 - `skills.add`: `{name, gitUrl}` → `{name, gitUrl, description, createdAt, path}`. Names use lowercase letters/numbers and single hyphens, at most 64 characters. Both names and canonical URL strings must be unique; duplicates are errors, not updates. The clone uses the default branch. No delete/update/revision-selection API.
 - `skills.list`: `{}` → `{skills: Skill[], recovery: {agentId, skill, path, error?}[]}`. Recovery includes pending fetch/readiness failures.
-- `organization.snapshot.capabilities.plugins.skills` advertises `{version: 1, settingsNamespace: "skills", endpoints: {list: "skills.list", add: "skills.add"}}`. Absent/older descriptors mean unsupported.
+- `organization.snapshot.capabilities.plugins.skills` advertises `{version: 1, settingsNamespace: "skills", serverSettingsNamespace: "skills", endpoints: {list: "skills.list", add: "skills.add"}}`. Absent/older descriptors mean unsupported.
 
 `agent.create` / `agent.modify` accept `settings.extensions.skills`:
 
@@ -38,7 +38,23 @@ Agent MCP tools:
 
 Create/modify still return lifecycle operations. Await them; filesystem or validation errors fail the operation, not a second socket response. Launch failures **after** records commit leave the agent failed with its selections preserved. Without the plugin, namespaced selections cannot be newly granted; existing namespaces and legacy fields block launches/modification with the generic `EXTENSION_REQUIRED` error. Even retained empty/unavailable-only namespaces require their owner, conservatively. Stop/removal remain possible; records/files remain intact.
 
-The TUI discovers the snapshot capability, shows `s skills`, edits selections with a captured revision, and adds catalog entries with `+`. It never automatically retries a mutation.
+The TUI exposes a catalog-backed **Skills** field inside ordinary agent create/modify forms. Selections stage in the form and are sent once as a complete revision-fenced replacement; Escape discards them. Repository seeds are managed separately in `v` → `s` server settings. The old global `s` screen and JSON catalog-add prompt are removed. The client does not automatically retry a mutation.
+
+## Organization settings
+
+The plugin registers a public `skills` server-settings group, separate from each agent's `settings.extensions.skills` selection map. Compatible hosts advertise the group through the generic `organization.settings.*` endpoints and the plugin capability (`settingsNamespace` / `serverSettingsNamespace: "skills"`). Settings access is client-only; they are not MCP tools.
+
+Defaults and effects:
+
+| Setting | Default | Bounds | Effect |
+| --- | --- | --- | --- |
+| `repositories` | `[]` | Up to 256 `{name, gitUrl}` records | Restart |
+| `gitTimeoutMs` | `60000` | Integer 1,000–60,000 ms | Immediate for subsequent Git work |
+| `maxCatalogEntries` | `256` | Integer 1–256 | Immediate for new catalog admissions |
+
+Repository records accept HTTPS URLs on GitHub, GitLab, or Bitbucket only, without credentials, explicit ports, query strings, or fragments. The list seeds the persistent catalog at server startup; it is not a live mirror. An exact existing name/URL pair is idempotent. Reusing a registered name for a different URL is a conflict and never overwrites the catalog entry. Removing a seed does not remove its catalog entry, checkout, installed files, agent selection, or recovery history. Saving repository settings performs no clone/delete; restart applies changes. Lowering `maxCatalogEntries` never evicts existing catalog entries, and the configured limit applies to new admissions through both seed import and `skills.add`.
+
+Invalid settings fail validation before persistence or Git activity. Invalid requests use `INVALID_PARAMS`; duplicate direct catalog additions use `DUPLICATE`; admissions over the limit use `LIMIT`. Seed bootstrap failures identify the repository and preserve checkout/journal artifacts for diagnosis. Readiness/launch failures remain explicit (`SKILL_NOT_READY` / `skills.error`); inspect `skills.list`, operation errors, and event history before repair. No failure is silently retried by the client.
 
 ## Migration and compatibility
 
