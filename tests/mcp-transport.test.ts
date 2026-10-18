@@ -266,6 +266,16 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect(unknownResult.status).toBe("failed");
     expect(unknownResult.error?.code).toBe("INVALID_PARAMS");
 
+    const installBeta = await f.mcp.callTool({ name: "descendant_modify", arguments: {
+      agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: { beta: "installed" } } },
+    } });
+    expect(installBeta.isError).not.toBe(true);
+    expect((await waitThroughMcp(f.mcp, resultText(installBeta))).status).toBe("completed");
+    current = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
+    const betaManagedFile = join(installRoot(child.settings.cwd!), "beta", "SKILL.md");
+    expect(states(current.settings)).toEqual({ beta: "installed" });
+    expect(await Bun.file(betaManagedFile).exists()).toBe(true);
+
     const cleared = await f.mcp.callTool({ name: "descendant_modify", arguments: {
       agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: {} } },
     } });
@@ -273,7 +283,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect((await waitThroughMcp(f.mcp, resultText(cleared))).status).toBe("completed");
     current = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
     expect(states(current.settings)).toEqual({});
-    expect(await Bun.file(installRoot(child.settings.cwd!), "beta").exists()).toBe(false);
+    expect(await Bun.file(betaManagedFile).exists()).toBe(false);
 
     const siblingOp = await f.mcp.callTool({ name: "child_create", arguments: {
       settings: { harness: "fixture", model: "test", cwd: join(f.workspace, "other") },
