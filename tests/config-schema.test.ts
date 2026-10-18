@@ -28,7 +28,8 @@ test("skills config canonicalizes repository trailing slashes and rejects canoni
     { name: "alpha", gitUrl: "https://github.com/example/alpha/" },
     { name: "beta", gitUrl: "https://github.com/example/alpha" },
   ], gitTimeoutMs: 60_000, maxCatalogEntries: 256 })).toThrow(/duplicate/i);
-  expect(() => validateSkillsConfig({ repositories: [
-    { name: "alpha", gitUrl: "https://github.com:443/example/alpha" },
-  ], gitTimeoutMs: 60_000, maxCatalogEntries: 256 })).toThrow();
+  for (const gitUrl of ["https://github.com:443/example/alpha", "https:github.com:443/example/alpha"]) {
+    expect(() => validateSkillsConfig({ repositories: [{ name: "alpha", gitUrl }],
+      gitTimeoutMs: 60_000, maxCatalogEntries: 256 })).toThrow();
+  }
 });

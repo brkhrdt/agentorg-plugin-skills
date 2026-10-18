@@ -27,8 +27,8 @@ export function validateSkillsConfig(value: unknown): SkillsConfig {
     let url: URL;
     try { url = new URL(gitUrl); } catch { throw new Error("Use an HTTPS Git URL"); }
     // Explicit ports (including :443), credentials, redirects and non-canonical host/path forms are forbidden.
-    const authority = gitUrl.match(/^https:\/\/([^/?#]+)/i)?.[1] ?? "";
-    if (url.protocol !== "https:" || url.username || url.password || authority.includes(":") || url.search || url.hash ||
+    const authority = gitUrl.match(/^https:\/\/([^/?#]+)/i)?.[1];
+    if (!authority || url.protocol !== "https:" || url.username || url.password || authority.includes(":") || url.search || url.hash ||
         !["github.com", "gitlab.com", "bitbucket.org"].includes(url.hostname) ||
         !/^\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+\/?$/.test(url.pathname) ||
         url.pathname.split("/").some(part => part === "." || part === ".."))
