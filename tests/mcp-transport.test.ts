@@ -43,11 +43,11 @@ async function createFixture(withSkills = true) {
   await git(source, "commit", "-m", "skill fixture");
 
   const harness: ServerPlugin = { apiVersion: 1, name: "mcp-fixture", setup(host) {
-    host.transformTool("child_create", tool => {
+    for (const name of ["child_create", "descendant_modify"]) host.transformTool(name, tool => {
       const properties = { ...tool.inputSchema.properties };
       const settings = properties.settings as { properties?: Record<string, any> };
       const extensions = (settings.properties?.extensions ?? { type: "object" }) as { type?: string; properties?: Record<string, unknown> };
-      properties.settings = { ...settings, properties: { ...settings.properties, extensions: { ...extensions, properties: { ...extensions.properties, siblingMarker: { type: "string" } } } } };
+      properties.settings = { ...settings, properties: { ...settings.properties, extensions: { ...extensions, properties: { ...extensions.properties, siblingMarker: { type: "string", enum: ["preserved"], description: "Sibling-plugin constraint" } } } } };
       return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
     });
     host.registerHarness({ name: "fixture", launch(context) {
@@ -117,14 +117,23 @@ async function createFixture(withSkills = true) {
 }
 
 const resultText = (result: any) => JSON.parse(result.content.find((item: any) => item.type === "text").text);
-const waitThroughMcp = async (mcp: Client, accepted: any) => resultText(await mcp.callTool({ name: "operation_wait", arguments: { operationId: accepted.id } }));
+const waitThroughMcp = async (mcp: Client, accepted: any, timeoutMs = 10_000) => {
+  const deadline = Date.now() + timeoutMs;
+  let operation = accepted;
+  while (!["completed", "failed", "stopped"].includes(operation.status)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`MCP operation ${accepted.id} did not finish before deadline`);
+    operation = resultText(await mcp.callTool({ name: "operation_wait", arguments: { operationId: accepted.id, waitMs: Math.min(1_000, remaining) } }));
+  }
+  return operation;
+};
 
 test("MCP without the skills plugin preserves opaque selections and exposes no skills tools", async () => {
   const f = await createFixture(false);
   try {
     const tools = await f.mcp.listTools();
     expect(tools.tools.some(tool => tool.name === "skills_list")).toBe(false);
-    expect(tools.tools.some(tool => ["skills.list", "skills.add", "organization_settings_list", "organization_settings_update"].includes(tool.name))).toBe(false);
+    expect(tools.tools.some(tool => ["skills.list", "skills.add", "organization.settings.list", "organization.settings.get", "organization.settings.update", "organization_settings_list", "organization_settings_get", "organization_settings_update"].includes(tool.name))).toBe(false);
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings)).toEqual({ alpha: "available" });
     await expect(f.mcp.callTool({ name: "skills_list", arguments: {} })).rejects.toThrow(/Unknown MCP tool/);
   } finally { await f.mcp.close(); }
@@ -134,13 +143,15 @@ test("disabling the skills plugin preserves installed selection and managed file
   const f = await createFixture();
   try {
     const accepted = resultText(await f.mcp.callTool({ name: "child_create", arguments: {
-      settings: { harness: "fixture", model: "test", cwd: join(f.workspace, "child"), extensions: { skills: { alpha: "installed" } } },
+      settings: { harness: "fixture", model: "test", cwd: join(f.workspace, "child"), extensions: { skills: { alpha: "installed", beta: "installed" } } },
     } }));
     const completed = await waitThroughMcp(f.mcp, accepted);
     expect(completed.status).toBe("completed");
     const child = completed.result as AgentRecord;
-    const skillFile = join(installRoot(child.settings.cwd!), "alpha/SKILL.md");
-    expect(await Bun.file(skillFile).exists()).toBe(true);
+    const alphaFile = join(installRoot(child.settings.cwd!), "alpha", "SKILL.md");
+    const betaFile = join(installRoot(child.settings.cwd!), "beta", "SKILL.md");
+    expect(await Bun.file(alphaFile).exists()).toBe(true);
+    expect(await Bun.file(betaFile).exists()).toBe(true);
 
     await f.mcp.close(); f.client.close(); await f.server.close();
     const disabled = await OrganizationServer.start({ dataDir: join(f.dir, "data"), socketPath: join(f.dir, "data/server.sock"), plugins: [f.harness] });
@@ -149,9 +160,30 @@ test("disabling the skills plugin preserves installed selection and managed file
     clients.push(client);
     expect((await client.request<any>("organization.snapshot")).capabilities.plugins?.skills).toBeUndefined();
     const persisted = await client.request<AgentRecord>("agent.get", { agentId: child.id });
-    expect(states(persisted.settings)).toEqual({ alpha: "installed" });
-    expect(await Bun.file(skillFile).exists()).toBe(true);
+    expect(states(persisted.settings)).toEqual({ alpha: "installed", beta: "installed" });
+    expect(await Bun.file(alphaFile).exists()).toBe(true);
+    expect(await Bun.file(betaFile).exists()).toBe(true);
   } finally { await f.mcp.close(); }
+});
+
+test.skipIf(!process.env.ORG_COMPILED_BRIDGE)("compiled host MCP bridge lists tools and polls skills operations", async () => {
+  const f = await createFixture();
+  const runtime = (f.server.organization as any).runtimes.get(f.root.id);
+  const compiled = new Client({ name: "compiled-skills-transport", version: "1" });
+  try {
+    await compiled.connect(new StdioClientTransport({ command: process.env.ORG_COMPILED_BRIDGE!, args: ["--internal-mcp-bridge"],
+      env: { ...(process.env as Record<string, string>), ORG_SOCKET: f.server.organization.socketPath, ORG_TOKEN: runtime.token },
+    }));
+    mcpClients.push(compiled);
+    expect((await compiled.listTools()).tools.map(tool => tool.name)).toContain("skills_list");
+    expect(resultText(await compiled.callTool({ name: "skills_list", arguments: {} })).skills.map((item: any) => item.name)).toEqual(["alpha", "beta", "gamma"]);
+    const accepted = resultText(await compiled.callTool({ name: "child_create", arguments: {
+      settings: { harness: "fixture", model: "test", cwd: join(f.workspace, "child"), extensions: { skills: { alpha: "installed" } } },
+    } }));
+    const completed = await waitThroughMcp(compiled, accepted);
+    expect(completed.status).toBe("completed");
+    expect(states((completed.result as AgentRecord).settings)).toEqual({ alpha: "installed" });
+  } finally { await compiled.close(); await f.mcp.close(); }
 });
 
 test("authenticated MCP discovers skills tools, composes transformed schemas, and enforces selection/caller rules", async () => {
@@ -160,12 +192,20 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     const tools = await f.mcp.listTools();
     expect(tools.tools.map(tool => tool.name)).toContain("skills_list");
     expect(tools.tools.map(tool => tool.name)).toContain("operation_wait");
-    expect(tools.tools.some(tool => ["skills.list", "skills.add", "organization_settings_list", "organization_settings_update"].includes(tool.name))).toBe(false);
+    expect(tools.tools.some(tool => ["skills.list", "skills.add", "organization.settings.list", "organization.settings.get", "organization.settings.update", "organization_settings_list", "organization_settings_get", "organization_settings_update"].includes(tool.name))).toBe(false);
     const createTool = tools.tools.find(tool => tool.name === "child_create") as any;
     const modifyTool = tools.tools.find(tool => tool.name === "descendant_modify") as any;
-    expect(createTool.inputSchema.properties.settings.properties.extensions.properties.skills).toBeDefined();
-    expect(modifyTool.inputSchema.properties.settings.properties.extensions.properties.skills).toBeDefined();
-    expect(createTool.inputSchema.properties.settings.properties.extensions.properties.siblingMarker).toBeDefined();
+    const createSkills = createTool.inputSchema.properties.settings.properties.extensions.properties.skills;
+    const modifySkills = modifyTool.inputSchema.properties.settings.properties.extensions.properties.skills;
+    expect(createSkills).toMatchObject({ type: "object", additionalProperties: { type: "string", enum: ["unavailable", "available", "installed"] } });
+    expect(modifySkills).toMatchObject({ type: "object", additionalProperties: { type: "string", enum: ["unavailable", "available", "installed"] } });
+    expect(createSkills.description).toContain("Complete replacement");
+    expect(modifySkills.description).toContain("Complete replacement");
+    expect(createTool.inputSchema.properties.settings.properties.extensions.properties.siblingMarker).toEqual({ type: "string", enum: ["preserved"], description: "Sibling-plugin constraint" });
+    expect(modifyTool.inputSchema.properties.settings.properties.extensions.properties.siblingMarker).toEqual({ type: "string", enum: ["preserved"], description: "Sibling-plugin constraint" });
+    expect(createTool.inputSchema.required).toContain("settings");
+    expect(modifyTool.inputSchema.required).toContain("agentId");
+    expect(modifyTool.inputSchema.properties.expectedRevision).toMatchObject({ type: "integer" });
     expect(createTool.inputSchema.required).toContain("settings");
 
     const listing = await f.mcp.callTool({ name: "skills_list", arguments: {} });
@@ -214,8 +254,17 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
       agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: { gamma: "available" } } },
     } });
     expect(denied.isError).not.toBe(true);
-    expect((await waitThroughMcp(f.mcp, resultText(denied))).status).toBe("failed");
+    const deniedResult = await waitThroughMcp(f.mcp, resultText(denied));
+    expect(deniedResult.status).toBe("failed");
+    expect(deniedResult.error?.code).toBe("FORBIDDEN");
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).settings)).toEqual({ beta: "available" });
+
+    const unknown = await f.mcp.callTool({ name: "descendant_modify", arguments: {
+      agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: { "not-in-catalog": "available" } } },
+    } });
+    const unknownResult = await waitThroughMcp(f.mcp, resultText(unknown));
+    expect(unknownResult.status).toBe("failed");
+    expect(unknownResult.error?.code).toBe("INVALID_PARAMS");
 
     const cleared = await f.mcp.callTool({ name: "descendant_modify", arguments: {
       agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: {} } },
@@ -231,9 +280,12 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     } });
     const sibling = await waitThroughMcp(f.mcp, resultText(siblingOp));
     expect(sibling.status).toBe("completed");
+    expect(states(sibling.result.settings)).toBeUndefined(); // Children do not inherit caller selections.
     const childMcp = await f.connectMcp(child.id);
     const siblingTarget = await childMcp.callTool({ name: "descendant_modify", arguments: { agentId: sibling.result.id, name: "forbidden-sibling-target" } });
     expect(siblingTarget.isError).toBe(true);
+    const ancestorTarget = await childMcp.callTool({ name: "descendant_modify", arguments: { agentId: f.root.id, name: "forbidden-ancestor-target" } });
+    expect(ancestorTarget.isError).toBe(true);
 
     const self = await f.mcp.callTool({ name: "descendant_modify", arguments: { agentId: f.root.id, name: "forbidden-self-target" } });
     expect(self.isError).toBe(true);
