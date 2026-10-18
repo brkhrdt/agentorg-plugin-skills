@@ -9,7 +9,6 @@ const roots: string[] = [];
 afterEach(async () => {
   process.env.PATH = process.env.TEST_ORIGINAL_PATH ?? process.env.PATH;
   delete process.env.TEST_GIT_SOURCE;
-  delete process.env.TEST_GIT_DELAY_MS;
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -33,7 +32,8 @@ const destination = args.at(-1);
 const input = args.at(-2);
 const source = input.startsWith('https://') ? process.env.TEST_GIT_SOURCE : input;
 const copy = () => { fs.mkdirSync(destination, { recursive: true }); fs.cpSync(source, destination, { recursive: true }); fs.mkdirSync(path.join(destination, '.git'), { recursive: true }); };
-setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e); process.exit(1); } }, Number(process.env.TEST_GIT_DELAY_MS || 0));
+const delay = fs.existsSync(path.join(__dirname, 'delay')) ? Number(fs.readFileSync(path.join(__dirname, 'delay'), 'utf8')) : 0;
+setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e); process.exit(1); } }, delay);
 `);
   await chmod(gitShim, 0o700);
   process.env.TEST_ORIGINAL_PATH ??= process.env.PATH;
@@ -65,7 +65,7 @@ setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e)
 
 const caller = { kind: "client", id: "test" };
 
-test("configured repository seeds import once and identical restarts preserve the catalog path", async () => {
+test.serial("configured repository seeds import once; identical restarts preserve path and metadata", async () => {
   const f = await fixture({
     repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }],
     gitTimeoutMs: 60_000, maxCatalogEntries: 4,
@@ -74,37 +74,51 @@ test("configured repository seeds import once and identical restarts preserve th
   await first.initialize([]);
   const initial = await first.endpoints.get("skills.list")!({}, caller) as any;
   expect(initial.skills.map((skill: any) => skill.name)).toEqual(["alpha"]);
-  const path = initial.skills[0].path;
+  const original = initial.skills[0];
   await first.shutdown();
 
-  // Seed removal is non-destructive: an existing catalog entry is not evicted.
-  f.config.repositories = [];
+  // An identical seed is idempotent across restart, preserving the catalog record.
   const second = await f.start();
   await second.initialize([]);
   const restarted = await second.endpoints.get("skills.list")!({}, caller) as any;
   expect(restarted.skills).toHaveLength(1);
-  expect(restarted.skills[0].path).toBe(path);
+  expect(restarted.skills[0]).toMatchObject({
+    name: original.name, gitUrl: original.gitUrl, description: original.description,
+    path: original.path, createdAt: original.createdAt,
+  });
   await second.shutdown();
+
+  // Seed removal is non-destructive: an existing catalog entry is not evicted.
+  f.config.repositories = [];
+  const third = await f.start();
+  await third.initialize([]);
+  const afterRemoval = await third.endpoints.get("skills.list")!({}, caller) as any;
+  expect(afterRemoval.skills).toHaveLength(1);
+  expect(afterRemoval.skills[0]).toMatchObject({ path: original.path, createdAt: original.createdAt });
+  await third.shutdown();
 });
 
-test("lower admission limits reject new catalog entries without evicting existing entries", async () => {
+test.serial("lower admission limits reject new catalog entries without evicting existing entries", async () => {
   const f = await fixture({
     repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }],
     gitTimeoutMs: 60_000, maxCatalogEntries: 1,
   }, true);
+  const betaSource = join(f.root, "source-beta");
+  await mkdir(betaSource);
+  await writeFile(join(betaSource, "SKILL.md"), "---\nname: beta\ndescription: Beta fixture\n---\n# Instructions\n");
   const plugin = await f.start();
   await plugin.initialize([]);
   const list = plugin.endpoints.get("skills.list")!;
   const add = plugin.endpoints.get("skills.add")!;
-  await expect(add({ name: "beta", gitUrl: f.source }, caller)).rejects.toThrow(/limit/i);
+  await expect(add({ name: "beta", gitUrl: betaSource }, caller)).rejects.toThrow(/limit/i);
   expect((await list({}, caller) as any).skills.map((skill: any) => skill.name)).toEqual(["alpha"]);
   await plugin.shutdown();
 });
 
-test("configured Git timeout bounds subsequent clone work using a controlled local runner", async () => {
+test.serial("configured Git timeout bounds subsequent clone work using a controlled local runner", async () => {
   const f = await fixture({ repositories: [], gitTimeoutMs: 1_000, maxCatalogEntries: 4 }, true);
   const plugin = await f.start();
-  process.env.TEST_GIT_DELAY_MS = "1_200";
+  await writeFile(join(f.root, "bin", "delay"), "1200");
   const started = Date.now();
   await expect(plugin.endpoints.get("skills.add")!({ name: "alpha", gitUrl: f.source }, caller)).rejects.toThrow(/timed out|timeout/i);
   expect(Date.now() - started).toBeLessThan(5_000);
