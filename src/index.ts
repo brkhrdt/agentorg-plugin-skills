@@ -12,6 +12,7 @@ export const skillStatesSchema = z.record(z.string().regex(/^[a-z0-9]+(?:-[a-z0-
 export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
 import { git } from "./git.ts";
+import { skillsServerSettings } from "./config.ts";
 
 export interface Skill { name: string; gitUrl: string; description: string; createdAt: string; path: string }
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
@@ -258,7 +259,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         return { ...rest, extensions: { ...extensions, skills: legacy } };
       },
     });
-    host.registerCapability("skills", { settingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add" }, version: 1 });
+    host.registerServerSettings(skillsServerSettings());
+    host.registerCapability("skills", { settingsNamespace: "skills", serverSettingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add" }, version: 1 });
     async function uniqueCwd(settings: Settings, agent: Readonly<AgentRecord>, agents: Readonly<AgentRecord>[]) {
       const cwd = await realpath(settings.cwd ?? process.cwd());
       if (!(await lstat(cwd)).isDirectory()) fail("cwd must be a directory");
