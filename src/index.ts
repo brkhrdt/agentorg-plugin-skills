@@ -11,7 +11,7 @@ import { isDeepStrictEqual } from "node:util";
 export const skillStatesSchema = z.record(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64), z.enum(["unavailable", "available", "installed"]));
 export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
-import { git } from "./git.ts";
+import { gitWithTimeout } from "./git.ts";
 import { skillsServerSettings } from "./config.ts";
 
 export interface Skill { name: string; gitUrl: string; description: string; createdAt: string; path: string }
@@ -76,9 +76,11 @@ function source(input: unknown, allowLocal: boolean): string {
   if (allowLocal && input.startsWith("/")) return resolve(input);
   let url: URL;
   try { url = new URL(input); } catch { return fail("Use an HTTPS Git URL"); }
-  if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash ||
+  const authority = input.match(/^https:\/\/([^/?#]+)/i)?.[1];
+  if (!authority || url.protocol !== "https:" || url.username || url.password || authority.includes(":") || url.port || url.search || url.hash ||
       !["github.com", "gitlab.com", "bitbucket.org"].includes(url.hostname) || !/^\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+$/.test(url.pathname) || url.pathname.split("/").some(s => s === "." || s === ".."))
     fail("Only HTTPS repositories on github.com, gitlab.com or bitbucket.org are supported (no credentials, ports, queries or redirects)");
+  url.pathname = url.pathname.replace(/\/+$/, "");
   return url.toString();
 }
 
@@ -110,6 +112,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     function exclusive<T>(work: () => Promise<T>): Promise<T> {
       const next = tail.then(work); tail = next.catch(() => {}); return next;
     }
+    const git = (cwd: string, ...args: string[]) => {
+      const effective = host.serverSettings("skills") as { gitTimeoutMs?: number };
+      return gitWithTimeout(cwd, effective.gitTimeoutMs ?? 60_000, ...args);
+    };
+    const effectiveConfig = () => host.serverSettings("skills") as { repositories: Array<{ name: string; gitUrl: string }>; gitTimeoutMs: number; maxCatalogEntries: number };
     async function own(i: Installation, path = i.path) {
       if ((await lstat(path)).isSymbolicLink()) fail(`Skill checkout is a symlink: ${path}`);
       const markerPath = join(path, ".git", "agentorg-skills.json");
@@ -307,10 +314,15 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         fail("Harness cwd must match the managed workspace", "CWD_CONFLICT");
     });
     host.onInitialize(agents => exclusive(async () => {
+        // Seeds are additive inputs to the persistent catalog, never a destructive mirror.
+        for (const repository of effectiveConfig().repositories) {
+          try { await registerCatalog(repository.name, repository.gitUrl, true); }
+          catch (error) { report(new Error(`Configured repository ${repository.name} (${repository.gitUrl}) failed: ${(error as Error).message}`)); }
+        }
         for (const j of rows<Journal>("journal")) {
           if (j.path) {
             report(new Error(`Interrupted catalog clone retained at ${j.path}; not registered`));
-            dropJournal(j.id); continue;
+            continue;
           }
           const agent = agents.find(a => a.id === j.agentId);
           try {
@@ -353,32 +365,47 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           }
         }
       }));
+    async function registerCatalog(name: string, inputUrl: unknown, configuredSeed: boolean): Promise<Skill> {
+      if (typeof name !== "string" || name.length > 64 || !idPattern.test(name)) fail("Invalid skill name");
+      const url = source(inputUrl, options.allowLocalSources ?? false);
+      const existing = catalog();
+      const sameName = existing.find(s => s.name === name);
+      const sameUrl = existing.find(s => s.gitUrl === url);
+      if (configuredSeed && sameName?.gitUrl === url) return sameName;
+      if (sameName || sameUrl) fail(`Skill repository conflict for ${name}: name or Git source already registered`, "DUPLICATE");
+      const limit = effectiveConfig().maxCatalogEntries;
+      if (existing.length >= limit) fail(`Catalog limit (${limit}) reached`, "LIMIT");
+      const path = join(root, hash(name) + "-" + randomUUID());
+      // Retain a journal and partial checkout on every failure for operator diagnosis.
+      const journalId = `catalog-${randomUUID()}`;
+      put("journal", journalId, { id: journalId, agentId: "catalog", revision: 0, actions: [], path });
+      let description: string;
+      try {
+        await git(root, "-c", `protocol.file.allow=${url.startsWith("/") ? "always" : "never"}`, "clone", "--", url, path);
+        description = await metadata(path, name);
+        await checkoutLimit(path);
+      } catch (error) {
+        throw new Error(`Catalog checkout for ${name} retained at ${path}: ${(error as Error).message}`);
+      }
+      const record: Skill = { name, gitUrl: url, description, path, createdAt: new Date().toISOString() };
+      db.transaction(() => {
+        db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, url, JSON.stringify(record));
+        dropJournal(journalId);
+      })();
+      host.emit("skills.catalog_added", record);
+      return record;
+    }
     function clientOnly(caller: { kind: string }) { if (caller.kind !== "client") fail("Catalog endpoints are client-only", "FORBIDDEN"); }
     host.registerEndpoint("skills.list", (_params, caller) => { clientOnly(caller); return { skills: catalog(), recovery: installations().filter(i => i.pending).map(i => ({ agentId: i.agentId, skill: i.skill, path: i.path, error: i.error })) }; });
     host.registerEndpoint("skills.add", (params, caller) => exclusive(async () => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).some(k => !["name", "gitUrl"].includes(k))) fail("Expected {name, gitUrl}");
       const { name, gitUrl } = params as any;
-      if (typeof name !== "string" || name.length > 64 || !idPattern.test(name)) fail("Invalid skill name");
-      const url = source(gitUrl, options.allowLocalSources ?? false);
-      if (catalog().some(s => s.name === name || s.gitUrl === url)) fail("Skill name or Git source already registered", "DUPLICATE");
-      if (catalog().length >= 256) fail("Catalog limit (256) reached", "LIMIT");
-      const path = join(root, hash(name) + "-" + randomUUID());
-      // Journal catalog clones before Git starts. Abandoned clones are retained, never registered.
-      const journalId = `catalog-${randomUUID()}`;
-      put("journal", journalId, { id: journalId, agentId: "catalog", revision: 0, actions: [], path });
-      try {
-        await git(root, "-c", `protocol.file.allow=${url.startsWith("/") ? "always" : "never"}`, "clone", "--", url, path);
-        const description = await metadata(path, name);
-        await checkoutLimit(path);
-        const record: Skill = { name, gitUrl: url, description, path, createdAt: new Date().toISOString() };
-        db.transaction(() => {
-          db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, url, JSON.stringify(record));
-          dropJournal(journalId);
-        })();
-        host.emit("skills.catalog_added", record);
-        return record;
-      } catch (error) { report(new Error(`Catalog add failed; any partial checkout retained at ${path}: ${(error as Error).message}`)); throw error; }
+      try { return await registerCatalog(name, gitUrl, false); }
+      catch (error) {
+        if (!(error as any).code) report(new Error(`Catalog add failed: ${(error as Error).message}`));
+        throw error;
+      }
     }));
     host.registerTool({ name: "skills_list", description: "List catalog and your skill states. Only available/installed skills may be delegated; children default to no selections. settings.extensions.skills explicitly replaces all states.", inputSchema: { type: "object", additionalProperties: false }, async execute(_args, caller) {
       const agent = await host.request("agent.get", { agentId: caller.id }, caller) as AgentRecord;

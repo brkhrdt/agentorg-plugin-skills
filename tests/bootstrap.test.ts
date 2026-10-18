@@ -41,6 +41,7 @@ setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e)
   process.env.TEST_GIT_SOURCE = source;
 
   const endpoints = new Map<string, (params: unknown, caller: { kind: string; id: string }) => unknown>();
+  const events: Array<{ type: string; payload: unknown }> = [];
   let initialize: ((agents: any[]) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   const host = {
@@ -54,11 +55,11 @@ setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e)
     registerEndpoint(name: string, callback: (params: unknown, caller: { kind: string; id: string }) => unknown) { endpoints.set(name, callback); },
     registerTool() {}, transformTool() {}, beforeSettings() {}, onEvent() {},
     onShutdown(callback: () => Promise<void>) { shutdown = callback; },
-    request: async () => ({}), emit() {},
+    request: async () => ({}), emit(type: string, payload: unknown) { events.push({ type, payload }); },
   };
   const start = async () => {
     await (createSkillsPlugin({ home, allowLocalSources }) as ServerPlugin).setup(host as any);
-    return { initialize: initialize!, shutdown: shutdown!, endpoints };
+    return { initialize: initialize!, shutdown: shutdown!, endpoints, events };
   };
   return { root, source, config, start };
 }
@@ -98,6 +99,33 @@ test.serial("configured repository seeds import once; identical restarts preserv
   await third.shutdown();
 });
 
+test.serial("configured name/source conflicts preserve the existing catalog entry", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const initial = await f.start();
+  await initial.initialize([]);
+  const original = (await initial.endpoints.get("skills.list")!({}, caller) as any).skills[0];
+  await initial.shutdown();
+
+  (f.config as { repositories: Array<{ name: string; gitUrl: string }> }).repositories[0]!.gitUrl = "https://github.com/example/other";
+  const conflict = await f.start();
+  await conflict.initialize([]);
+  const items = (await conflict.endpoints.get("skills.list")!({}, caller) as any).skills;
+  expect(items).toHaveLength(1);
+  expect(items[0]).toMatchObject({ path: original.path, gitUrl: original.gitUrl, createdAt: original.createdAt });
+  expect(conflict.events.some(event => event.type === "skills.error" && JSON.stringify(event.payload).includes("alpha"))).toBe(true);
+  await conflict.shutdown();
+});
+
+test.serial("invalid configured checkout remains unregistered with an actionable seed report", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  await writeFile(join(f.source, "SKILL.md"), "---\nname: wrong\ndescription: Invalid fixture\n---\n# Instructions\n");
+  const plugin = await f.start();
+  await plugin.initialize([]);
+  expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).skills).toHaveLength(0);
+  expect(plugin.events.some(event => event.type === "skills.error" && JSON.stringify(event.payload).includes("alpha"))).toBe(true);
+  await plugin.shutdown();
+});
+
 test.serial("lower admission limits reject new catalog entries without evicting existing entries", async () => {
   const f = await fixture({
     repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }],
@@ -110,6 +138,7 @@ test.serial("lower admission limits reject new catalog entries without evicting 
   await plugin.initialize([]);
   const list = plugin.endpoints.get("skills.list")!;
   const add = plugin.endpoints.get("skills.add")!;
+  await expect(add({ name: "alpha", gitUrl: betaSource }, caller)).rejects.toMatchObject({ code: "DUPLICATE" });
   await expect(add({ name: "beta", gitUrl: betaSource }, caller)).rejects.toThrow(/limit/i);
   expect((await list({}, caller) as any).skills.map((skill: any) => skill.name)).toEqual(["alpha"]);
   await plugin.shutdown();
