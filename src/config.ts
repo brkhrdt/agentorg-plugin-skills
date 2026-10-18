@@ -9,7 +9,7 @@ const schema = z.object({
   maxCatalogEntries: z.number().int().min(1).max(256),
 }).strict();
 
-export interface SkillsConfig {
+export interface SkillsConfig extends Record<string, unknown> {
   repositories: Array<{ name: string; gitUrl: string }>;
   gitTimeoutMs: number;
   maxCatalogEntries: number;
@@ -33,6 +33,7 @@ export function validateSkillsConfig(value: unknown): SkillsConfig {
         !/^\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+\/?$/.test(url.pathname) ||
         url.pathname.split("/").some(part => part === "." || part === ".."))
       throw new Error("Only HTTPS repositories on github.com, gitlab.com or bitbucket.org are supported (no credentials, ports, queries or redirects)");
+    url.pathname = url.pathname.replace(/\/+$/, "");
     const canonical = url.toString();
     if (urls.has(canonical)) throw new Error(`Duplicate skills repository URL: ${canonical}`);
     urls.add(canonical);
@@ -51,7 +52,7 @@ export function skillsServerSettings(): ServerSettingsDefinition {
     version: 1,
     defaults: skillsStartupDefaults,
     fields: [
-      { key: "repositories", label: "Repository seeds", editor: "list", effect: "restart", itemIdKey: "name", itemLabelKey: "name",
+      { key: "repositories", label: "Repository seeds", editor: "list", effect: "restart", itemIdKey: "name", itemLabelKey: "name", itemDefaults: { name: "", gitUrl: "" },
         itemFields: [
           { key: "name", label: "Skill name", editor: "text", effect: "restart", description: "Lowercase letters, digits and hyphens; must match the repository SKILL.md name." },
           { key: "gitUrl", label: "HTTPS Git URL", editor: "text", effect: "restart", description: "Public HTTPS repository on github.com, gitlab.com or bitbucket.org. Restart imports missing seeds; removing a seed never deletes catalog data, clones or agent selections. Reusing a name for a different URL is a conflict." },
