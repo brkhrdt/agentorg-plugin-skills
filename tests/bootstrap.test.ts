@@ -638,14 +638,19 @@ test.serial("remove/re-add resets the bounded retry budget for an exhausted tran
     (f.config as any).repositories = [{ name: "alpha", gitUrl: alphaUrl }];
     f.setRevision(3);
     await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 3 } });
+    await waitFor(async () => {
+      const status = (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation;
+      const count = (await Bun.file(calls).text().catch(() => "")).trim().split("\n").filter(Boolean).length;
+      return status.desiredRevision === 3 && status.entries[0]?.status === "error" && status.entries[0]?.attempts === 1 && count === 1;
+    });
     await rm(failure, { force: true });
-    await pause(1_250);
+    await waitFor(async () => (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation.state === "ready");
     const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
     expect(view.reconciliation).toMatchObject({ desiredRevision: 3, state: "ready" });
     expect(view.skills.map((item: any) => item.name)).toContain("alpha");
     expect((await Bun.file(calls).text()).trim().split("\n").filter(Boolean)).toHaveLength(2);
   } finally { await plugin.shutdown(); }
-});
+}, 10_000);
 
 test.serial("restart resets an exhausted transient retry budget", async () => {
   const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });

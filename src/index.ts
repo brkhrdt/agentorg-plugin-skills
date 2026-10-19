@@ -154,7 +154,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     };
     let shuttingDown = false;
     let reconciliationWorker: Promise<void> | undefined;
-    let fullReconciliationRequest: { reason: string; resetRetries: boolean } | undefined;
+    let fullReconciliationRequest: { reason: string; resetRetries: boolean; allowPermanentRetry: boolean } | undefined;
+    let activePermanentRetryPermission = false;
     const targetedRetryRequests = new Set<string>();
     let observedSettingsRevision = 0;
     let sweepTimer: ReturnType<typeof setInterval> | undefined;
@@ -545,12 +546,13 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const message = (error as Error)?.message ?? "";
       return !/SKILL\.md|frontmatter|must match|exceeds|conflict|invalid skill name/i.test(message);
     }
-    async function reconcileIdentity(repository: { name: string; gitUrl: string }, revision: number, fingerprint: string, generation: number, allowPermanentRetry = false) {
+    async function reconcileIdentity(repository: { name: string; gitUrl: string }, revision: number, fingerprint: string, generation: number, allowPermanentRetry = false, allowTransientRetry = false) {
       const { name, gitUrl } = repository;
       if (!currentGenerationSync(generation, revision, fingerprint, name, gitUrl)) return;
       const previous = repositoryState(name, gitUrl);
       const repoFingerprint = repositoryFingerprint(name, gitUrl);
       if (previous?.failureClass === "permanent" && !allowPermanentRetry) return;
+      if (previous?.failureClass === "transient" && previous.status === "error" && !allowTransientRetry) return;
       if (previous?.fingerprint === repoFingerprint && previous.status === "error" && previous.attempts >= 3) return;
       let attempts = previous?.fingerprint === repoFingerprint ? previous.attempts : 0;
       const update = (status: RepositoryStatus, error?: string, failureClass?: "transient" | "permanent") => {
@@ -631,17 +633,20 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         }
       } finally { releaseIdentity(name, gitUrl, claim); }
     }
-    function requestFullReconciliation(reason: string, resetRetries = false) {
-      fullReconciliationRequest = { reason, resetRetries: resetRetries || (fullReconciliationRequest?.resetRetries ?? false) };
+    function requestFullReconciliation(reason: string, resetRetries = false, allowPermanentRetry = false) {
+      fullReconciliationRequest = {
+        reason, resetRetries: resetRetries || (fullReconciliationRequest?.resetRetries ?? false),
+        allowPermanentRetry: allowPermanentRetry || reason === "requested" || activePermanentRetryPermission || (fullReconciliationRequest?.allowPermanentRetry ?? false),
+      };
       targetedRetryRequests.clear();
     }
-    async function reconcileCurrent(reason: string, resetRetries = false, retryOnly?: Set<string>) {
+    async function reconcileCurrent(reason: string, resetRetries = false, retryOnly?: Set<string>, allowPermanentRetry = false) {
       let view: Awaited<ReturnType<typeof settingsView>>;
       try { view = await settingsView(); }
       catch (error) { if (!shuttingDown) throw error; return; }
       if (view.revision < observedSettingsRevision) { requestFullReconciliation("settings"); return; }
       observedSettingsRevision = view.revision;
-      if (!retryOnly) for (const repository of view.effective.repositories) {
+      if (!retryOnly && (reason === "startup" || resetRetries || reason === "requested")) for (const repository of view.effective.repositories) {
         const key = `${repository.name}\0${repository.gitUrl}`, timer = retryTimers.get(key);
         if (timer) clearTimeout(timer);
         retryTimers.delete(key);
@@ -659,7 +664,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         const timer = retryTimers.get(`${state.name}\0${state.gitUrl}`);
         if (timer) clearTimeout(timer);
         retryTimers.delete(`${state.name}\0${state.gitUrl}`);
-        saveRepositoryState({ ...state, status: "retired", error: undefined });
+        saveRepositoryState({ ...state, status: "retired", error: undefined, attempts: 0, failureClass: undefined });
       }
       const generation = saved.generation + 1;
       saved = { generation, desiredRevision: view.revision, fingerprint, state: "running", lastSuccessfulRevision: saved.lastSuccessfulRevision, entries: repositories.map(r => {
@@ -670,7 +675,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       for (const repository of repositories) {
         const identity = `${repository.name}\0${repository.gitUrl}`;
         if (shuttingDown || (retryOnly && !retryOnly.has(identity))) continue;
-        await reconcileIdentity(repository, view.revision, fingerprint, generation, reason === "requested");
+        const prior = repositoryState(repository.name, repository.gitUrl);
+        const allowTransientRetry = reason === "startup" || resetRetries || reason === "requested" || retryOnly?.has(identity) === true || prior?.status !== "error" || prior.failureClass !== "transient";
+        await reconcileIdentity(repository, view.revision, fingerprint, generation, allowPermanentRetry, allowTransientRetry);
         if (!currentGenerationSync(generation, view.revision, fingerprint)) { requestFullReconciliation("settings"); return; }
         saved.entries = repositories.map(r => {
           const item = repositoryState(r.name, r.gitUrl);
@@ -703,7 +710,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
             if (full) {
               fullReconciliationRequest = undefined;
               targetedRetryRequests.clear();
-              await reconcileCurrent(full.reason, full.resetRetries);
+              activePermanentRetryPermission = full.allowPermanentRetry;
+              try { await reconcileCurrent(full.reason, full.resetRetries, undefined, full.allowPermanentRetry); }
+              finally { activePermanentRetryPermission = false; }
             } else {
               const targets = new Set(targetedRetryRequests);
               targetedRetryRequests.clear();
