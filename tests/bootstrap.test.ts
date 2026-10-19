@@ -88,6 +88,25 @@ const waitFor = async (check: () => Promise<boolean>, timeoutMs = 5_000) => {
 const databasePath = async (root: string) => join(root, "home", ".agentorg", "skills",
   createHash("sha256").update(await realpath(join(root, "data"))).digest("hex"), "skills.sqlite");
 
+test.serial("a status read schedules reconciliation after a missed settings event", async () => {
+  const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: f.source }];
+    const before = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(before.skills).toHaveLength(0);
+    expect(before.reconciliation.state).toBe("pending");
+    await waitFor(async () => {
+      const current = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+      return current.reconciliation.state === "ready" && current.skills.some((item: any) => item.name === "alpha");
+    });
+    const after = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(after.reconciliation.state).toBe("ready");
+    expect(after.skills[0].origin).toBe("configured");
+  } finally { await plugin.shutdown(); }
+});
+
 test.serial("configured repository seeds import once; identical restarts preserve path and metadata", async () => {
   const f = await fixture({
     repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }],
@@ -224,6 +243,40 @@ test.serial("manual name and URL contention settles configured entries as confli
     expect(view.reconciliation.entries.every((entry: any) => /conflict/i.test(entry.error))).toBe(true);
     expect(view.skills.map((item: any) => item.name)).toEqual(["alpha"]);
   } finally { await plugin.shutdown(); }
+});
+
+test.serial("reservation release wakes the reconciler and persists the resulting manual/configured conflict", async () => {
+  const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
+  const entered = join(f.root, "manual-entered"), release = join(f.root, "manual-release");
+  process.env.TEST_GIT_GATE_URL = f.source;
+  process.env.TEST_GIT_GATE_ENTERED = entered;
+  process.env.TEST_GIT_GATE_RELEASE = release;
+  const plugin = await f.start(); let pluginClosed = false;
+  try {
+    const pendingManual = plugin.endpoints.get("skills.add")!({ name: "alpha", gitUrl: f.source }, caller) as Promise<any>;
+    await waitFor(async () => Bun.file(entered).exists());
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: "https://github.com/example/configured" }];
+    const pending = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(pending.reconciliation.entries).toMatchObject([{ name: "alpha", status: "pending" }]);
+    await writeFile(release, "release");
+    const manual = await pendingManual;
+    expect(manual.origin).toBe("manual");
+    await waitFor(async () => {
+      const result = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+      return result.reconciliation.entries[0]?.status === "error";
+    });
+    const result = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(result.reconciliation.entries[0].error).toContain("conflict");
+    expect(result.skills[0].origin).toBe("manual");
+    await plugin.shutdown(); pluginClosed = true;
+    const restarted = await f.start();
+    try {
+      await restarted.initialize([]);
+      const persisted = await restarted.endpoints.get("skills.list")!({}, caller) as any;
+      expect(persisted.reconciliation.entries).toMatchObject([{ name: "alpha", status: "error" }]);
+      expect(persisted.skills.map((item: any) => item.origin)).toEqual(["manual"]);
+    } finally { await restarted.shutdown(); }
+  } finally { if (!pluginClosed) await plugin.shutdown(); }
 });
 
 test.serial("legacy catalog ownership migration exposes configured versus manual provenance", async () => {

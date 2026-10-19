@@ -49,13 +49,23 @@ const promptly = async <T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> =
 test.serial("repository settings reconcile live after commit without restarting and enforce removal immediately", async () => {
   root = await mkdtemp(join(tmpdir(), "skills-live-settings-"));
   const dataDir = join(root, "data"), socketPath = join(dataDir, "server.sock");
-  const home = join(root, "home"), repo = join(root, "repo"), bin = join(root, "bin"), workspace = join(root, "workspace"), newWorkspace = join(root, "new-workspace");
-  await Promise.all([mkdir(home), mkdir(repo), mkdir(bin), mkdir(workspace), mkdir(newWorkspace)]);
+  const home = join(root, "home"), repo = join(root, "repo"), conflictRepo = join(root, "conflict-repo"), betaRepo = join(root, "beta-repo"), bin = join(root, "bin"), workspace = join(root, "workspace"), newWorkspace = join(root, "new-workspace");
+  await Promise.all([mkdir(home), mkdir(repo), mkdir(conflictRepo), mkdir(betaRepo), mkdir(bin), mkdir(workspace), mkdir(newWorkspace)]);
   await git(repo, "init", "--initial-branch=main");
   await git(repo, "config", "user.email", "test@example.com");
   await git(repo, "config", "user.name", "Test");
   await writeFile(join(repo, "SKILL.md"), "---\nname: alpha\ndescription: Alpha live fixture\n---\n# Instructions\n");
   await git(repo, "add", "."); await git(repo, "commit", "-m", "live fixture");
+  await git(conflictRepo, "init", "--initial-branch=main");
+  await git(conflictRepo, "config", "user.email", "test@example.com");
+  await git(conflictRepo, "config", "user.name", "Test");
+  await writeFile(join(conflictRepo, "SKILL.md"), "---\nname: alpha\ndescription: Conflicting alpha fixture\n---\n# Instructions\n");
+  await git(conflictRepo, "add", "."); await git(conflictRepo, "commit", "-m", "conflicting alpha fixture");
+  await git(betaRepo, "init", "--initial-branch=main");
+  await git(betaRepo, "config", "user.email", "test@example.com");
+  await git(betaRepo, "config", "user.name", "Test");
+  await writeFile(join(betaRepo, "SKILL.md"), "---\nname: beta\ndescription: Beta live fixture\n---\n# Instructions\n");
+  await git(betaRepo, "add", "."); await git(betaRepo, "commit", "-m", "beta fixture");
 
   const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
   const entered = join(root, "clone-entered"), release = join(root, "clone-release"), shim = join(bin, "git");
@@ -174,9 +184,40 @@ exec ${realGit} "$@"
   const unchanged = await client.request<AgentRecord>("agent.get", { agentId: agent.id });
   expect((unchanged.settings.extensions?.skills as Record<string, string> | undefined)?.alpha).toBe("available");
   const deniedGrant = await client.wait(await client.request<Operation>("agent.create", {
-    parentId: null, settings: { harness: "fixture", model: "test", cwd: newWorkspace, extensions: { skills: { alpha: "available" } } },
+    parentId: agent.id, settings: { harness: "fixture", model: "test", cwd: newWorkspace, extensions: { skills: { alpha: "available" } } },
   }));
   expect(deniedGrant.status).toBe("failed");
   expect(deniedGrant.error?.code).toBe("REPOSITORY_RETIRED");
+
+  const conflicting = await client.request<any>("organization.settings.update", {
+    namespace: "skills", expectedRevision: 4, patch: { repositories: [{ name: "alpha", gitUrl: conflictRepo }] },
+  });
+  expect(conflicting.revision).toBe(5);
+  await waitFor(async () => (await client!.request<any>("skills.list")).reconciliation.entries[0]?.status === "error");
+  const rejectedConflictGrant = await client.wait(await client.request<Operation>("agent.create", {
+    parentId: agent.id, settings: { harness: "fixture", model: "test", cwd: newWorkspace, extensions: { skills: { alpha: "available" } } },
+  }));
+  expect(rejectedConflictGrant.status).toBe("failed");
+  expect(rejectedConflictGrant.error?.code).toBe("REPOSITORY_CONFLICT");
+  const reset = await client.request<any>("organization.settings.update", {
+    namespace: "skills", expectedRevision: 5, patch: { repositories: [] },
+  });
+  expect(reset.revision).toBe(6);
   expect(process.pid).toBe(pid);
+
+  // Shutdown must join the live worker before closing its durable ledger.
+  await rm(entered, { force: true }); await rm(release, { force: true });
+  const betaUpdate = await promptly(client.request<any>("organization.settings.update", {
+    namespace: "skills", expectedRevision: 6, patch: { repositories: [{ name: "beta", gitUrl: betaRepo }] },
+  }));
+  expect(betaUpdate.revision).toBe(7);
+  await waitFor(async () => Bun.file(entered).exists());
+  let closed = false;
+  const closing = server.close().then(() => { closed = true; });
+  await Bun.sleep(50);
+  expect(closed).toBe(false);
+  await writeFile(release, "release");
+  await closing;
+  server = undefined;
+  expect(closed).toBe(true);
 }, 15_000);
