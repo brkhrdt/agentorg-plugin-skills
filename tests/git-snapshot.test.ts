@@ -50,12 +50,23 @@ test("local Git snapshot commits all bytes including ignored files without trans
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("snapshot verification accommodates thousands of long filenames", async () => {
+test("streamed index validation handles 9,016 Unicode-escaped paths near the OS path bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "skills-git-longnames-")), repo = join(root, "repo");
   await mkdir(repo);
   try {
-    for (let i = 0; i < 5_000; i++) await writeFile(join(repo, `${String(i).padStart(4, "0")}-${"x".repeat(220)}`), "x");
-    await initializeLocalSnapshot(repo, 30_000);
+    let deep = repo;
+    while (Buffer.byteLength(deep) < 3_700) {
+      const remaining = 3_700 - Buffer.byteLength(deep) - 1;
+      const component = "é".repeat(Math.min(100, Math.floor(remaining / 2)));
+      if (!component) break;
+      deep = join(deep, component);
+      await mkdir(deep);
+    }
+    for (let i = 0; i < 9_016; i++) await writeFile(join(deep, `q-é-\\\"-${String(i).padStart(5, "0")}`), "x");
+    const longest = Buffer.byteLength(join(deep, "q-é-\\\"-09015"));
+    expect(longest).toBeGreaterThan(3_700);
+    expect(longest).toBeLessThan(4_096);
+    await initializeLocalSnapshot(repo, 60_000);
     expect(await gitWithTimeout(repo, 10_000, "rev-list", "--count", "HEAD")).toBe("1");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
