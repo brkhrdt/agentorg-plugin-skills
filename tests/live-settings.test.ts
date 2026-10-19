@@ -16,6 +16,10 @@ let client: OrganizationClient | undefined;
 let priorPath: string | undefined;
 let priorEntered: string | undefined;
 let priorRelease: string | undefined;
+let priorGateSource: string | undefined;
+let priorFailSource: string | undefined;
+let priorFailFile: string | undefined;
+let priorCloneCalls: string | undefined;
 let releaseGate: string | undefined;
 afterEach(async () => {
   if (releaseGate) await writeFile(releaseGate, "release").catch(() => {});
@@ -24,7 +28,11 @@ afterEach(async () => {
   if (priorPath !== undefined) process.env.PATH = priorPath;
   if (priorEntered === undefined) delete process.env.SKILLS_CLONE_ENTERED; else process.env.SKILLS_CLONE_ENTERED = priorEntered;
   if (priorRelease === undefined) delete process.env.SKILLS_CLONE_RELEASE; else process.env.SKILLS_CLONE_RELEASE = priorRelease;
-  priorPath = undefined; priorEntered = undefined; priorRelease = undefined; releaseGate = undefined;
+  if (priorGateSource === undefined) delete process.env.SKILLS_CLONE_GATE_SOURCE; else process.env.SKILLS_CLONE_GATE_SOURCE = priorGateSource;
+  if (priorFailSource === undefined) delete process.env.SKILLS_CLONE_FAIL_SOURCE; else process.env.SKILLS_CLONE_FAIL_SOURCE = priorFailSource;
+  if (priorFailFile === undefined) delete process.env.SKILLS_CLONE_FAIL_FILE; else process.env.SKILLS_CLONE_FAIL_FILE = priorFailFile;
+  if (priorCloneCalls === undefined) delete process.env.SKILLS_CLONE_CALLS; else process.env.SKILLS_CLONE_CALLS = priorCloneCalls;
+  priorPath = undefined; priorEntered = undefined; priorRelease = undefined; priorGateSource = undefined; priorFailSource = undefined; priorFailFile = undefined; priorCloneCalls = undefined; releaseGate = undefined;
   if (root) await rm(root, { recursive: true, force: true });
   root = undefined;
 });
@@ -45,6 +53,74 @@ const promptly = async <T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> =
     })]);
   } finally { if (timer) clearTimeout(timer); }
 };
+
+test.serial("an expired targeted retry survives an unrelated settings wake during a blocked sibling clone", async () => {
+  root = await mkdtemp(join(tmpdir(), "skills-live-retry-coalesce-"));
+  const dataDir = join(root, "data"), socketPath = join(dataDir, "server.sock");
+  const home = join(root, "home"), alpha = join(root, "alpha"), beta = join(root, "beta"), bin = join(root, "bin");
+  await Promise.all([mkdir(home), mkdir(alpha), mkdir(beta), mkdir(bin)]);
+  for (const [path, name] of [[alpha, "alpha"], [beta, "beta"]]) {
+    await git(path, "init", "--initial-branch=main");
+    await git(path, "config", "user.email", "test@example.com");
+    await git(path, "config", "user.name", "Test");
+    await writeFile(join(path, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} retry race fixture\n---\n# Instructions\n`);
+    await git(path, "add", "."); await git(path, "commit", "-m", `${name} fixture`);
+  }
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const entered = join(root, "beta-entered"), release = join(root, "beta-release");
+  const failure = join(root, "alpha-fail-once"), calls = join(root, "clone-calls"), shim = join(bin, "git");
+  await writeFile(failure, "fail"); releaseGate = release;
+  await writeFile(shim, `#!/bin/sh
+args=" $* "
+source_arg=""; last=""
+for arg do source_arg="$last"; last="$arg"; done
+case "$args" in *" clone "*)
+  printf '%s\\n' "$source_arg" >> "$SKILLS_CLONE_CALLS"
+  case "$args" in *" $SKILLS_CLONE_FAIL_SOURCE "*) if [ -e "$SKILLS_CLONE_FAIL_FILE" ]; then exit 1; fi ;; esac
+  case "$args" in *" $SKILLS_CLONE_GATE_SOURCE "*) touch "$SKILLS_CLONE_ENTERED"; while [ ! -e "$SKILLS_CLONE_RELEASE" ]; do sleep 0.01; done ;; esac
+;; esac
+exec ${realGit} "$@"
+`);
+  await chmod(shim, 0o700);
+  priorPath = process.env.PATH; priorEntered = process.env.SKILLS_CLONE_ENTERED; priorRelease = process.env.SKILLS_CLONE_RELEASE;
+  priorGateSource = process.env.SKILLS_CLONE_GATE_SOURCE; priorFailSource = process.env.SKILLS_CLONE_FAIL_SOURCE;
+  priorFailFile = process.env.SKILLS_CLONE_FAIL_FILE; priorCloneCalls = process.env.SKILLS_CLONE_CALLS;
+  process.env.PATH = `${bin}:${priorPath ?? "/usr/bin:/bin"}`;
+  process.env.SKILLS_CLONE_ENTERED = entered; process.env.SKILLS_CLONE_RELEASE = release;
+  process.env.SKILLS_CLONE_GATE_SOURCE = beta; process.env.SKILLS_CLONE_FAIL_SOURCE = alpha;
+  process.env.SKILLS_CLONE_FAIL_FILE = failure; process.env.SKILLS_CLONE_CALLS = calls;
+
+  const pid = process.pid;
+  server = await OrganizationServer.start({ dataDir, socketPath, plugins: [createSkillsPlugin({ home, allowLocalSources: true })] });
+  client = await OrganizationClient.connect(socketPath);
+  const update = await promptly(client.request<any>("organization.settings.update", {
+    namespace: "skills", expectedRevision: 0, patch: { repositories: [{ name: "alpha", gitUrl: alpha }, { name: "beta", gitUrl: beta }] },
+  }));
+  expect(update.revision).toBe(1);
+  await waitFor(async () => Bun.file(entered).exists());
+  expect((await Bun.file(calls).text()).trim().split("\n")).toEqual([alpha, beta]);
+  await rm(failure, { force: true });
+  await Bun.sleep(1_250); // Alpha's targeted retry expires while beta still holds the full pass.
+
+  const numericWake = await promptly(client.request<any>("organization.settings.update", {
+    namespace: "skills", expectedRevision: 1, patch: { gitTimeoutMs: 30_000 },
+  }));
+  expect(numericWake.revision).toBe(2);
+  expect(process.pid).toBe(pid);
+  expect((await client.request<any>("organization.settings.get", { namespace: "skills" })).effective.gitTimeoutMs).toBe(30_000);
+  await writeFile(release, "release");
+  await waitFor(async () => {
+    const result = await client!.request<any>("skills.list");
+    return result.reconciliation.desiredRevision === 2 && ["ready", "error"].includes(result.reconciliation.state);
+  });
+  const cloneSources = (await Bun.file(calls).text()).trim().split("\n");
+  expect(cloneSources.filter(source => source === alpha)).toHaveLength(2);
+  const status = await client.request<any>("skills.list");
+  expect(status.reconciliation.state).toBe("ready");
+  expect(status.skills.map((item: any) => item.name).sort()).toEqual(["alpha", "beta"]);
+  expect((await client.request<any>("organization.snapshot")).seq).toBeGreaterThanOrEqual(0);
+  expect(process.pid).toBe(pid);
+}, 15_000);
 
 test.serial("repository settings reconcile live after commit without restarting and enforce removal immediately", async () => {
   root = await mkdtemp(join(tmpdir(), "skills-live-settings-"));
