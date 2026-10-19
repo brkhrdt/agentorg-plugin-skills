@@ -24,7 +24,7 @@ export async function createLocalLifecycle(options: { disabled?: boolean; corrup
     } });
   } };
   const corrupt: ServerPlugin = { apiVersion: 1, name: "corrupt-skill-env", setup(host) {
-    host.prepareLaunch(context => { context.env.AGENTORG_SKILL_FILES = "not-json"; });
+    host.prepareLaunch(context => { context.env.AGENTORG_SKILL_FILES = "[]"; });
   } };
   const plugins = (enabled: boolean, corruptEnv = false) => [harness, ...(enabled ? [createSkillsPlugin({ home }), ...(corruptEnv ? [corrupt] : [])] : [])];
   let server = await OrganizationServer.start({ dataDir, socketPath, plugins: plugins(!options.disabled, !!options.corruptSkillEnv),

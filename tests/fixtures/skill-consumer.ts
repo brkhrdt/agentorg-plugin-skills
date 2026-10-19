@@ -2,11 +2,11 @@ import * as acp from "@agentclientprotocol/sdk";
 import { readFile } from "node:fs/promises";
 import { Readable, Writable } from "node:stream";
 
-const sessionId = crypto.randomUUID();
+let sessionId: string = crypto.randomUUID();
 acp.agent({ name: "local-skill-consumer" })
   .onRequest("initialize", () => ({ protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: { loadSession: true } }))
   .onRequest("session/new", () => ({ sessionId }))
-  .onRequest("session/load", () => ({}))
+  .onRequest("session/load", ctx => { sessionId = ctx.params.sessionId; return {}; })
   .onRequest("session/prompt", async ctx => {
     const requested = ctx.params.prompt.map(block => block.type === "text" ? block.text : "").join(" ");
     const paths: string[] = JSON.parse(process.env.AGENTORG_SKILL_FILES ?? "[]");

@@ -40,6 +40,10 @@ async function waitMcp(client: Client, accepted: any) {
     expect(states(afterAdd.settings)).toBeUndefined();
     expect(await readdir(installRoot(root.settings.cwd!)).catch(() => [])).toEqual([]);
 
+    const rootGrant = await f.run("agent.modify", { agentId: root.id, settings: { extensions: { skills: { alpha: "available" } } } });
+    expect(rootGrant.status).toBe("completed");
+    expect((rootGrant.result as AgentRecord).revision).toBe(before.revision + 1);
+    expect(await readdir(installRoot(root.settings.cwd!)).catch(() => [])).toEqual([]);
     const childCwd = join(f.workspace, "child"); await mkdir(childCwd);
     const childOp = await f.run("agent.create", { parentId: root.id, name: "new-child", settings: { harness: "skill-consumer", model: "test", cwd: childCwd } });
     expect(childOp.status).toBe("completed");
@@ -49,14 +53,27 @@ async function waitMcp(client: Client, accepted: any) {
 
     const grant = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "available" } } } });
     expect(grant.status).toBe("completed");
+    expect((grant.result as AgentRecord).revision).toBe(child.revision + 1);
     expect(states((grant.result as AgentRecord).settings)).toEqual({ alpha: "available" });
-    expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: root.id })).settings)).toEqual({ alpha: "available" });
+    const rootAfterGrant = await f.client.request<AgentRecord>("agent.get", { agentId: root.id });
+    expect(rootAfterGrant.revision).toBe((rootGrant.result as AgentRecord).revision);
+    expect(states(rootAfterGrant.settings)).toEqual({ alpha: "available" });
     expect(await readdir(installRoot(child.settings.cwd!))).toEqual([]); // available does not install.
+
+    const rootInstall = await f.run("agent.modify", { agentId: root.id, settings: { extensions: { skills: { alpha: "installed" } } } });
+    expect(rootInstall.status).toBe("completed");
+    const rootInstalled = rootInstall.result as AgentRecord;
+    expect(rootInstalled.revision).toBe(rootAfterGrant.revision + 1);
+    expect(await Bun.file(join(installRoot(root.settings.cwd!), "alpha", "SKILL.md")).exists()).toBe(true);
 
     const install = await f.run("agent.modify", { agentId: child.id, expectedRevision: (grant.result as AgentRecord).revision,
       settings: { extensions: { skills: { alpha: "installed", beta: "available" } } } });
     expect(install.status).toBe("completed");
     const installed = install.result as AgentRecord;
+    expect(installed.revision).toBe((grant.result as AgentRecord).revision + 1);
+    const rootAfterReplacement = await f.client.request<AgentRecord>("agent.get", { agentId: root.id });
+    expect(rootAfterReplacement.revision).toBe(rootInstalled.revision + 1);
+    expect(states(rootAfterReplacement.settings)).toEqual({ alpha: "installed", beta: "available" });
     const alphaFile = join(installRoot(child.settings.cwd!), "alpha", "SKILL.md");
     expect(await readFile(alphaFile, "utf8")).toContain("alpha-local-proof");
     expect(await Bun.file(join(installRoot(child.settings.cwd!), "beta")).exists()).toBe(false);
@@ -77,7 +94,7 @@ async function waitMcp(client: Client, accepted: any) {
     const cleared = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: {} } } });
     expect(cleared.status).toBe("completed"); expect(states((cleared.result as AgentRecord).settings)).toEqual({});
     expect(await readdir(installRoot(child.settings.cwd!))).toEqual([]);
-    expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: root.id })).settings)).toEqual({ alpha: "available", beta: "available" });
+    expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: root.id })).settings)).toEqual({ alpha: "installed", beta: "available" });
   } finally { await f.cleanup(); }
 });
 
@@ -117,7 +134,7 @@ test("local installations are independent, retain identity/remotes and recover w
       await Bun.sleep(20);
     }
     expect(refs).toContain(commit);
-    const remoteName = (await git(central, "remote")).split("\\n").find(name => name.startsWith(`agent-${a.id}-`));
+    const remoteName = (await git(central, "remote")).split("\n").find(name => name.startsWith(`agent-${a.id}-`));
     expect(remoteName).toBeTruthy();
     expect(await git(central, "remote", "get-url", remoteName!)).toBe(aDir); // Recovery remote points to the retained workspace.
     expect(await readFile(join(aDir, "dirty-work.txt"), "utf8")).toContain("retain dirty work"); // Removed workspaces stay archived.
@@ -181,28 +198,31 @@ test("unsupported harness, missing installed checkout, corrupt launch environmen
   try {
     const alpha = await f.addSkill("alpha", "failure-proof");
     const unsupportedCwd = join(f.workspace, "unsupported"); await mkdir(unsupportedCwd);
-    const unsupported = await f.run("agent.create", { parentId: null, settings: { harness: "unsupported-skill-consumer", model: "test", cwd: unsupportedCwd, extensions: { skills: { alpha: "installed" } } } });
+    const root = (await f.createAgent("root")).agent;
+    const unsupported = await f.run("agent.create", { parentId: root.id, settings: { harness: "unsupported-skill-consumer", model: "test", cwd: unsupportedCwd, extensions: { skills: { alpha: "installed" } } } });
     expect(unsupported.status).toBe("failed"); expect(unsupported.error?.code).toBe("SKILL_NOT_READY");
 
-    const installed = await f.createAgent("valid", { alpha: "installed" });
-    expect(installed.operation.status).toBe("completed");
-    const activeSkill = join(installRoot(installed.cwd), "alpha", "SKILL.md");
+    const installedCwd = join(f.workspace, "valid"); await mkdir(installedCwd);
+    const installedOp = await f.run("agent.create", { parentId: root.id, settings: { harness: "skill-consumer", model: "test", cwd: installedCwd, extensions: { skills: { alpha: "installed" } } } });
+    expect(installedOp.status).toBe("completed");
+    const installed = installedOp.result as AgentRecord;
+    const activeSkill = join(installRoot(installedCwd), "alpha", "SKILL.md");
     await f.restart(true, true);
-    const corrupt = await f.run("agent.restart", { agentId: installed.agent.id });
-    expect(corrupt.status).toBe("failed"); expect(corrupt.error?.code).toBe("SKILL_NOT_READY");
+    const corrupt = await f.run("agent.restart", { agentId: installed.id });
+    expect(corrupt.status).toBe("failed"); expect(corrupt.error?.code).toBe("START_FAILED");
     await f.restart(true);
     const missingCheckout = activeSkill.slice(0, -"/SKILL.md".length);
     const retainedCheckout = join(f.workspace, "retained-after-missing-checkout");
     await rename(missingCheckout, retainedCheckout);
-    const missing = await f.run("agent.restart", { agentId: installed.agent.id });
+    const missing = await f.run("agent.restart", { agentId: installed.id });
     expect(missing.status).toBe("failed");
     await rename(retainedCheckout, missingCheckout);
     expect(await Bun.file(activeSkill).exists()).toBe(true); // Failure never destroys the agent copy.
 
     await f.restart(false);
     expect((await f.client.request<any>("organization.snapshot")).capabilities.plugins.skills).toBeUndefined();
-    expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: installed.agent.id })).settings)).toEqual({ alpha: "installed" });
-    const disabled = await f.run("agent.restart", { agentId: installed.agent.id });
+    expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: installed.id })).settings)).toEqual({ alpha: "installed" });
+    const disabled = await f.run("agent.restart", { agentId: installed.id });
     expect(disabled.status).toBe("failed"); expect(disabled.error?.message).toMatch(/Enable the skills plugin/);
     expect(await Bun.file(activeSkill).exists()).toBe(true);
   } finally { await f.cleanup(); }
