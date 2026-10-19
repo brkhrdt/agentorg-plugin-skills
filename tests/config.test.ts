@@ -49,10 +49,10 @@ test("skills declares the public server settings contract separately from agent 
   });
   const repositories = config!.fields.find(field => field.key === "repositories");
   expect(repositories).toMatchObject({
-    editor: "list", effect: "restart", itemIdKey: "name", itemLabelKey: "name",
+    editor: "list", effect: "immediate", itemIdKey: "name", itemLabelKey: "name",
     itemFields: [
-      { key: "name", editor: "text" },
-      { key: "gitUrl", editor: "text" },
+      { key: "name", editor: "text", effect: "immediate" },
+      { key: "gitUrl", editor: "text", effect: "immediate" },
     ],
   });
   expect(config!.fields.find(field => field.key === "gitTimeoutMs")).toMatchObject({

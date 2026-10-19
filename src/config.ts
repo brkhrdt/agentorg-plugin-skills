@@ -55,16 +55,17 @@ export function skillsServerSettings(allowLocalSources = false): ServerSettingsD
   return {
     namespace: "skills",
     title: "Skills",
-    description: "Repository seeds are imported at server startup. Removing a seed does not delete its catalog entry or installed agent data; repository changes take effect after restart.",
+    description: "Repository configuration is effective immediately. Repository preparation/readiness is separate from this settings transaction; configuration never installs a skill into an agent.",
     version: 1,
     defaults: skillsStartupDefaults,
     fields: [
-      { key: "repositories", label: "Repository seeds", editor: "list", effect: "restart", itemIdKey: "name", itemLabelKey: "name", itemDefaults: { name: "", gitUrl: "" },
+      { key: "repositories", label: "Repositories", editor: "list", effect: "immediate", itemIdKey: "name", itemLabelKey: "name", itemDefaults: { name: "", gitUrl: "" },
         itemFields: [
-          { key: "name", label: "Skill name", editor: "text", effect: "restart", description: "Lowercase letters, digits and hyphens; must match the repository SKILL.md name." },
-          { key: "gitUrl", label: "HTTPS Git URL", editor: "text", effect: "restart", description: "Public HTTPS repository on github.com, gitlab.com or bitbucket.org. Restart imports missing seeds; removing a seed never deletes catalog data, clones or agent selections. Reusing a name for a different URL is a conflict." },
+          { key: "name", label: "Skill name", editor: "text", effect: "immediate", description: "Lowercase letters, digits and hyphens; must match the repository SKILL.md name." },
+          { key: "gitUrl", label: "HTTPS Git URL", editor: "text", effect: "immediate", description: "Public HTTPS repository on github.com, gitlab.com or bitbucket.org. Reusing a registered name for a different URL is a conflict." },
         ],
-        description: "Repositories seeded into the persistent catalog at startup. Changes require a server restart; this is not a destructive mirror." },
+        description: "Desired repositories for the shared catalog. Effective configuration updates immediately; repository preparation does not install skills into agents." },
+
       { key: "gitTimeoutMs", label: "Git timeout (ms)", editor: "number", min: 1_000, max: 60_000, effect: "immediate", description: "Timeout for subsequent Git work (1,000–60,000 ms)." },
       { key: "maxCatalogEntries", label: "Maximum catalog entries", editor: "number", min: 1, max: 256, effect: "immediate", description: "Admission limit for new catalog entries (1–256). Lowering it never removes existing entries." },
     ],
