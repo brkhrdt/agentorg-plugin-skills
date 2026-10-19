@@ -638,7 +638,6 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         reason, resetRetries: resetRetries || (fullReconciliationRequest?.resetRetries ?? false),
         allowPermanentRetry: allowPermanentRetry || reason === "requested" || activePermanentRetryPermission || (fullReconciliationRequest?.allowPermanentRetry ?? false),
       };
-      targetedRetryRequests.clear();
     }
     async function reconcileCurrent(reason: string, resetRetries = false, retryOnly?: Set<string>, allowPermanentRetry = false) {
       let view: Awaited<ReturnType<typeof settingsView>>;
@@ -709,7 +708,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
             const full = fullReconciliationRequest;
             if (full) {
               fullReconciliationRequest = undefined;
-              targetedRetryRequests.clear();
+              if (full.reason === "startup" || full.resetRetries || full.reason === "requested") targetedRetryRequests.clear();
               activePermanentRetryPermission = full.allowPermanentRetry;
               try { await reconcileCurrent(full.reason, full.resetRetries, undefined, full.allowPermanentRetry); }
               finally { activePermanentRetryPermission = false; }
