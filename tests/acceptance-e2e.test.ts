@@ -88,7 +88,10 @@ test("TUI configures a seeded local skill, restarts, installs, calls authenticat
     ui.keys("\x1b[B".repeat(5)); await ui.visible("Skills:"); ui.keys("\r"); await ui.visible("Alpha local acceptance fixture");
     ui.keys("i"); await ui.visible("installed"); ui.keys("S"); await ui.visible("Create agent · root");
     ui.keys("S");
-    await waitFor(() => ui!.screen().includes("LATEST TRACKED EVENT") && ui!.screen().includes("acceptance-worker") && !ui!.screen().includes("Create agent · root"));
+    await waitFor(() => {
+      const screen = ui!.screen();
+      return screen.includes("LATEST TRACKED EVENT") && screen.includes("acceptance-worker") && screen.includes("↑↓ select") && !screen.includes("Save changes");
+    });
     await waitFor(async () => {
       snapshot = await admin!.request("organization.snapshot");
       return snapshot.agents.some((agent: AgentRecord) => agent.name === "acceptance-worker");
@@ -120,8 +123,16 @@ test("TUI configures a seeded local skill, restarts, installs, calls authenticat
     // it, retain this work under recovery, and preserve the shared catalog/ref.
     const userWork = join(installRoot(work), "alpha", "user-work.txt");
     await writeFile(userWork, "keep this local work\n");
-    ui.keys("e"); await ui.visible("Modify agent · revision 1");
-    ui.keys("\x1b[B".repeat(9)); await ui.visible("1 selected"); ui.keys("\r"); await ui.visible("Alpha local acceptance fixture");
+    ui.keys("e");
+    const editForm = () => {
+      const screen = ui!.screen();
+      return screen.includes("revision 1") && screen.includes("Save changes") && screen.includes("acceptance-worker") && screen.includes("Skills");
+    };
+    await waitFor(editForm);
+    // The form title changes with its selected row; use the ordinary-form
+    // fields/save row above, then navigate from the known first field to Skills.
+    ui.keys("\x1b[B".repeat(9)); await ui.visible("1 selected");
+    ui.keys("\r"); await ui.visible("Alpha local acceptance fixture");
     ui.keys("d"); ui.keys("S"); await ui.visible("None selected"); ui.keys("S");
     await waitFor(async () => {
       const current = await admin!.request<AgentRecord>("agent.get", { agentId: agent.id });
