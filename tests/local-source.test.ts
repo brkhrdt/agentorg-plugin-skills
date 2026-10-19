@@ -24,6 +24,18 @@ test("resolve accepts directory or root SKILL.md; relative paths need explicit b
   } finally { await fixture.cleanup(); }
 });
 
+test("missing root metadata is INVALID_PARAMS while root metadata I/O failures retain INVALID_PATH", async () => {
+  const fixture = await createLocalSkillFixture();
+  try {
+    const noEntry = Object.assign(new Error("missing"), { code: "ENOENT" });
+    await expect(resolveLocalSource(fixture.path, { rootSkillLstat: async () => { throw noEntry; } }))
+      .rejects.toMatchObject({ code: "INVALID_PARAMS", cause: { code: "ENOENT" }, message: expect.stringContaining("root SKILL.md") });
+    const denied = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    await expect(resolveLocalSource(fixture.path, { rootSkillLstat: async () => { throw denied; } }))
+      .rejects.toMatchObject({ code: "INVALID_PATH", cause: { code: "EACCES" }, message: expect.stringContaining("EACCES") });
+  } finally { await fixture.cleanup(); }
+});
+
 test("top-level directory aliases canonicalize; source copy includes ignored, untracked and .agents but excludes .git at every depth", async () => {
   const fixture = await createLocalSkillFixture();
   const root = await temporary();

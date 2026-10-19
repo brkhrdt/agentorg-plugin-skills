@@ -5,7 +5,13 @@ import { Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { MAX_SKILL_ENTRIES, MAX_SKILL_MD_BYTES, MAX_SKILL_PAYLOAD_BYTES, readSkillMetadata } from "./skill-content.ts";
 
-export interface LocalSourceOptions { baseDir?: string; home?: string; centralRoot?: string }
+export interface LocalSourceOptions {
+  baseDir?: string;
+  home?: string;
+  centralRoot?: string;
+  /** Test seam for classifying root metadata lookup failures deterministically. */
+  rootSkillLstat?: (path: string) => ReturnType<typeof lstat>;
+}
 export interface ResolvedLocalSource { directory: string; skillFile: string; device: number; inode: number }
 export interface LocalCopyOptions extends LocalSourceOptions {
   /** Internal caller-owned staging root allowed inside the protected central root. */
@@ -68,8 +74,14 @@ export async function resolveLocalSource(input: unknown, options: LocalSourceOpt
   const directoryInfo = await lstat(directory).catch(() => undefined);
   if (!directoryInfo?.isDirectory() || directoryInfo.isSymbolicLink()) fail("Local skill root must be a regular directory");
   const skillFile = join(directory, "SKILL.md");
-  const skillInfo = await lstat(skillFile).catch(() => undefined);
-  if (!skillInfo) return fail("Local skill directory must contain a root SKILL.md", "INVALID_PARAMS");
+  let skillInfo: Awaited<ReturnType<typeof lstat>>;
+  try { skillInfo = await (options.rootSkillLstat ?? lstat)(skillFile); }
+  catch (error: any) {
+    if (error?.code === "ENOENT")
+      throw Object.assign(new Error("Local skill directory must contain a root SKILL.md"), { code: "INVALID_PARAMS", cause: error });
+    throw Object.assign(new Error(`Cannot inspect root SKILL.md${error?.code ? ` (${error.code})` : ""}: ${error?.message ?? error}`),
+      { code: "INVALID_PATH", cause: error });
+  }
   if (!skillInfo.isFile() || skillInfo.isSymbolicLink()) fail("Root SKILL.md must be a regular non-symlink file", "INVALID_PATH");
   if (options.centralRoot) {
     const central = await realpath(options.centralRoot);
