@@ -142,18 +142,19 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const next = publishTail.then(work); publishTail = next.catch(() => {}); return next;
     }
     const identityClaims = new Map<string, string>();
-    const claimIdentity = (name: string, gitUrl: string): string | undefined => {
-      const keys = [`name:${name}`, `url:${gitUrl}`];
+    const claimIdentity = (name: string, gitUrl: string, origin: RepositoryOrigin): string | undefined => {
+      const keys = [`${origin}:name:${name}`, `${origin}:url:${gitUrl}`];
       if (keys.some(key => identityClaims.has(key))) return undefined;
       const owner = randomUUID(); for (const key of keys) identityClaims.set(key, owner);
       return owner;
     };
-    const releaseIdentity = (name: string, gitUrl: string, owner: string) => {
-      for (const key of [`name:${name}`, `url:${gitUrl}`]) if (identityClaims.get(key) === owner) identityClaims.delete(key);
+    const releaseIdentity = (name: string, gitUrl: string, owner: string, origin: RepositoryOrigin) => {
+      for (const key of [`${origin}:name:${name}`, `${origin}:url:${gitUrl}`]) if (identityClaims.get(key) === owner) identityClaims.delete(key);
     };
     let shuttingDown = false;
     let reconciliationWorker: Promise<void> | undefined;
-    let reconciliationRequested = false;
+    let fullReconciliationRequest: { reason: string; resetRetries: boolean } | undefined;
+    const targetedRetryRequests = new Set<string>();
     let observedSettingsRevision = 0;
     let sweepTimer: ReturnType<typeof setInterval> | undefined;
     const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -256,7 +257,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         }
         const retiredDowngrade = !configuredActive(item) && previousStates[name] === "installed" && state === "available";
         const desiredConflict = desiredRepositories().find(repository => repository.name === name && repository.gitUrl !== item.gitUrl);
-        if (desiredConflict && state !== "unavailable" && previousStates[name] !== state && !retiredDowngrade)
+        if (repositoryState(item.name, item.gitUrl)?.origin === "configured" && desiredConflict && state !== "unavailable" && previousStates[name] !== state && !retiredDowngrade)
           fail(`Skill ${name} conflicts with configured source ${desiredConflict.gitUrl}`, "REPOSITORY_CONFLICT");
         if (state !== "unavailable" && !grantable(item) && previousStates[name] !== state && !retiredDowngrade) {
           const record = repositoryState(item.name, item.gitUrl);
@@ -460,7 +461,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     async function registerCatalog(name: string, inputUrl: unknown): Promise<Skill> {
       if (typeof name !== "string" || name.length > 64 || !idPattern.test(name)) fail("Invalid skill name");
       const url = source(inputUrl, options.allowLocalSources ?? false);
-      const claim = claimIdentity(name, url);
+      const claim = claimIdentity(name, url, "manual");
       if (!claim) fail(`Repository registration is already in progress for ${name}`, "DUPLICATE");
       try {
         const existing = catalog();
@@ -494,7 +495,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         host.emit("skills.catalog_added", exposedSkill(record));
         return exposedSkill(record);
       } finally {
-        releaseIdentity(name, url, claim);
+        releaseIdentity(name, url, claim, "manual");
         if (desiredRepositories().some(repository => repository.name === name || repository.gitUrl === url)) scheduleReconciliation("catalog-add");
       }
     }
@@ -520,7 +521,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         observedSettingsRevision = Math.max(observedSettingsRevision, view.revision);
         return view.revision === revision && identityFingerprint(view.effective.repositories) === fingerprint && currentGenerationSync(generation, revision, fingerprint, name, gitUrl);
       } catch (error) {
-        if (!shuttingDown) { reconciliationRequested = true; report(error); }
+        if (!shuttingDown) report(error);
         return false;
       }
     }
@@ -529,10 +530,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const key = `${name}\0${url}`;
       if (retryTimers.has(key)) return;
       const delay = attempts === 1 ? 1_000 : 5_000;
-      retryTimers.set(key, setTimeout(() => {
+      const timer = setTimeout(() => {
+        if (retryTimers.get(key) !== timer) return;
         retryTimers.delete(key);
-        if (configuredIdentity(name, url)) void runReconciliation("retry");
-      }, delay));
+        if (!shuttingDown && configuredIdentity(name, url)) void runReconciliation("retry", false, key).catch(error => report(error));
+      }, delay);
+      retryTimers.set(key, timer);
     }
     function transient(error: unknown) {
       const code = (error as any)?.code;
@@ -579,12 +582,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         if (update("error", message)) report(new Error(`Configured repository ${name} (${gitUrl}) failed: ${message}`));
         return;
       }
-      const claim = claimIdentity(name, gitUrl);
+      const claim = claimIdentity(name, gitUrl, "configured");
       if (!claim) { update("pending", "Repository registration is already in progress"); return; }
       const path = join(root, hash(name) + "-" + randomUUID());
       const journalId = `catalog-${randomUUID()}`;
       put("journal", journalId, { id: journalId, agentId: "catalog", revision, actions: [], path, repository: { name, gitUrl } });
-      if (!update("pending")) { releaseIdentity(name, gitUrl, claim); return; }
+      if (!update("pending")) { releaseIdentity(name, gitUrl, claim, "configured"); return; }
       try {
         const url = source(gitUrl, options.allowLocalSources ?? false);
         await git(root, "-c", `protocol.file.allow=${url.startsWith("/") ? "always" : "never"}`, "clone", "--", url, path);
@@ -599,7 +602,10 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           const now = catalog();
           const byName = now.find(item => item.name === name), byUrl = now.find(item => item.gitUrl === gitUrl);
           if (byName || byUrl) {
-            if (byName?.gitUrl === gitUrl) { update("ready"); dropJournal(journalId); return; }
+            if (byName?.gitUrl === gitUrl) {
+              if (repositoryState(name, gitUrl)?.origin !== "manual") update("ready");
+              dropJournal(journalId); return;
+            }
             update("error", `Repository identity conflicts with registered skill ${byName?.name ?? byUrl?.name}`); return;
           }
           if (now.length >= effectiveConfig().maxCatalogEntries) { update("error", `Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`); return; }
@@ -617,14 +623,23 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           report(new Error(`Configured repository ${name} (${gitUrl}) failed; work retained at ${path}: ${message}`));
           if (transient(error)) scheduleRetry(name, gitUrl, attempts);
         }
-      } finally { releaseIdentity(name, gitUrl, claim); }
+      } finally { releaseIdentity(name, gitUrl, claim, "configured"); }
     }
-    async function reconcileCurrent(reason: string, resetRetries = false) {
+    function requestFullReconciliation(reason: string, resetRetries = false) {
+      fullReconciliationRequest = { reason, resetRetries: resetRetries || (fullReconciliationRequest?.resetRetries ?? false) };
+      targetedRetryRequests.clear();
+    }
+    async function reconcileCurrent(reason: string, resetRetries = false, retryOnly?: Set<string>) {
       let view: Awaited<ReturnType<typeof settingsView>>;
       try { view = await settingsView(); }
       catch (error) { if (!shuttingDown) throw error; return; }
-      if (view.revision < observedSettingsRevision) { reconciliationRequested = true; return; }
+      if (view.revision < observedSettingsRevision) { requestFullReconciliation("settings"); return; }
       observedSettingsRevision = view.revision;
+      if (!retryOnly) for (const repository of view.effective.repositories) {
+        const key = `${repository.name}\0${repository.gitUrl}`, timer = retryTimers.get(key);
+        if (timer) clearTimeout(timer);
+        retryTimers.delete(key);
+      }
       const repositories = view.effective.repositories;
       const fingerprint = identityFingerprint(repositories);
       let saved = reconciliation();
@@ -644,12 +659,16 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         saveRepositoryState({ ...state, status: "retired", error: undefined });
       }
       const generation = saved.generation + 1;
-      saved = { generation, desiredRevision: view.revision, fingerprint, state: "running", lastSuccessfulRevision: saved.lastSuccessfulRevision, entries: repositories.map(r => ({ name: r.name, gitUrl: r.gitUrl, status: "pending", attempts: repositoryState(r.name, r.gitUrl)?.attempts ?? 0 })) };
-      if (!saveStatus(saved, true)) { reconciliationRequested = true; return; }
+      saved = { generation, desiredRevision: view.revision, fingerprint, state: "running", lastSuccessfulRevision: saved.lastSuccessfulRevision, entries: repositories.map(r => {
+        const state = repositoryState(r.name, r.gitUrl), key = `${r.name}\0${r.gitUrl}`;
+        return { name: r.name, gitUrl: r.gitUrl, status: retryOnly?.has(key) ? "pending" : state?.status ?? "pending", attempts: state?.attempts ?? 0, error: state?.error };
+      }) };
+      if (!saveStatus(saved, true)) { requestFullReconciliation("settings"); return; }
       for (const repository of repositories) {
-        if (shuttingDown) break;
+        const identity = `${repository.name}\0${repository.gitUrl}`;
+        if (shuttingDown || (retryOnly && !retryOnly.has(identity))) continue;
         await reconcileIdentity(repository, view.revision, fingerprint, generation);
-        if (!currentGenerationSync(generation, view.revision, fingerprint)) { reconciliationRequested = true; return; }
+        if (!currentGenerationSync(generation, view.revision, fingerprint)) { requestFullReconciliation("settings"); return; }
         saved.entries = repositories.map(r => {
           const item = repositoryState(r.name, r.gitUrl);
           return { name: r.name, gitUrl: r.gitUrl, status: item?.status ?? "pending", error: item?.error, attempts: item?.attempts ?? 0 };
@@ -660,7 +679,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       try { current = await settingsView(); }
       catch (error) { if (shuttingDown) return; throw error; }
       observedSettingsRevision = Math.max(observedSettingsRevision, current.revision);
-      if (current.revision !== view.revision || identityFingerprint(current.effective.repositories) !== fingerprint || !currentGenerationSync(generation, view.revision, fingerprint)) { reconciliationRequested = true; return; }
+      if (current.revision !== view.revision || identityFingerprint(current.effective.repositories) !== fingerprint || !currentGenerationSync(generation, view.revision, fingerprint)) { requestFullReconciliation("settings"); return; }
       const finalStates = repositories.map(r => repositoryState(r.name, r.gitUrl));
       const complete = finalStates.every(state => state?.status === "ready");
       saved.state = complete ? "ready" : finalStates.some(state => state?.status === "pending") ? "pending" : "error";
@@ -669,23 +688,31 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       saveStatus(saved);
       if (reason === "startup" && !complete) report(new Error("Configured repository reconciliation has pending or failed entries"));
     }
-    async function runReconciliation(reason: string, resetRetries = false) {
+    async function runReconciliation(reason: string, resetRetries = false, retryIdentity?: string) {
       if (shuttingDown) return;
-      reconciliationRequested = true;
-      if (resetRetries) for (const state of repositoryStates()) if (state.origin === "configured" && state.status === "error") {
-        saveRepositoryState({ ...state, attempts: 0 });
-        const key = `${state.name}\0${state.gitUrl}`, timer = retryTimers.get(key);
-        if (timer) clearTimeout(timer);
-        retryTimers.delete(key);
-      }
+      if (retryIdentity) targetedRetryRequests.add(retryIdentity);
+      else requestFullReconciliation(reason, resetRetries);
       if (!reconciliationWorker) {
-        reconciliationWorker = (async () => {
-          do { reconciliationRequested = false; await reconcileCurrent(reason, resetRetries); resetRetries = false; }
-          while (reconciliationRequested && !shuttingDown);
+        let worker: Promise<void>;
+        worker = (async () => {
+          while (!shuttingDown && (fullReconciliationRequest || targetedRetryRequests.size)) {
+            const full = fullReconciliationRequest;
+            if (full) {
+              fullReconciliationRequest = undefined;
+              targetedRetryRequests.clear();
+              await reconcileCurrent(full.reason, full.resetRetries);
+              for (const repository of desiredRepositories()) targetedRetryRequests.delete(`${repository.name}\0${repository.gitUrl}`);
+            } else {
+              const targets = new Set(targetedRetryRequests);
+              targetedRetryRequests.clear();
+              await reconcileCurrent("retry", false, targets);
+            }
+          }
         })().finally(() => {
-          reconciliationWorker = undefined;
-          if (reconciliationRequested && !shuttingDown) void runReconciliation("coalesced").catch(error => report(error));
+          if (reconciliationWorker === worker) reconciliationWorker = undefined;
+          if (!shuttingDown && (fullReconciliationRequest || targetedRetryRequests.size)) void runReconciliation("coalesced").catch(error => report(error));
         });
+        reconciliationWorker = worker;
       }
       await reconciliationWorker;
     }

@@ -72,6 +72,30 @@ test("catalog validation, duplicate/source policy, durable catalog and scoped ca
   await expect(f.server.organization.request("skills.list", {}, { kind: "agent", id: f.root.id })).rejects.toThrow("client-only");
 });
 
+test("manual repository grants stay independent of a conflicting configured identity", async () => {
+  const f = await fixture();
+  const manual = await f.add("alpha");
+  const configured = join(f.dir, "configured-alpha"); await mkdir(configured);
+  await git(configured, "init", "--initial-branch=main");
+  await git(configured, "config", "user.email", "test@example.com");
+  await git(configured, "config", "user.name", "Test");
+  await writeFile(join(configured, "SKILL.md"), "---\nname: alpha\ndescription: Configured alpha fixture\n---\n# Instructions\n");
+  await git(configured, "add", "."); await git(configured, "commit", "-m", "configured alpha");
+  const update = await f.client.request<any>("organization.settings.update", { namespace: "skills", expectedRevision: 0, patch: { repositories: [{ name: "alpha", gitUrl: configured }] } });
+  expect(update.restartRequired).toEqual([]);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const view = await f.client.request<any>("skills.list");
+    if (view.reconciliation.entries[0]?.status === "error") break;
+    await Bun.sleep(20);
+  }
+  const view = await f.client.request<any>("skills.list");
+  expect(view.reconciliation.entries[0]).toMatchObject({ name: "alpha", status: "error" });
+  expect(view.skills).toMatchObject([{ name: "alpha", gitUrl: manual.gitUrl, origin: "manual" }]);
+  const child = await f.create(f.root.id, "child", { alpha: "available" });
+  expect(child.status).toBe("completed");
+  expect(states((child.result as AgentRecord).settings)).toEqual({ alpha: "available" });
+});
+
 test("public grants, complete replacement, omission, persisted installed states and explicit launch paths", async () => {
   const f = await fixture(); await f.add(); await f.add("beta");
   const child = (await f.create(f.root.id, "child")).result as AgentRecord;
