@@ -315,6 +315,39 @@ test.serial("manual identity is independent while a different configured source 
   }
 });
 
+test.serial("explicit permanent-failure retry permission survives a coalesced settings wake", async () => {
+  const alphaUrl = "https://github.com/example/alpha", betaUrl = "https://github.com/example/beta";
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: alphaUrl }, { name: "beta", gitUrl: betaUrl }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  await writeFile(join(f.source, "SKILL.md"), "---\nname: [broken\n---\n# Instructions\n");
+  const betaSource = join(f.root, "source-beta"); await mkdir(betaSource);
+  await writeFile(join(betaSource, "SKILL.md"), "---\nname: beta\ndescription: Beta fixture\n---\n# Instructions\n");
+  const calls = join(f.root, "git-calls"), entered = join(f.root, "beta-entered"), release = join(f.root, "beta-release");
+  process.env.TEST_GIT_CALLS = calls; process.env.TEST_GIT_SOURCES = JSON.stringify({ [betaUrl]: betaSource });
+  process.env.TEST_GIT_GATE_URL = betaUrl; process.env.TEST_GIT_GATE_ENTERED = entered; process.env.TEST_GIT_GATE_RELEASE = release;
+  const plugin = await f.start(); const startup = plugin.initialize([]);
+  try {
+    await waitFor(async () => Bun.file(entered).exists());
+    expect((await Bun.file(calls).text()).trim().split("\n").filter(url => url === alphaUrl)).toHaveLength(1);
+    await writeFile(join(f.source, "SKILL.md"), "---\nname: alpha\ndescription: repaired alpha fixture\n---\n# Instructions\n");
+    await plugin.endpoints.get("skills.reconcile")!({}, caller);
+    await pause(20); // Let the explicit retry queue behind the currently blocked worker.
+    (f.config as any).gitTimeoutMs = 30_000;
+    f.setRevision(1);
+    await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 1 } });
+    await writeFile(release, "release");
+    await startup;
+    const callsForAlpha = (await Bun.file(calls).text()).trim().split("\n").filter(url => url === alphaUrl);
+    expect(callsForAlpha).toHaveLength(2);
+    const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(view.reconciliation).toMatchObject({ desiredRevision: 1, state: "ready" });
+    expect(view.skills.map((item: any) => item.name)).toContain("alpha");
+  } finally {
+    await writeFile(release, "release").catch(() => {});
+    await startup.catch(() => {});
+    await plugin.shutdown();
+  }
+}, 15_000);
+
 test.serial("same exact manual/configured identity cannot double-clone or corrupt ownership", async () => {
   const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
   const calls = join(f.root, "git-calls"), entered = join(f.root, "clone-entered"), release = join(f.root, "clone-release");
@@ -434,6 +467,41 @@ test.serial("permanent malformed alpha is not retried by an unrelated numeric se
   } finally { await plugin.shutdown(); }
 });
 
+test.serial("re-adding a repaired permanent identity clears its persisted failure without restart", async () => {
+  const alphaUrl = "https://github.com/example/alpha";
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: alphaUrl }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  await writeFile(join(f.source, "SKILL.md"), "---\nname: [broken\n---\n# Instructions\n");
+  const calls = join(f.root, "git-calls"); process.env.TEST_GIT_CALLS = calls;
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    const failed = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(failed.reconciliation.entries[0]).toMatchObject({ name: "alpha", status: "error" });
+    expect(failed.reconciliation.entries[0].error).toBeTruthy();
+
+    await writeFile(join(f.source, "SKILL.md"), "---\nname: alpha\ndescription: repaired alpha fixture\n---\n# Instructions\n");
+    (f.config as any).repositories = [];
+    f.setRevision(1);
+    await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 1 } });
+    await waitFor(async () => {
+      const status = (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation;
+      return status.desiredRevision === 1 && status.state === "ready";
+    });
+
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: alphaUrl }];
+    f.setRevision(2);
+    await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 2 } });
+    await waitFor(async () => {
+      const status = (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation;
+      return status.desiredRevision === 2 && ["ready", "error"].includes(status.state);
+    });
+    const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(view.reconciliation.state).toBe("ready");
+    expect(view.skills.map((item: any) => item.name)).toContain("alpha");
+    expect((await Bun.file(calls).text()).trim().split("\n").filter(Boolean)).toEqual([alphaUrl, alphaUrl]);
+  } finally { await plugin.shutdown(); }
+});
+
 test.serial("the periodic sweep reconciles settings missed without a status read", async () => {
   const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
   const calls = join(f.root, "git-calls"); process.env.TEST_GIT_CALLS = calls;
@@ -534,6 +602,48 @@ test.serial("malformed YAML is permanent and does not consume transient retry at
     const state = JSON.parse((db.query("SELECT data FROM repository_state WHERE name='alpha'").get() as any).data);
     db.close();
     expect(state.attempts).toBe(1);
+  } finally { await plugin.shutdown(); }
+});
+
+test.serial("remove/re-add resets the bounded retry budget for an exhausted transient identity", async () => {
+  const alphaUrl = "https://github.com/example/alpha";
+  const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const calls = join(f.root, "git-calls"), failure = join(f.root, "git-failure");
+  process.env.TEST_GIT_CALLS = calls; process.env.TEST_GIT_FAIL = failure; process.env.TEST_GIT_FAIL_URL = alphaUrl;
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    const fingerprint = createHash("sha256").update(JSON.stringify(["alpha", alphaUrl])).digest("hex");
+    const db = new Database(await databasePath(f.root));
+    db.query("INSERT INTO repository_state VALUES (?,?,?)").run("alpha", alphaUrl, JSON.stringify({
+      name: "alpha", gitUrl: alphaUrl, origin: "configured", status: "error", error: "transient failure",
+      attempts: 3, fingerprint, failureClass: "transient",
+    }));
+    db.close();
+    await writeFile(failure, "fail");
+
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: alphaUrl }];
+    f.setRevision(1);
+    await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 1 } });
+    await waitFor(async () => {
+      const status = (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation;
+      return status.desiredRevision === 1 && status.state === "error";
+    });
+    expect((await Bun.file(calls).text().catch(() => "")).trim()).toBe("");
+
+    (f.config as any).repositories = [];
+    f.setRevision(2);
+    await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 2 } });
+    await waitFor(async () => (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation.desiredRevision === 2);
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: alphaUrl }];
+    f.setRevision(3);
+    await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 3 } });
+    await rm(failure, { force: true });
+    await pause(1_250);
+    const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(view.reconciliation).toMatchObject({ desiredRevision: 3, state: "ready" });
+    expect(view.skills.map((item: any) => item.name)).toContain("alpha");
+    expect((await Bun.file(calls).text()).trim().split("\n").filter(Boolean)).toHaveLength(2);
   } finally { await plugin.shutdown(); }
 });
 
