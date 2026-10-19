@@ -68,7 +68,7 @@ Exactly one root `SKILL.md` is loaded per repository. It must be a regular file 
 
 Production sources are HTTPS on **github.com, gitlab.com or bitbucket.org**, without embedded credentials, custom ports, queries, fragments or redirects. Other sources are rejected. Git runs without shell interpolation, system/global Git configuration, ambient URL rewrites or interactive prompts. Private authentication can use an operator-provided noninteractive `GIT_ASKPASS`; credential-helper configuration in global Git config is intentionally not read. Each Git subprocess is bounded to 60 seconds and 1 MiB diagnostic output. Clones are size-checked **after cloning**, not bandwidth/disk-quota sandboxed; use OS resource limits and trusted sources. Proxy/DNS/server environment remain operator-trusted.
 
-Tests/embedded deployments can explicitly call `createSkillsPlugin({home, allowLocalSources: true})` for local absolute repository fixtures. These options are not accepted through the socket, and the default CLI export never enables local sources.
+Tests/embedded deployments can explicitly call `createSkillsPlugin({home, allowLocalSources: true})` for local absolute repository fixtures, including repository seeds edited through the generic server-settings UI/API in that trusted test host. The opt-in is a plugin-factory option (not a socket parameter); the default CLI export rejects local sources.
 
 ## Storage, preservation and recovery
 
@@ -94,4 +94,4 @@ bun test
 bun run test:binary
 ```
 
-Local Git fixtures cover restart persistence, atomic ancestor grants, delegation, replacements/omissions, plugin order, canonical cwd conflicts, dirty/untracked preservation, reinstall generations, interrupted moves, collisions, failure retries and disabled-plugin launches. A no-model/no-network test checks explicit versus ambient loading using the installed real `pi` CLI (skipped when unavailable).
+Local Git fixtures cover restart persistence, atomic ancestor grants, delegation, replacements/omissions, plugin order, canonical cwd conflicts, dirty/untracked preservation, reinstall generations, interrupted moves, collisions, failure retries and disabled-plugin launches. An end-to-end terminal test configures a trusted local seed through server settings, restarts, selects it through the ordinary agent form, calls `skills_list` over the authenticated MCP stdio bridge, then removes it and checks explicit unload plus retained recovery work. A no-model/no-network test checks explicit versus ambient loading using the installed real `pi` CLI (skipped when unavailable).

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { resolve } from "node:path";
 import type { ServerSettingsDefinition } from "agent-organization/plugin";
 
 const nameSchema = z.string().min(1).max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
@@ -15,8 +16,8 @@ export interface SkillsConfig extends Record<string, unknown> {
   maxCatalogEntries: number;
 }
 
-/** The public settings surface deliberately excludes embedded-test source allowances. */
-export function validateSkillsConfig(value: unknown): SkillsConfig {
+/** Normalize public settings; local absolute sources require an explicit trusted embedded-test factory. */
+export function validateSkillsConfig(value: unknown, allowLocalSources = false): SkillsConfig {
   const parsed = schema.parse(value);
   const names = new Set<string>();
   const urls = new Set<string>();
@@ -24,6 +25,12 @@ export function validateSkillsConfig(value: unknown): SkillsConfig {
     if (names.has(name)) throw new Error(`Duplicate skills repository name: ${name}`);
     names.add(name);
     if (/[\x00-\x20]/.test(gitUrl)) throw new Error("Invalid Git source");
+    if (allowLocalSources && gitUrl.startsWith("/")) {
+      const canonical = resolve(gitUrl);
+      if (urls.has(canonical)) throw new Error(`Duplicate skills repository URL: ${canonical}`);
+      urls.add(canonical);
+      return { name, gitUrl: canonical };
+    }
     let url: URL;
     try { url = new URL(gitUrl); } catch { throw new Error("Use an HTTPS Git URL"); }
     // Explicit ports (including :443), credentials, redirects and non-canonical host/path forms are forbidden.
@@ -44,7 +51,7 @@ export function validateSkillsConfig(value: unknown): SkillsConfig {
 
 export const skillsStartupDefaults: SkillsConfig = Object.freeze({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 });
 
-export function skillsServerSettings(): ServerSettingsDefinition {
+export function skillsServerSettings(allowLocalSources = false): ServerSettingsDefinition {
   return {
     namespace: "skills",
     title: "Skills",
@@ -61,6 +68,6 @@ export function skillsServerSettings(): ServerSettingsDefinition {
       { key: "gitTimeoutMs", label: "Git timeout (ms)", editor: "number", min: 1_000, max: 60_000, effect: "immediate", description: "Timeout for subsequent Git work (1,000–60,000 ms)." },
       { key: "maxCatalogEntries", label: "Maximum catalog entries", editor: "number", min: 1, max: 256, effect: "immediate", description: "Admission limit for new catalog entries (1–256). Lowering it never removes existing entries." },
     ],
-    validate: validateSkillsConfig,
+    validate: value => validateSkillsConfig(value, allowLocalSources),
   };
 }

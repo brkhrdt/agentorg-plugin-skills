@@ -266,7 +266,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         return { ...rest, extensions: { ...extensions, skills: legacy } };
       },
     });
-    host.registerServerSettings(skillsServerSettings());
+    host.registerServerSettings(skillsServerSettings(options.allowLocalSources ?? false));
     host.registerCapability("skills", { settingsNamespace: "skills", serverSettingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add" }, version: 1 });
     async function uniqueCwd(settings: Settings, agent: Readonly<AgentRecord>, agents: Readonly<AgentRecord>[]) {
       const cwd = await realpath(settings.cwd ?? process.cwd());

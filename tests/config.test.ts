@@ -8,7 +8,7 @@ import { createSkillsPlugin } from "../src/index.ts";
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
-async function definition() {
+async function definition(allowLocalSources = false) {
   const root = await mkdtemp(join(tmpdir(), "skills-settings-contract-"));
   roots.push(root);
   await mkdir(join(root, "data"));
@@ -34,7 +34,7 @@ async function definition() {
     request: async () => ({}),
     emit: noop,
   };
-  await (createSkillsPlugin({ home: root }) as ServerPlugin).setup(host as any);
+  await (createSkillsPlugin({ home: root, allowLocalSources }) as ServerPlugin).setup(host as any);
   return captured;
 }
 
@@ -64,6 +64,15 @@ test("skills declares the public server settings contract separately from agent 
   expect(config!.validate({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 })).toEqual({
     repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256,
   });
+});
+
+test("local repository seeds require the explicit embedded-test opt-in", async () => {
+  const path = join(tmpdir(), "skills-local-seed-fixture");
+  const publicConfig = await definition();
+  expect(() => publicConfig!.validate({ repositories: [{ name: "alpha", gitUrl: path }], gitTimeoutMs: 60_000, maxCatalogEntries: 256 })).toThrow();
+  const trustedConfig = await definition(true);
+  expect(trustedConfig!.validate({ repositories: [{ name: "alpha", gitUrl: path }], gitTimeoutMs: 60_000, maxCatalogEntries: 256 }))
+    .toEqual({ repositories: [{ name: "alpha", gitUrl: path }], gitTimeoutMs: 60_000, maxCatalogEntries: 256 });
 });
 
 test("skills settings normalize only valid unique repository seeds and bounded integer limits", async () => {
