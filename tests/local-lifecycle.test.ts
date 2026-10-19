@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -74,9 +74,12 @@ async function waitMcp(client: Client, accepted: any) {
     const rootAfterReplacement = await f.client.request<AgentRecord>("agent.get", { agentId: root.id });
     expect(rootAfterReplacement.revision).toBe(rootInstalled.revision + 1);
     expect(states(rootAfterReplacement.settings)).toEqual({ alpha: "installed", beta: "available" });
-    const alphaFile = join(installRoot(child.settings.cwd!), "alpha", "SKILL.md");
+    const childInstallRoot = installRoot(child.settings.cwd!);
+    const alphaFile = join(childInstallRoot, "alpha", "SKILL.md");
     expect(await readFile(alphaFile, "utf8")).toContain("alpha-local-proof");
-    expect(await Bun.file(join(installRoot(child.settings.cwd!), "beta")).exists()).toBe(false);
+    expect(await readdir(childInstallRoot)).toEqual(["alpha"]);
+    await expect(lstat(join(childInstallRoot, "beta"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(f.launches.get(child.id)).toEqual([alphaFile]);
     const prompt = await f.run("agent.prompt", { agentId: child.id, text: "read the managed skill" });
     expect(prompt.status).toBe("completed");
     expect((prompt.result as any).text).toContain("alpha-local-proof"); // ACP fixture reads the installed file from AGENTORG_SKILL_FILES.
