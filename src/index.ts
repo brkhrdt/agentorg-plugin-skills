@@ -20,7 +20,7 @@ interface Action { generation: string; from: string; to: string; old: boolean }
 interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string } }
 type RepositoryOrigin = "manual" | "configured";
 type RepositoryStatus = "pending" | "ready" | "retired" | "error";
-interface RepositoryRecordState { name: string; gitUrl: string; origin: RepositoryOrigin; status: RepositoryStatus; error?: string; attempts: number; fingerprint: string }
+interface RepositoryRecordState { name: string; gitUrl: string; origin: RepositoryOrigin; status: RepositoryStatus; error?: string; attempts: number; fingerprint: string; failureClass?: "transient" | "permanent" }
 interface ReconciliationStatus { generation: number; desiredRevision: number; fingerprint: string; state: "pending" | "running" | "ready" | "error"; lastSuccessfulRevision?: number; entries: Array<{ name: string; gitUrl: string; status: RepositoryStatus; error?: string; attempts: number }> }
 interface Options {
   /** Test/embedded deployments only; normal CLI always uses OS home. */
@@ -142,14 +142,15 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const next = publishTail.then(work); publishTail = next.catch(() => {}); return next;
     }
     const identityClaims = new Map<string, string>();
-    const claimIdentity = (name: string, gitUrl: string, origin: RepositoryOrigin): string | undefined => {
-      const keys = [`${origin}:name:${name}`, `${origin}:url:${gitUrl}`];
-      if (keys.some(key => identityClaims.has(key))) return undefined;
-      const owner = randomUUID(); for (const key of keys) identityClaims.set(key, owner);
+    const claimIdentity = (name: string, gitUrl: string): string | undefined => {
+      const key = `${name}\0${gitUrl}`;
+      if (identityClaims.has(key)) return undefined;
+      const owner = randomUUID(); identityClaims.set(key, owner);
       return owner;
     };
-    const releaseIdentity = (name: string, gitUrl: string, owner: string, origin: RepositoryOrigin) => {
-      for (const key of [`${origin}:name:${name}`, `${origin}:url:${gitUrl}`]) if (identityClaims.get(key) === owner) identityClaims.delete(key);
+    const releaseIdentity = (name: string, gitUrl: string, owner: string) => {
+      const key = `${name}\0${gitUrl}`;
+      if (identityClaims.get(key) === owner) identityClaims.delete(key);
     };
     let shuttingDown = false;
     let reconciliationWorker: Promise<void> | undefined;
@@ -169,6 +170,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     const desiredRepositories = () => effectiveConfig().repositories;
     const configuredIdentity = (name: string, gitUrl: string) => desiredRepositories().some(repository => repository.name === name && repository.gitUrl === gitUrl);
     const identityFingerprint = (repositories: Array<{ name: string; gitUrl: string }>) => hash(JSON.stringify([...repositories].sort((a, b) => a.name.localeCompare(b.name) || a.gitUrl.localeCompare(b.gitUrl))));
+    const repositoryFingerprint = (name: string, gitUrl: string) => hash(JSON.stringify([name, gitUrl]));
     const reconciliation = (): ReconciliationStatus => {
       const saved = db.query("SELECT data FROM reconciliation WHERE id=1").get() as { data: string } | null;
       return saved ? JSON.parse(saved.data) : { generation: 0, desiredRevision: 0, fingerprint: "", state: "ready", entries: [] };
@@ -461,7 +463,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     async function registerCatalog(name: string, inputUrl: unknown): Promise<Skill> {
       if (typeof name !== "string" || name.length > 64 || !idPattern.test(name)) fail("Invalid skill name");
       const url = source(inputUrl, options.allowLocalSources ?? false);
-      const claim = claimIdentity(name, url, "manual");
+      const claim = claimIdentity(name, url);
       if (!claim) fail(`Repository registration is already in progress for ${name}`, "DUPLICATE");
       try {
         const existing = catalog();
@@ -495,7 +497,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         host.emit("skills.catalog_added", exposedSkill(record));
         return exposedSkill(record);
       } finally {
-        releaseIdentity(name, url, claim, "manual");
+        releaseIdentity(name, url, claim);
         if (desiredRepositories().some(repository => repository.name === name || repository.gitUrl === url)) scheduleReconciliation("catalog-add");
       }
     }
@@ -543,15 +545,17 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const message = (error as Error)?.message ?? "";
       return !/SKILL\.md|frontmatter|must match|exceeds|conflict|invalid skill name/i.test(message);
     }
-    async function reconcileIdentity(repository: { name: string; gitUrl: string }, revision: number, fingerprint: string, generation: number) {
+    async function reconcileIdentity(repository: { name: string; gitUrl: string }, revision: number, fingerprint: string, generation: number, allowPermanentRetry = false) {
       const { name, gitUrl } = repository;
       if (!currentGenerationSync(generation, revision, fingerprint, name, gitUrl)) return;
       const previous = repositoryState(name, gitUrl);
-      if (previous?.fingerprint === fingerprint && previous.status === "error" && previous.attempts >= 3) return;
-      let attempts = previous?.fingerprint === fingerprint ? previous.attempts : 0;
-      const update = (status: RepositoryStatus, error?: string) => {
+      const repoFingerprint = repositoryFingerprint(name, gitUrl);
+      if (previous?.failureClass === "permanent" && !allowPermanentRetry) return;
+      if (previous?.fingerprint === repoFingerprint && previous.status === "error" && previous.attempts >= 3) return;
+      let attempts = previous?.fingerprint === repoFingerprint ? previous.attempts : 0;
+      const update = (status: RepositoryStatus, error?: string, failureClass?: "transient" | "permanent") => {
         if (!currentGenerationSync(generation, revision, fingerprint, name, gitUrl)) return false;
-        saveRepositoryState({ name, gitUrl, origin: "configured", status, error, attempts, fingerprint });
+        saveRepositoryState({ name, gitUrl, origin: "configured", status, error, attempts, fingerprint: repoFingerprint, failureClass });
         return true;
       };
       const existing = catalog();
@@ -566,7 +570,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
           update("ready");
         } catch (error) {
-          if (await currentGeneration(generation, revision, fingerprint, name, gitUrl) && update("error", (error as Error).message))
+          const failureClass = transient(error) ? "transient" : "permanent";
+          if (await currentGeneration(generation, revision, fingerprint, name, gitUrl) && update("error", (error as Error).message, failureClass))
             report(new Error(`Configured repository ${name} (${gitUrl}) validation failed: ${(error as Error).message}`));
         }
         return;
@@ -582,12 +587,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         if (update("error", message)) report(new Error(`Configured repository ${name} (${gitUrl}) failed: ${message}`));
         return;
       }
-      const claim = claimIdentity(name, gitUrl, "configured");
+      const claim = claimIdentity(name, gitUrl);
       if (!claim) { update("pending", "Repository registration is already in progress"); return; }
       const path = join(root, hash(name) + "-" + randomUUID());
       const journalId = `catalog-${randomUUID()}`;
       put("journal", journalId, { id: journalId, agentId: "catalog", revision, actions: [], path, repository: { name, gitUrl } });
-      if (!update("pending")) { releaseIdentity(name, gitUrl, claim, "configured"); return; }
+      if (!update("pending")) { releaseIdentity(name, gitUrl, claim); return; }
       try {
         const url = source(gitUrl, options.allowLocalSources ?? false);
         await git(root, "-c", `protocol.file.allow=${url.startsWith("/") ? "always" : "never"}`, "clone", "--", url, path);
@@ -619,11 +624,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
         attempts++;
         const message = (error as Error).message;
-        if (update("error", message)) {
+        const retryable = transient(error);
+        if (update("error", message, retryable ? "transient" : "permanent")) {
           report(new Error(`Configured repository ${name} (${gitUrl}) failed; work retained at ${path}: ${message}`));
-          if (transient(error)) scheduleRetry(name, gitUrl, attempts);
+          if (retryable) scheduleRetry(name, gitUrl, attempts);
         }
-      } finally { releaseIdentity(name, gitUrl, claim, "configured"); }
+      } finally { releaseIdentity(name, gitUrl, claim); }
     }
     function requestFullReconciliation(reason: string, resetRetries = false) {
       fullReconciliationRequest = { reason, resetRetries: resetRetries || (fullReconciliationRequest?.resetRetries ?? false) };
@@ -643,13 +649,10 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const repositories = view.effective.repositories;
       const fingerprint = identityFingerprint(repositories);
       let saved = reconciliation();
-      if (reason === "startup" || resetRetries || (saved.fingerprint && saved.fingerprint !== fingerprint)) {
+      if (reason === "startup" || resetRetries) {
         for (const repository of repositories) {
           const state = repositoryState(repository.name, repository.gitUrl);
-          if (state) saveRepositoryState({ ...state, attempts: 0, fingerprint });
-          const timer = retryTimers.get(`${repository.name}\0${repository.gitUrl}`);
-          if (timer) clearTimeout(timer);
-          retryTimers.delete(`${repository.name}\0${repository.gitUrl}`);
+          if (state) saveRepositoryState({ ...state, attempts: 0 });
         }
       }
       for (const state of repositoryStates()) if (state.origin === "configured" && !repositories.some(r => r.name === state.name && r.gitUrl === state.gitUrl)) {
@@ -667,7 +670,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       for (const repository of repositories) {
         const identity = `${repository.name}\0${repository.gitUrl}`;
         if (shuttingDown || (retryOnly && !retryOnly.has(identity))) continue;
-        await reconcileIdentity(repository, view.revision, fingerprint, generation);
+        await reconcileIdentity(repository, view.revision, fingerprint, generation, reason === "requested");
         if (!currentGenerationSync(generation, view.revision, fingerprint)) { requestFullReconciliation("settings"); return; }
         saved.entries = repositories.map(r => {
           const item = repositoryState(r.name, r.gitUrl);
@@ -701,7 +704,6 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
               fullReconciliationRequest = undefined;
               targetedRetryRequests.clear();
               await reconcileCurrent(full.reason, full.resetRetries);
-              for (const repository of desiredRepositories()) targetedRetryRequests.delete(`${repository.name}\0${repository.gitUrl}`);
             } else {
               const targets = new Set(targetedRetryRequests);
               targetedRetryRequests.clear();
@@ -727,8 +729,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const entries = desired.map(repository => {
         const state = repositoryState(repository.name, repository.gitUrl);
         const manualReady = state?.origin === "manual" && catalog().some(item => item.name === repository.name && item.gitUrl === repository.gitUrl);
-        const current = manualReady || state?.fingerprint === fingerprint;
-        return { name: repository.name, gitUrl: repository.gitUrl, status: current ? state?.status ?? "ready" : "pending", error: current ? state?.error : undefined, attempts: current ? state?.attempts ?? 0 : 0 };
+        const current = manualReady || !!state;
+        const status = state?.status === "retired" ? "pending" : state?.status;
+        return { name: repository.name, gitUrl: repository.gitUrl, status: current ? status ?? "ready" : "pending", error: current ? state?.error : undefined, attempts: current ? state?.attempts ?? 0 : 0 };
       });
       return { ...saved, fingerprint, state: fingerprint !== saved.fingerprint ? "pending" : saved.state, entries };
     }

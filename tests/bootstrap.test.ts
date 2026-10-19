@@ -340,7 +340,7 @@ test.serial("same exact manual/configured identity cannot double-clone or corrup
     });
     const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
     expect(view.skills).toHaveLength(1);
-    expect(view.skills[0]).toMatchObject({ name: "alpha", gitUrl: f.source, origin: expect.any(String) });
+    expect(view.skills[0]).toMatchObject({ name: "alpha", gitUrl: f.source });
     expect(["manual", "configured"]).toContain(view.skills[0].origin);
     const db = new Database(await databasePath(f.root), { readonly: true });
     expect((db.query("SELECT COUNT(*) AS count FROM catalog").get() as any).count).toBe(1);
@@ -380,7 +380,7 @@ test.serial("an alpha retry firing during beta's gated full pass is drained afte
     const entries = (await Bun.file(calls).text()).trim().split("\n");
     expect(entries.filter(url => url === alphaUrl)).toHaveLength(2);
     expect(entries.filter(url => url === betaUrl)).toHaveLength(1);
-    expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).skills.map((item: any) => item.name)).toEqual(["alpha", "beta"]);
+    expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).skills.map((item: any) => item.name).sort()).toEqual(["alpha", "beta"]);
   } finally {
     await writeFile(release, "release").catch(() => {});
     await startup.catch(() => {});
