@@ -12,6 +12,10 @@ test("resolve accepts directory or root SKILL.md; relative paths need explicit b
   try {
     expect((await resolveLocalSource(fixture.path)).directory).toBe(fixture.path);
     expect((await resolveLocalSource(join(fixture.path, "SKILL.md"))).directory).toBe(fixture.path);
+    const fromFile = await copyLocalSkill(join(fixture.path, "SKILL.md"), join(fixture.root, "copied-from-file"));
+    const fromDirectory = await copyLocalSkill(fixture.path, join(fixture.root, "copied-from-directory"));
+    expect(await readFile(join(fromFile.destinationPath, "asset.bin"))).toEqual(await readFile(join(fromDirectory.destinationPath, "asset.bin")));
+    expect(await readFile(join(fromFile.destinationPath, "SKILL.md"))).toEqual(await readFile(join(fromDirectory.destinationPath, "SKILL.md")));
     expect((await resolveLocalSource("local-skill", { baseDir: fixture.root })).directory).toBe(fixture.path);
     expect((await resolveLocalSource("~/local-skill", { home: fixture.root })).directory).toBe(fixture.path);
     await expect(resolveLocalSource("local-skill")).rejects.toThrow(/explicit base/);
@@ -136,15 +140,50 @@ test("nofollow nonblocking opens reject deterministic source symlink and FIFO sw
     await expect(readFile(join(root, "symlink-swap", "asset.bin"))).rejects.toThrow();
 
     await rm(sourceFile, { force: true });
-    const fifo = Bun.spawnSync(["mkfifo", sourceFile]);
-    expect(fifo.exitCode).toBe(0);
+    await writeFile(sourceFile, Buffer.from([0, 255, 1, 128]));
+    let fifoSwapExercised = false;
     const started = Date.now();
     await expect(copyLocalSkill(fixture.path, join(root, "fifo-swap"), {
       beforeOpenEntry: async entry => {
-        if (entry === sourceFile) { await rm(sourceFile); expect(Bun.spawnSync(["mkfifo", sourceFile]).exitCode).toBe(0); }
+        if (entry === sourceFile) {
+          fifoSwapExercised = true;
+          await rm(sourceFile);
+          expect(Bun.spawnSync(["mkfifo", sourceFile]).exitCode).toBe(0);
+        }
       },
     })).rejects.toThrow();
+    expect(fifoSwapExercised).toBe(true);
     expect(Date.now() - started).toBeLessThan(2_000);
+  } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("destination parents must be process-owned and not group/world writable", async () => {
+  const fixture = await createLocalSkillFixture();
+  const root = await temporary();
+  try {
+    const writable = join(root, "writable"); await mkdir(writable, { mode: 0o777 });
+    await (await import("node:fs/promises")).chmod(writable, 0o777);
+    await expect(copyLocalSkill(fixture.path, join(writable, "stage"))).rejects.toThrow(/not group\/world writable/);
+    await expect(lstat(join(writable, "stage"))).rejects.toThrow();
+  } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("a replaced stage between exclusive mkdir and open is never adopted or chmodded", async () => {
+  const fixture = await createLocalSkillFixture();
+  const root = await temporary();
+  try {
+    const stage = join(root, "stage"), replacement = join(root, "replacement");
+    await mkdir(replacement, { mode: 0o755 });
+    await writeFile(join(replacement, "keep"), "unrelated");
+    const beforeMode = (await lstat(replacement)).mode & 0o777;
+    await expect(copyLocalSkill(fixture.path, stage, {
+      afterStageMkdir: async destination => {
+        await rm(destination, { recursive: true });
+        await (await import("node:fs/promises")).rename(replacement, destination);
+      },
+    })).rejects.toThrow(/stage was replaced/);
+    expect((await lstat(stage)).mode & 0o777).toBe(beforeMode);
+    expect(await readFile(join(stage, "keep"), "utf8")).toBe("unrelated");
   } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
 });
 
