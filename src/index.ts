@@ -13,8 +13,9 @@ export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
 import { gitWithTimeout } from "./git.ts";
 import { skillsServerSettings } from "./config.ts";
+import { migrateCatalog, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
 
-export interface Skill { name: string; gitUrl: string; description: string; createdAt: string; path: string }
+export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
 interface Action { generation: string; from: string; to: string; old: boolean }
 interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string } }
@@ -106,9 +107,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS repository_state(name TEXT NOT NULL, url TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(name,url));
       CREATE TABLE IF NOT EXISTS reconciliation(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);`);
-    const schemaVersion = (db.query("SELECT version FROM meta").get() as any).version;
-    if (schemaVersion > 2) throw new Error(`Unsupported skills database version ${schemaVersion}`);
-    if (schemaVersion < 2) db.query("UPDATE meta SET version=2").run();
+    migrateCatalog(db);
     const rows = <T>(table: string): T[] => db.query(`SELECT data FROM ${table} ORDER BY rowid`).all().map((r: any) => JSON.parse(r.data));
     const put = (table: "installations" | "journal", id: string, value: unknown) => db.query(`INSERT OR REPLACE INTO ${table} VALUES (?,?)`).run(id, JSON.stringify(value));
     const dropJournal = (id: string) => db.query("DELETE FROM journal WHERE id=?").run(id);
@@ -128,7 +127,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       fail(`Unknown skill ${name}`);
     }
-    const exposedSkill = (item: Skill) => ({ ...item, origin: repositoryState(item.name, item.gitUrl)?.origin ?? "manual" });
+    const gitSource = (item: Skill): string => item.source.kind === "git" ? item.source.gitUrl : fail(`Skill ${item.name} is not Git-backed`);
+    const exposedSkill = (item: Skill) => ({ ...item, origin: item.source.kind === "git" ? repositoryState(item.name, item.source.gitUrl)?.origin ?? "manual" : "manual" });
     const installations = () => rows<Installation>("installations");
     const installation = (generation: string) => installations().find(i => i.generation === generation)!;
     const report = (error: unknown, agentId?: string) => host.emit("skills.error", { message: (error as Error).message }, agentId);
@@ -178,18 +178,19 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     };
     const saveReconciliation = (value: ReconciliationStatus) => db.query("INSERT OR REPLACE INTO reconciliation VALUES (1,?)").run(JSON.stringify(value));
     const configuredActive = (item: Skill) => {
-      const state = repositoryState(item.name, item.gitUrl);
-      return state?.origin === "manual" || (state?.origin === "configured" && configuredIdentity(item.name, item.gitUrl));
+      if (item.source.kind !== "git") return true;
+      const state = repositoryState(item.name, item.source.gitUrl);
+      return state?.origin === "manual" || (state?.origin === "configured" && configuredIdentity(item.name, item.source.gitUrl));
     };
-    const grantable = (item: Skill) => configuredActive(item) && repositoryState(item.name, item.gitUrl)?.status === "ready";
+    const grantable = (item: Skill) => item.source.kind === "local" || (configuredActive(item) && repositoryState(item.name, item.source.gitUrl)?.status === "ready");
     const activeCatalog = () => catalog().filter(grantable);
     // Schema-v1 catalog entries have no ownership record. Classify once against
     // the current effective configuration; all nonmatches remain manual.
     const migrateRepositoryOwnership = () => db.transaction(() => {
       const configured = desiredRepositories();
-      for (const item of catalog()) if (!repositoryState(item.name, item.gitUrl)) {
-        const origin = configured.some(repository => repository.name === item.name && repository.gitUrl === item.gitUrl) ? "configured" : "manual";
-        saveRepositoryState({ name: item.name, gitUrl: item.gitUrl, origin, status: "ready", attempts: 0, fingerprint: "" });
+      for (const item of catalog()) if (item.source.kind === "git" && !repositoryState(item.name, item.source.gitUrl)) {
+        const origin = configured.some(repository => repository.name === item.name && repository.gitUrl === gitSource(item)) ? "configured" : "manual";
+        saveRepositoryState({ name: item.name, gitUrl: item.source.gitUrl, origin, status: "ready", attempts: 0, fingerprint: "" });
       }
     })();
     async function own(i: Installation, path = i.path) {
@@ -259,11 +260,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           continue;
         }
         const retiredDowngrade = !configuredActive(item) && previousStates[name] === "installed" && state === "available";
-        const desiredConflict = desiredRepositories().find(repository => repository.name === name && repository.gitUrl !== item.gitUrl);
-        if (repositoryState(item.name, item.gitUrl)?.origin === "configured" && desiredConflict && state !== "unavailable" && previousStates[name] !== state && !retiredDowngrade)
+        const desiredConflict = item.source.kind === "git" ? desiredRepositories().find(repository => repository.name === name && repository.gitUrl !== gitSource(item)) : undefined;
+        if (item.source.kind === "git" && repositoryState(item.name, item.source.gitUrl)?.origin === "configured" && desiredConflict && state !== "unavailable" && previousStates[name] !== state && !retiredDowngrade)
           fail(`Skill ${name} conflicts with configured source ${desiredConflict.gitUrl}`, "REPOSITORY_CONFLICT");
         if (state !== "unavailable" && !grantable(item) && previousStates[name] !== state && !retiredDowngrade) {
-          const record = repositoryState(item.name, item.gitUrl);
+          const record = item.source.kind === "git" ? repositoryState(item.name, item.source.gitUrl) : undefined;
           fail(`Skill ${name} is ${record?.status === "retired" || !configuredActive(item) ? "retired from the configured repository list" : "not ready"}`, record?.status === "retired" || !configuredActive(item) ? "REPOSITORY_RETIRED" : "SKILL_NOT_READY");
         }
       }
@@ -483,7 +484,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         } catch (error) {
           throw new Error(`Catalog checkout for ${name} retained at ${path}: ${(error as Error).message}`);
         }
-        const record: Skill = { name, gitUrl: url, description, path, createdAt: new Date().toISOString() };
+        const record: Skill = { name, source: { kind: "git", gitUrl: url }, gitUrl: url, description, path, createdAt: new Date().toISOString() };
         try {
           await catalogPublish(() => db.transaction(() => {
             if (catalog().some(s => s.name === name || s.gitUrl === url)) fail(`Skill repository conflict for ${name}`, "DUPLICATE");
@@ -603,7 +604,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
         await checkoutLimit(path);
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
-        const record: Skill = { name, gitUrl, description, path, createdAt: new Date().toISOString() };
+        const record: Skill = { name, source: { kind: "git", gitUrl }, gitUrl, description, path, createdAt: new Date().toISOString() };
         await catalogPublish(() => db.transaction(() => {
           if (!currentGenerationSync(generation, revision, fingerprint, name, gitUrl)) return;
           const now = catalog();
@@ -745,7 +746,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     }
     host.registerEndpoint("skills.list", (_params, caller) => {
       clientOnly(caller);
-      const retained = catalog().filter(item => repositoryState(item.name, item.gitUrl)?.origin === "configured" && !configuredIdentity(item.name, item.gitUrl));
+      const retained = catalog().filter(item => item.source.kind === "git" && repositoryState(item.name, item.source.gitUrl)?.origin === "configured" && !configuredIdentity(item.name, item.source.gitUrl));
       return {
         skills: activeCatalog().map(exposedSkill), retained: retained.map(item => ({ ...exposedSkill(item), status: "retired" as const })),
         reconciliation: publicReconciliation(),
