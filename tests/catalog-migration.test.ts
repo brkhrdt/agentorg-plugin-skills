@@ -89,6 +89,23 @@ test("failed migration rolls back earlier catalog rewrites and schema version", 
   } finally { db.close(); }
 });
 
+test("v3 local-import journals preserve unknown-name intent and later durable phases", () => {
+  const db = database(3);
+  const id = "local-import-1", path = "/managed/local-import-staging/1";
+  const journal = {
+    id, agentId: "catalog", revision: 0, actions: [], path,
+    source: { source: { kind: "local", path: "/source" } },
+    localImport: { phase: "intent", sourcePath: "/source", stagingPath: path },
+  };
+  db.query("INSERT INTO journal VALUES (?,?)").run(id, JSON.stringify(journal));
+  try {
+    expect(migrateCatalog(db)).toBe(3);
+    expect(JSON.parse((db.query("SELECT data FROM journal").get() as any).data)).toEqual(journal);
+    db.query("UPDATE journal SET data=? WHERE id=?").run(JSON.stringify({ ...journal, localImport: { ...journal.localImport, phase: "initialized", name: "fixture-skill" } }), id);
+    expect(migrateCatalog(db)).toBe(3);
+  } finally { db.close(); }
+});
+
 test("newer schema fails closed", () => {
   const db = database(4);
   try { expect(() => migrateCatalog(db)).toThrow(/unsupported schema/); } finally { db.close(); }

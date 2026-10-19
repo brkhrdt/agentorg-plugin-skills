@@ -8,6 +8,8 @@ import { MAX_SKILL_ENTRIES, MAX_SKILL_MD_BYTES, MAX_SKILL_PAYLOAD_BYTES, readSki
 export interface LocalSourceOptions { baseDir?: string; home?: string; centralRoot?: string }
 export interface ResolvedLocalSource { directory: string; skillFile: string; device: number; inode: number }
 export interface LocalCopyOptions extends LocalSourceOptions {
+  /** Internal caller-owned staging root allowed inside the protected central root. */
+  managedStagingRoot?: string;
   /** Deterministic fault/mutation seam; a failed stage is deliberately retained. */
   beforeCopyFile?: (source: string, destination: string) => void | Promise<void>;
   afterSourceOpen?: (source: string) => void | Promise<void>;
@@ -80,7 +82,9 @@ export async function copyLocalSkill(input: unknown, destination: string, option
   const target = join(targetParent, destinationAbsolute.split(sep).at(-1)!);
   if (overlaps(source.directory, target)) fail("Source and destination directories must not overlap");
   const central = options.centralRoot ? await realpath(options.centralRoot) : undefined;
-  if (central && overlaps(central, target)) fail("Destination must not overlap the managed central skills directory");
+  const managedStage = options.managedStagingRoot ? await realpath(options.managedStagingRoot) : undefined;
+  if (central && overlaps(central, target) && (!managedStage || !within(managedStage, target) || dirname(target) !== managedStage))
+    fail("Destination must not overlap the managed central skills directory outside its managed staging root");
 
   const parentHandle = await open(targetParent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   let stageHandle: Awaited<ReturnType<typeof open>> | undefined;

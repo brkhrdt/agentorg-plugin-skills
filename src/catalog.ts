@@ -21,7 +21,8 @@ export interface CatalogJournal {
   /** Legacy Git journal payload retained for backwards decoding. */
   repository?: { name: string; gitUrl: string };
   /** New source-neutral representation for future catalog imports. */
-  source?: { name: string; source: SkillSource };
+  source?: { name?: string; source: SkillSource };
+  localImport?: { phase: "intent" | "copying" | "copied" | "initialized"; sourcePath: string; stagingPath: string; name?: string };
 }
 
 const fail = (message: string): never => { throw new Error(`Invalid skills catalog: ${message}`); };
@@ -84,8 +85,15 @@ export function migrateCatalog(db: Database): number {
         if (journal.repository !== undefined && (!journal.repository || typeof journal.repository.name !== "string" || !journal.repository.name ||
             typeof journal.repository.gitUrl !== "string" || !journal.repository.gitUrl)) fail(`malformed legacy repository journal ${row.id}`);
         if (journal.source !== undefined) {
-          if (!journal.source || typeof journal.source.name !== "string" || !journal.source.name) fail(`malformed source journal ${row.id}`);
+          if (!journal.source || (journal.source.name !== undefined && (typeof journal.source.name !== "string" || !journal.source.name))) fail(`malformed source journal ${row.id}`);
           decodeSource(journal.source.source, `journal ${row.id}`);
+        }
+        if (journal.localImport !== undefined) {
+          const local = journal.localImport;
+          if (!local || !["intent", "copying", "copied", "initialized"].includes(local.phase) ||
+              typeof local.sourcePath !== "string" || !isAbsolute(local.sourcePath) || typeof local.stagingPath !== "string" || !isAbsolute(local.stagingPath) ||
+              (local.name !== undefined && (typeof local.name !== "string" || !local.name))) fail(`malformed local import journal ${row.id}`);
+          if (journal.path !== local.stagingPath) fail(`local import journal path mismatch ${row.id}`);
         }
       }
       if (version < 3) db.query("UPDATE meta SET version=3").run();

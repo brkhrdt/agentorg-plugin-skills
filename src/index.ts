@@ -14,11 +14,12 @@ import { gitWithTimeout } from "./git.ts";
 import { skillsServerSettings } from "./config.ts";
 import { migrateCatalog, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
 import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
+import { LocalSkillImporter } from "./local-import.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
 interface Action { generation: string; from: string; to: string; old: boolean }
-interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string } }
+interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string }; localImport?: { phase: "intent" | "copying" | "copied" | "initialized"; sourcePath: string; stagingPath: string; name?: string } }
 type RepositoryOrigin = "manual" | "configured";
 type RepositoryStatus = "pending" | "ready" | "retired" | "error";
 interface RepositoryRecordState { name: string; gitUrl: string; origin: RepositoryOrigin; status: RepositoryStatus; error?: string; attempts: number; fingerprint: string; failureClass?: "transient" | "permanent" }
@@ -396,7 +397,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         await exclusive(async () => {
         for (const j of rows<Journal>("journal")) {
           if (j.path) {
-            report(new Error(`Interrupted catalog clone retained at ${j.path}; not registered`));
+            report(new Error(j.localImport
+              ? `Interrupted local skill import (${j.localImport.phase}) retained at ${j.path}; not registered or recopied`
+              : `Interrupted catalog clone retained at ${j.path}; not registered`));
             continue;
           }
           const agent = agents.find(a => a.id === j.agentId);
@@ -481,6 +484,29 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         releaseIdentity(name, url, claim);
         if (desiredRepositories().some(repository => repository.name === name || repository.gitUrl === url)) scheduleReconciliation("catalog-add");
       }
+    }
+    const activeLocalImports = new Set<Promise<unknown>>();
+    const localImporter = new LocalSkillImporter({
+      centralRoot: root, stagingRoot: join(root, "local-import-staging"), maxCatalogEntries: effectiveConfig().maxCatalogEntries,
+      gitTimeoutMs: effectiveConfig().gitTimeoutMs,
+      putJournal: journal => put("journal", journal.id, journal),
+      publish: (record, identity, journalId) => catalogPublish(() => db.transaction(() => {
+        const entries = catalog();
+        if (entries.some(item => item.name === record.name || item.source && sourceIdentity(item.source) === identity))
+          fail(`Local skill source or name already registered: ${record.name}`, "DUPLICATE");
+        if (entries.length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
+        db.query("INSERT INTO catalog VALUES (?,?,?)").run(record.name, identity, JSON.stringify(record));
+        dropJournal(journalId);
+      })()),
+      report: error => report(error),
+      emit: record => host.emit("skills.catalog_added", exposedSkill(record)),
+    });
+    function runLocalImport(input: unknown, pathOptions: { baseDir?: string; home?: string } = {}) {
+      if (shuttingDown) fail("Skills plugin is shutting down", "SHUTTING_DOWN");
+      const operation = exclusive(() => localImporter.import(input, pathOptions));
+      activeLocalImports.add(operation);
+      void operation.finally(() => activeLocalImports.delete(operation)).catch(() => {});
+      return operation;
     }
     async function settingsView() {
       return await host.request("organization.settings.get", { namespace: "skills" }, server) as { revision: number; effective: { repositories: Array<{ name: string; gitUrl: string }> } };
@@ -730,7 +756,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         skills: activeCatalog().map(exposedSkill), retained: retained.map(item => ({ ...exposedSkill(item), status: "retired" as const })),
         reconciliation: publicReconciliation(),
         recovery: installations().filter(i => i.pending).map(i => ({ agentId: i.agentId, skill: i.skill, path: i.path, error: i.error })),
-        repositoryRecovery: rows<Journal>("journal").filter(j => j.agentId === "catalog" && j.path).map(j => ({ id: j.id, path: j.path, repository: j.repository, origin: (j.repository && repositoryState(j.repository.name, j.repository.gitUrl)?.origin) ?? "manual", revision: j.revision, status: "retained" as const })),
+        repositoryRecovery: rows<Journal>("journal").filter(j => j.agentId === "catalog" && j.path).map(j => ({ id: j.id, path: j.path, repository: j.repository, localImport: j.localImport, origin: (j.repository && repositoryState(j.repository.name, j.repository.gitUrl)?.origin) ?? "manual", revision: j.revision, status: "retained" as const })),
       };
     });
     host.registerEndpoint("skills.reconcile", (params, caller) => {
@@ -788,7 +814,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       if (sweepTimer) clearInterval(sweepTimer);
       for (const timer of retryTimers.values()) clearTimeout(timer);
       retryTimers.clear();
-      await Promise.allSettled([tail, publishTail, reconciliationWorker].filter(Boolean) as Promise<unknown>[]);
+      await Promise.allSettled([tail, publishTail, reconciliationWorker, ...activeLocalImports].filter(Boolean) as Promise<unknown>[]);
       db.close();
     });
   } };
