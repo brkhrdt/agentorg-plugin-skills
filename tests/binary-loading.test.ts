@@ -30,7 +30,7 @@ test.skipIf(!process.env.ORG_BINARY)("compiled host loads the separate skills mo
     }
     expect(snapshot.capabilities.plugins.skills).toEqual({
       settingsNamespace: "skills", serverSettingsNamespace: "skills",
-      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile" }, version: 1,
+      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", addFromPath: "skills.addFromPath" }, localImport: true, version: 1,
     });
     const settings = await client.request<any>("organization.settings.list");
     expect(settings.groups.find((group: any) => group.namespace === "skills")).toMatchObject({

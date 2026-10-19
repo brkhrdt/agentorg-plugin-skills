@@ -16,7 +16,7 @@ export interface LocalImportJournal {
 export interface LocalImporterDependencies {
   centralRoot: string;
   stagingRoot: string;
-  gitTimeoutMs?: number;
+  gitTimeoutMs?: number | (() => number);
   maxCatalogEntries: number;
   putJournal: (journal: LocalImportJournal) => void;
   publish: (record: CatalogSkill, identity: string, journalId: string) => Promise<void>;
@@ -58,22 +58,23 @@ export class LocalSkillImporter {
       const copied = await copyLocalSkill(source.directory, stagingPath, {
         centralRoot, managedStagingRoot: stageRoot,
       });
-      if (copied.sourcePath !== source.directory) throw new Error("Local source path changed after provenance was captured");
+      if (copied.sourcePath !== source.directory) throw Object.assign(new Error("Local source path changed after provenance was captured"), { code: "INVALID_PATH" });
       journal.localImport = { ...journal.localImport, phase: "copied", name: copied.name };
       this.deps.putJournal(journal);
       const before = await lstat(stagingPath);
-      if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("Local snapshot stage identity is invalid");
-      await initializeLocalSnapshot(stagingPath, this.deps.gitTimeoutMs ?? 60_000);
+      if (!before.isDirectory() || before.isSymbolicLink()) throw Object.assign(new Error("Local snapshot stage identity is invalid"), { code: "INVALID_PATH" });
+      const timeout = typeof this.deps.gitTimeoutMs === "function" ? this.deps.gitTimeoutMs() : this.deps.gitTimeoutMs;
+      await initializeLocalSnapshot(stagingPath, timeout ?? 60_000);
       const initialized = await lstat(stagingPath);
       if (!initialized.isDirectory() || initialized.isSymbolicLink() || before.dev !== initialized.dev || before.ino !== initialized.ino)
-        throw new Error("Local snapshot stage changed during repository initialization");
+        throw Object.assign(new Error("Local snapshot stage changed during repository initialization"), { code: "INVALID_PATH" });
       await checkCheckoutLimits(stagingPath);
       const after = await lstat(stagingPath);
       if (!after.isDirectory() || after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino)
-        throw new Error("Local snapshot stage changed during repository validation");
+        throw Object.assign(new Error("Local snapshot stage changed during repository validation"), { code: "INVALID_PATH" });
       // Re-read copied metadata after Git initialized; name and instructions remain mandatory.
       const metadata = await readSkillMetadata(stagingPath);
-      if (metadata.name !== copied.name || metadata.description !== copied.description) throw new Error("Local snapshot metadata changed during initialization");
+      if (metadata.name !== copied.name || metadata.description !== copied.description) throw Object.assign(new Error("Local snapshot metadata changed during initialization"), { code: "INVALID_PATH" });
       const record: CatalogSkill = {
         name: metadata.name, source: sourceRecord, description: metadata.description,
         path: stagingPath, createdAt: new Date().toISOString(),
@@ -83,9 +84,11 @@ export class LocalSkillImporter {
       await this.deps.publish(record, identity, id);
       committedRecord = record;
     } catch (error) {
-      const code = (error as any)?.code;
-      const failure = Object.assign(new Error(`Local skill import retained at ${stagingPath}: ${(error as Error).message}`), code ? { code } : {});
-      try { this.deps.report?.(failure); } catch { /* Diagnostic failure cannot replace the import error. */ }
+      const code = (error as any)?.code ?? "INTERNAL";
+      const failure = Object.assign(new Error(`Local skill import retained at ${stagingPath}: ${(error as Error).message}`), { code });
+      if (!["INVALID_PARAMS", "INVALID_PATH", "DUPLICATE", "LIMIT"].includes(code)) {
+        try { this.deps.report?.(failure); } catch { /* Diagnostic failure cannot replace the import error. */ }
+      }
       throw failure;
     }
     try { this.deps.emit?.(committedRecord!); }
@@ -103,5 +106,5 @@ async function ensurePrivateStageRoot(path: string) {
   catch (error: any) { if (error.code !== "EEXIST") throw error; }
   const stat = await lstat(path);
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
-    throw new Error("Local import staging root must be process-owned and private");
+    throw Object.assign(new Error("Local import staging root must be process-owned and private"), { code: "INVALID_PATH" });
 }

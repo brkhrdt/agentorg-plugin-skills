@@ -15,6 +15,7 @@ import { skillsServerSettings } from "./config.ts";
 import { migrateCatalog, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
 import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
 import { LocalSkillImporter } from "./local-import.ts";
+import { localSkillImportSupported } from "./local-source.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
@@ -73,6 +74,9 @@ function source(input: unknown, allowLocal: boolean): string {
 
 export function createSkillsPlugin(options: Options = {}): ServerPlugin {
   return { apiVersion: 1, name: "skills", async setup(host) {
+    const startupSnapshot = await host.request("organization.snapshot", {}, server) as { capabilities?: { cwd?: unknown } };
+    const localImportBase = typeof startupSnapshot?.capabilities?.cwd === "string" ? resolve(startupSnapshot.capabilities.cwd) : process.cwd();
+    const supportsLocalImport = await localSkillImportSupported();
     // Scope independent organizations by canonical data directory; never open core SQLite.
     const scope = hash(await realpath(host.dataDir));
     const root = join(await realpath(options.home ?? homedir()), ".agentorg", "skills", scope);
@@ -346,7 +350,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     });
     host.registerServerSettings(skillsServerSettings(options.allowLocalSources ?? false));
     migrateRepositoryOwnership();
-    host.registerCapability("skills", { settingsNamespace: "skills", serverSettingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile" }, version: 1 });
+    host.registerCapability("skills", {
+      settingsNamespace: "skills", serverSettingsNamespace: "skills",
+      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", ...(supportsLocalImport ? { addFromPath: "skills.addFromPath" } : {}) },
+      localImport: supportsLocalImport, version: 1,
+    });
     async function uniqueCwd(settings: Settings, agent: Readonly<AgentRecord>, agents: Readonly<AgentRecord>[]) {
       const cwd = await realpath(settings.cwd ?? process.cwd());
       if (!(await lstat(cwd)).isDirectory()) fail("cwd must be a directory");
@@ -490,16 +498,19 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     const activeLocalImports = new Set<Promise<unknown>>();
     const localImporter = new LocalSkillImporter({
       centralRoot: root, stagingRoot: join(root, "local-import-staging"), maxCatalogEntries: effectiveConfig().maxCatalogEntries,
-      gitTimeoutMs: effectiveConfig().gitTimeoutMs,
+      gitTimeoutMs: () => effectiveConfig().gitTimeoutMs,
       putJournal: journal => put("journal", journal.id, journal),
-      publish: (record, identity, journalId) => catalogPublish(() => db.transaction(() => {
-        const entries = catalog();
-        if (entries.some(item => item.name === record.name || item.source && sourceIdentity(item.source) === identity))
-          fail(`Local skill source or name already registered: ${record.name}`, "DUPLICATE");
-        if (entries.length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
-        db.query("INSERT INTO catalog VALUES (?,?,?)").run(record.name, identity, JSON.stringify(record));
-        dropJournal(journalId);
-      })()),
+      publish: async (record, identity, journalId) => {
+        await catalogPublish(() => db.transaction(() => {
+          const entries = catalog();
+          if (entries.some(item => item.name === record.name || item.source && sourceIdentity(item.source) === identity))
+            fail(`Local skill source or name already registered: ${record.name}`, "DUPLICATE");
+          if (entries.length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
+          db.query("INSERT INTO catalog VALUES (?,?,?)").run(record.name, identity, JSON.stringify(record));
+          dropJournal(journalId);
+        })());
+        if (desiredRepositories().some(repository => repository.name === record.name)) scheduleReconciliation("catalog-add");
+      },
       report: error => report(error),
       emit: record => host.emit("skills.catalog_added", exposedSkill(record)),
     });
@@ -767,6 +778,19 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const status = publicReconciliation(false);
       scheduleReconciliation("requested", true);
       return { accepted: true, reconciliation: status };
+    });
+    if (supportsLocalImport) host.registerEndpoint("skills.addFromPath", async (params, caller) => {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 1 || !Object.hasOwn(params, "path") || typeof (params as any).path !== "string")
+        fail("Expected exactly {path: string}", "INVALID_PARAMS");
+      try {
+        const record = await runLocalImport((params as any).path, { baseDir: localImportBase, home: homedir() });
+        return exposedSkill(record);
+      } catch (error: any) {
+        if (["INVALID_PARAMS", "INVALID_PATH", "DUPLICATE", "LIMIT", "SHUTTING_DOWN", "INTERNAL"].includes(error?.code)) throw error;
+        report(new Error(`Local skill import failed: ${(error as Error).message}`));
+        fail("Local skill import failed; inspect server diagnostics", "INTERNAL");
+      }
     });
     host.registerEndpoint("skills.add", (params, caller) => exclusive(async () => {
       clientOnly(caller);

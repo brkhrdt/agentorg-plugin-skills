@@ -23,7 +23,7 @@ test("plain local skill fixture has the planned import inputs and no Git metadat
   }
 });
 
-test("current capability preserves Git contract and does not imply local import", async () => {
+test("local import capability is explicit while preserving the existing Git contract", async () => {
   const dir = await createLocalSkillFixture();
   const org = new Organization(join(dir.root, "server.sock"), join(dir.root, "data"));
   try {
@@ -34,11 +34,11 @@ test("current capability preserves Git contract and does not imply local import"
       version: 1,
       settingsNamespace: "skills",
       serverSettingsNamespace: "skills",
-      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile" },
+      localImport: true,
+      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", addFromPath: "skills.addFromPath" },
     });
-    expect(descriptor.endpoints.addFromPath).toBeUndefined();
-    expect(advertisesLocalImport({ version: descriptor.version })).toBe(false);
-    expect(advertisesLocalImport(descriptor)).toBe(false);
+    expect(advertisesLocalImport({ version: descriptor.version, endpoints: { addFromPath: "skills.addFromPath" } })).toBe(false);
+    expect(advertisesLocalImport(descriptor)).toBe(true);
     await expect(org.request("skills.add", { name: "local", gitUrl: dir.path }, { kind: "client", id: "test" }))
       .rejects.toMatchObject({ code: "INVALID_PARAMS" });
   } finally {

@@ -17,10 +17,14 @@ export interface LocalCopyOptions extends LocalSourceOptions {
   afterStageMkdir?: (destination: string) => void | Promise<void>;
 }
 export interface LocalCopyResult { sourcePath: string; destinationPath: string; name: string; description: string; entries: number; bytes: number }
-const fail = (message: string, code = "INVALID_PARAMS"): never => { throw Object.assign(new Error(message), { code }); };
+const fail = (message: string, code = "INVALID_PATH"): never => { throw Object.assign(new Error(message), { code }); };
 const MAX_PATH_LENGTH = 4096;
 const linuxFdTraversal = process.platform === "linux";
 function requireFdTraversal() { if (!linuxFdTraversal) fail("Safe local skill copying requires Linux /proc/self/fd directory handles"); }
+export async function localSkillImportSupported(): Promise<boolean> {
+  if (!linuxFdTraversal) return false;
+  try { return (await lstat("/proc/self/fd")).isDirectory(); } catch { return false; }
+}
 function within(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -65,7 +69,8 @@ export async function resolveLocalSource(input: unknown, options: LocalSourceOpt
   if (!directoryInfo?.isDirectory() || directoryInfo.isSymbolicLink()) fail("Local skill root must be a regular directory");
   const skillFile = join(directory, "SKILL.md");
   const skillInfo = await lstat(skillFile).catch(() => undefined);
-  if (!skillInfo?.isFile() || skillInfo.isSymbolicLink()) fail("Root SKILL.md must be a regular non-symlink file");
+  if (!skillInfo) return fail("Local skill directory must contain a root SKILL.md", "INVALID_PARAMS");
+  if (!skillInfo.isFile() || skillInfo.isSymbolicLink()) fail("Root SKILL.md must be a regular non-symlink file", "INVALID_PATH");
   if (options.centralRoot) {
     const central = await realpath(options.centralRoot);
     if (overlaps(central, directory)) fail("Local source must not overlap the managed central skills directory");
@@ -196,6 +201,10 @@ export async function copyLocalSkill(input: unknown, destination: string, option
       const metadata = await readSkillMetadata(fdPath(stageHandle.fd));
       return { sourcePath: source.directory, destinationPath: target, name: metadata.name, description: metadata.description, entries, bytes };
     } finally { await sourceHandle.close(); }
+  } catch (error: any) {
+    if (["ENOENT", "EACCES", "EPERM", "ELOOP", "ENOTDIR", "EOPNOTSUPP", "EINVAL"].includes(error?.code))
+      fail(`Unsafe or unreadable local skill source: ${error.message}`, "INVALID_PATH");
+    throw error;
   } finally {
     await stageHandle?.close();
     await parentHandle.close();
