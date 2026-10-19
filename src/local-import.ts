@@ -22,6 +22,7 @@ export interface LocalImporterDependencies {
   publish: (record: CatalogSkill, identity: string, journalId: string) => Promise<void>;
   report?: (error: Error) => void;
   emit?: (record: CatalogSkill) => void;
+  afterSourceResolved?: (sourcePath: string) => void | Promise<void>;
 }
 
 /** Internal durable local-snapshot import primitive; deliberately has no request/auth/API surface. */
@@ -45,15 +46,19 @@ export class LocalSkillImporter {
       source: { source: sourceRecord },
       localImport: { phase: "intent", sourcePath: source.directory, stagingPath },
     };
+    let committedRecord: CatalogSkill | undefined;
+    try {
     try {
       // Persist intent before creating the staging parent or destination tree.
       this.deps.putJournal(journal);
+      await this.deps.afterSourceResolved?.(source.directory);
       await ensurePrivateStageRoot(stageRoot);
       journal.localImport.phase = "copying";
       this.deps.putJournal(journal);
       const copied = await copyLocalSkill(source.directory, stagingPath, {
         centralRoot, managedStagingRoot: stageRoot,
       });
+      if (copied.sourcePath !== source.directory) throw new Error("Local source path changed after provenance was captured");
       journal.localImport = { ...journal.localImport, phase: "copied", name: copied.name };
       this.deps.putJournal(journal);
       const before = await lstat(stagingPath);
@@ -76,12 +81,19 @@ export class LocalSkillImporter {
       journal.localImport = { ...journal.localImport, phase: "initialized", name: metadata.name };
       this.deps.putJournal(journal);
       await this.deps.publish(record, identity, id);
-      this.deps.emit?.(record);
-      return record;
+      committedRecord = record;
     } catch (error) {
-      const failure = new Error(`Local skill import retained at ${stagingPath}: ${(error as Error).message}`);
-      this.deps.report?.(failure);
+      const code = (error as any)?.code;
+      const failure = Object.assign(new Error(`Local skill import retained at ${stagingPath}: ${(error as Error).message}`), code ? { code } : {});
+      try { this.deps.report?.(failure); } catch { /* Diagnostic failure cannot replace the import error. */ }
       throw failure;
+    }
+    try { this.deps.emit?.(committedRecord!); }
+    catch (error) {
+      try { this.deps.report?.(new Error(`Local skill ${committedRecord!.name} was published, but its catalog event could not be emitted: ${(error as Error).message}`)); }
+      catch { /* A post-commit notifier must not turn committed import into a reported import failure. */ }
+    }
+    return committedRecord!;
     } finally { this.claims.delete(identity); }
   }
 }

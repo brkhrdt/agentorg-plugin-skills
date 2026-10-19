@@ -8,14 +8,14 @@ const exec = promisify(execFile);
 async function runGit(cwd: string, timeoutMs: number, isolate: boolean, ...args: string[]): Promise<string> {
   const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never", GIT_CONFIG_NOSYSTEM: "1" };
   const ambient = isolate
-    ? /^GIT_(DIR|WORK_TREE|COMMON_DIR|NAMESPACE|PREFIX|INDEX_FILE|INDEX_VERSION|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|REPLACE_REF_BASE|SHALLOW_FILE|CONFIG|CONFIG_SYSTEM|CONFIG_PARAMETERS|CONFIG_COUNT|CONFIG_KEY_.*|CONFIG_VALUE_.*)$/
+    ? /^GIT_(DIR|WORK_TREE|COMMON_DIR|NAMESPACE|PREFIX|INDEX_FILE|INDEX_VERSION|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|REPLACE_REF_BASE|SHALLOW_FILE|TEMPLATE_DIR|AUTHOR_.*|COMMITTER_.*|CONFIG|CONFIG_SYSTEM|CONFIG_PARAMETERS|CONFIG_COUNT|CONFIG_KEY_.*|CONFIG_VALUE_.*)$/
     : /^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG|CONFIG_PARAMETERS|CONFIG_COUNT|CONFIG_KEY_.*|CONFIG_VALUE_.*)$/;
-  for (const key of Object.keys(env)) if (ambient.test(key)) delete (env as any)[key];
+  for (const key of Object.keys(env)) if (ambient.test(key) || (isolate && key === "EMAIL")) delete (env as any)[key];
   // Disable ambient URL rewrites/helpers. Operators may provide a noninteractive GIT_ASKPASS.
   const safeEnv = { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", ...(isolate ? { GIT_ATTR_NOSYSTEM: "1" } : {}) };
   try {
     const result = await exec("git", ["-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.file.allow=always", "-c", "http.followRedirects=false", "-C", cwd, ...args], {
-      env: safeEnv, timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+      env: safeEnv, timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: isolate ? 128 * 1024 * 1024 : 1024 * 1024,
     });
     return result.stdout.trim();
   } catch (error) {
@@ -44,16 +44,31 @@ async function snapshotGit(path: string, timeoutMs: number, ...args: string[]) {
 }
 
 /** Initialize a local-only, one-commit repository without source remotes/history or executing repository content. */
-export async function initializeLocalSnapshot(path: string, timeoutMs = 60_000): Promise<void> {
-  await snapshotGit(path, timeoutMs, "init", "--quiet", "--template=", "--initial-branch=main");
+export async function cloneLocalSnapshot(source: string, destination: string, timeoutMs = 60_000): Promise<void> {
+  await safeSnapshotGit(source, timeoutMs, "clone", "--no-checkout", "--no-hardlinks", "--template=", "--", source, destination);
+  await configureSnapshotWorktree(destination, timeoutMs, false);
+  await snapshotGit(destination, timeoutMs, "checkout", "--force", "HEAD");
+  await snapshotGit(destination, timeoutMs, "config", "--local", "--unset", "core.hooksPath");
+  if (await snapshotGit(destination, timeoutMs, "status", "--porcelain", "--untracked-files=all") !== "")
+    throw new Error("Cloned local snapshot worktree differs from its index");
+}
+
+async function configureSnapshotWorktree(path: string, timeoutMs: number, includeSnapshotIdentity: boolean) {
   const info = join(path, ".git", "info");
   await mkdir(info, { recursive: true, mode: 0o700 });
   await chmod(info, 0o700);
   await writeFile(join(info, "attributes"), "* -text -filter -ident -working-tree-encoding\n", { mode: 0o600, flag: "wx" });
   for (const value of snapshotConfig) {
+    if (!includeSnapshotIdentity && value.startsWith("user.")) continue;
     const separator = value.indexOf("=");
     await snapshotGit(path, timeoutMs, "config", "--local", value.slice(0, separator), value.slice(separator + 1));
   }
+}
+
+export async function initializeLocalSnapshot(path: string, timeoutMs = 60_000): Promise<void> {
+  await snapshotGit(path, timeoutMs, "init", "--quiet", "--template=", "--initial-branch=main");
+  await configureSnapshotWorktree(path, timeoutMs, true);
+  const info = join(path, ".git", "info");
   await snapshotGit(path, timeoutMs, "add", "--force", "--all", "--", ".");
   await snapshotGit(path, timeoutMs, "commit", "--quiet", "--no-gpg-sign", "-m", "Import local skill snapshot");
 

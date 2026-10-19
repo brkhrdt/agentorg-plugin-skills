@@ -9,7 +9,7 @@ import type { CatalogSkill } from "../src/catalog.ts";
 import { gitWithTimeout } from "../src/git.ts";
 import { createLocalSkillFixture } from "./helpers/local-skill.ts";
 
-function makeImporter(db: Database, central: string, options: { failPublish?: boolean; beforeJournal?: (journal: LocalImportJournal) => void } = {}) {
+function makeImporter(db: Database, central: string, options: { failPublish?: boolean; failEmit?: boolean; beforeJournal?: (journal: LocalImportJournal) => void; afterSourceResolved?: (path: string) => void | Promise<void> } = {}) {
   const published: CatalogSkill[] = [], emitted: CatalogSkill[] = [], reported: Error[] = [];
   const importer = new LocalSkillImporter({
     centralRoot: central, stagingRoot: join(central, "local-import-staging"), maxCatalogEntries: 8, gitTimeoutMs: 10_000,
@@ -21,7 +21,7 @@ function makeImporter(db: Database, central: string, options: { failPublish?: bo
       if (options.failPublish) throw new Error("injected publication failure");
       db.transaction(() => {
         if (db.query("SELECT 1 FROM catalog WHERE name=? OR url=?").get(record.name, identity)) throw Object.assign(new Error("duplicate"), { code: "DUPLICATE" });
-        if ((db.query("SELECT COUNT(*) AS n FROM catalog").get() as any).n >= 8) throw new Error("limit");
+        if ((db.query("SELECT COUNT(*) AS n FROM catalog").get() as any).n >= 8) throw Object.assign(new Error("limit"), { code: "LIMIT" });
         db.query("INSERT INTO catalog VALUES (?,?,?)").run(record.name, identity, JSON.stringify(record));
         db.query("DELETE FROM journal WHERE id=?").run(journalId);
       })();
@@ -29,8 +29,10 @@ function makeImporter(db: Database, central: string, options: { failPublish?: bo
     },
     emit(record) {
       expect(db.query("SELECT 1 FROM catalog WHERE name=?").get(record.name)).toBeDefined();
+      if (options.failEmit) throw new Error("injected event failure");
       emitted.push(record);
     },
+    afterSourceResolved: options.afterSourceResolved,
     report(error) { reported.push(error); },
   });
   return { importer, published, emitted, reported };
@@ -82,6 +84,59 @@ test("canonical source claims prevent concurrent duplicate snapshots", async () 
     expect([a, b].filter(result => result.status === "fulfilled")).toHaveLength(1);
     expect([a, b].find(result => result.status === "rejected")?.status).toBe("rejected");
     expect(h.published).toHaveLength(1);
+  } finally { await fixture.cleanup(); await f.cleanup(); }
+});
+
+test("source alias replacement after provenance resolution cannot publish a different tree", async () => {
+  const f = await setup(), original = await createLocalSkillFixture(), replacement = await createLocalSkillFixture();
+  try {
+    await writeFile(join(replacement.path, "untracked.txt"), "different source tree");
+    const renamed = `${original.path}-retained`;
+    const h = makeImporter(f.db, f.central, { afterSourceResolved: async path => {
+      expect(path).toBe(original.path);
+      await (await import("node:fs/promises")).rename(original.path, renamed);
+      await (await import("node:fs/promises")).symlink(replacement.path, original.path, "dir");
+    } });
+    await expect(h.importer.import(original.path)).rejects.toThrow(/source path changed/);
+    expect(h.published).toHaveLength(0);
+    expect((f.db.query("SELECT COUNT(*) AS n FROM catalog").get() as any).n).toBe(0);
+    const journal = JSON.parse((f.db.query("SELECT data FROM journal").get() as any).data);
+    expect(journal.localImport.sourcePath).toBe(original.path);
+    expect(await readFile(join(journal.path, "untracked.txt"), "utf8")).toBe("different source tree");
+  } finally { await original.cleanup(); await replacement.cleanup(); await f.cleanup(); }
+});
+
+test("post-publication event failures do not report the import as failed or undo catalog state", async () => {
+  const f = await setup(), fixture = await createLocalSkillFixture();
+  try {
+    const h = makeImporter(f.db, f.central, { failEmit: true });
+    const record = await h.importer.import(fixture.path);
+    expect(record.name).toBe("fixture-skill");
+    expect((f.db.query("SELECT COUNT(*) AS n FROM catalog").get() as any).n).toBe(1);
+    expect((f.db.query("SELECT COUNT(*) AS n FROM journal").get() as any).n).toBe(0);
+    expect(h.reported[0]?.message).toContain("was published");
+  } finally { await fixture.cleanup(); await f.cleanup(); }
+});
+
+test("duplicate catalog names retain their error code through the durable importer", async () => {
+  const f = await setup(), fixture = await createLocalSkillFixture();
+  try {
+    f.db.query("INSERT INTO catalog VALUES (?,?,?)").run("fixture-skill", "https://github.com/example/existing", "{}");
+    const h = makeImporter(f.db, f.central);
+    await expect(h.importer.import(fixture.path)).rejects.toMatchObject({ code: "DUPLICATE" });
+    expect((f.db.query("SELECT COUNT(*) AS n FROM catalog").get() as any).n).toBe(1);
+    expect((f.db.query("SELECT COUNT(*) AS n FROM journal").get() as any).n).toBe(1);
+  } finally { await fixture.cleanup(); await f.cleanup(); }
+});
+
+test("catalog limits retain error code through the durable importer", async () => {
+  const f = await setup(), fixture = await createLocalSkillFixture();
+  try {
+    for (let i = 0; i < 8; i++) f.db.query("INSERT INTO catalog VALUES (?,?,?)").run(`seed-${i}`, `https://example/${i}`, "{}");
+    const h = makeImporter(f.db, f.central);
+    await expect(h.importer.import(fixture.path)).rejects.toMatchObject({ code: "LIMIT" });
+    expect((f.db.query("SELECT COUNT(*) AS n FROM catalog").get() as any).n).toBe(8);
+    expect((f.db.query("SELECT COUNT(*) AS n FROM journal").get() as any).n).toBe(1);
   } finally { await fixture.cleanup(); await f.cleanup(); }
 });
 
