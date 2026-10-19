@@ -55,6 +55,8 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   const endpoints = new Map<string, (params: unknown, caller: { kind: string; id: string }) => unknown>();
   const events: Array<{ type: string; payload: unknown }> = [];
+  let settingsRevision = 0;
+  let eventHandler: ((event: any) => void | Promise<void>) | undefined;
   let initialize: ((agents: any[]) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   const host = {
@@ -66,18 +68,18 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     onInitialize(callback: (agents: any[]) => Promise<void>) { initialize = callback; },
     prepareLaunch() {}, validateLaunch() {}, registerHarness() {},
     registerEndpoint(name: string, callback: (params: unknown, caller: { kind: string; id: string }) => unknown) { endpoints.set(name, callback); },
-    registerTool() {}, transformTool() {}, beforeSettings() {}, onEvent() {},
+    registerTool() {}, transformTool() {}, beforeSettings() {}, onEvent(callback: (event: any) => void | Promise<void>) { eventHandler = callback; },
     onShutdown(callback: () => Promise<void>) { shutdown = callback; },
     request: async (method: string) => {
       if (method === "organization.settings.get" && (config as any).rejectSettingsRead) throw new Error("Injected settings read failure");
-      return method === "organization.settings.get" ? { revision: 0, effective: structuredClone(config) } : {};
+      return method === "organization.settings.get" ? { revision: settingsRevision, effective: structuredClone(config) } : {};
     }, emit(type: string, payload: unknown) { events.push({ type, payload }); },
   };
   const start = async () => {
     await (createSkillsPlugin({ home, allowLocalSources }) as ServerPlugin).setup(host as any);
     return { initialize: initialize!, shutdown: shutdown!, endpoints, events };
   };
-  return { root, source, config, start };
+  return { root, source, config, start, setRevision: (revision: number) => { settingsRevision = revision; }, emit: (event: any) => eventHandler?.(event) };
 }
 
 const caller = { kind: "client", id: "test" };
@@ -313,6 +315,79 @@ test.serial("manual identity is independent while a different configured source 
   }
 });
 
+test.serial("same exact manual/configured identity cannot double-clone or corrupt ownership", async () => {
+  const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
+  const calls = join(f.root, "git-calls"), entered = join(f.root, "clone-entered"), release = join(f.root, "clone-release");
+  process.env.TEST_GIT_CALLS = calls;
+  process.env.TEST_GIT_GATE_URL = f.source; process.env.TEST_GIT_GATE_ENTERED = entered; process.env.TEST_GIT_GATE_RELEASE = release;
+  const plugin = await f.start(); let closed = false;
+  try {
+    await plugin.initialize([]);
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: f.source }];
+    await plugin.endpoints.get("skills.reconcile")!({}, caller);
+    await waitFor(async () => Bun.file(entered).exists());
+    const manualPromise: Promise<{ value?: unknown; error?: any }> = Promise.resolve(plugin.endpoints.get("skills.add")!({ name: "alpha", gitUrl: f.source }, caller))
+      .then(value => ({ value }), error => ({ error }));
+    await pause(100);
+    const clonesWhileGated = (await Bun.file(calls).text()).trim().split("\n");
+    expect(clonesWhileGated).toHaveLength(1);
+    await writeFile(release, "release");
+    const manual = await manualPromise;
+    expect(manual.value || (manual.error as any)?.code === "DUPLICATE").toBeTruthy();
+    await waitFor(async () => {
+      const result = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+      return result.reconciliation.state === "ready";
+    });
+    const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(view.skills).toHaveLength(1);
+    expect(view.skills[0]).toMatchObject({ name: "alpha", gitUrl: f.source, origin: expect.any(String) });
+    expect(["manual", "configured"]).toContain(view.skills[0].origin);
+    const db = new Database(await databasePath(f.root), { readonly: true });
+    expect((db.query("SELECT COUNT(*) AS count FROM catalog").get() as any).count).toBe(1);
+    const owner = JSON.parse((db.query("SELECT data FROM repository_state WHERE name='alpha'").get() as any).data);
+    db.close();
+    expect(owner.origin).toBe(view.skills[0].origin);
+    await plugin.shutdown(); closed = true;
+  } finally {
+    await writeFile(release, "release").catch(() => {});
+    if (!closed) await plugin.shutdown();
+  }
+});
+
+test.serial("an alpha retry firing during beta's gated full pass is drained afterward", async () => {
+  const alphaUrl = "https://github.com/example/alpha", betaUrl = "https://github.com/example/beta";
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: alphaUrl }, { name: "beta", gitUrl: betaUrl }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const betaSource = join(f.root, "source-beta"); await mkdir(betaSource);
+  await writeFile(join(betaSource, "SKILL.md"), "---\nname: beta\ndescription: Beta fixture\n---\n# Instructions\n");
+  const calls = join(f.root, "git-calls"), failure = join(f.root, "alpha-failure");
+  const entered = join(f.root, "beta-entered"), release = join(f.root, "beta-release");
+  process.env.TEST_GIT_CALLS = calls;
+  process.env.TEST_GIT_SOURCES = JSON.stringify({ [betaUrl]: betaSource });
+  process.env.TEST_GIT_FAIL = failure; process.env.TEST_GIT_FAIL_URL = alphaUrl;
+  process.env.TEST_GIT_GATE_URL = betaUrl; process.env.TEST_GIT_GATE_ENTERED = entered; process.env.TEST_GIT_GATE_RELEASE = release;
+  await writeFile(failure, "fail");
+  const plugin = await f.start();
+  const startup = plugin.initialize([]);
+  try {
+    await waitFor(async () => Bun.file(entered).exists(), 8_000).catch(async () => {
+      throw new Error(`Beta clone gate was not reached; Git calls: ${await Bun.file(calls).text().catch(() => "<none>")}`);
+    });
+    await rm(failure, { force: true });
+    await pause(1_250); // Alpha's retry expires while the full pass is blocked on beta.
+    expect((await Bun.file(calls).text()).trim().split("\n")).toEqual([alphaUrl, betaUrl]);
+    await writeFile(release, "release");
+    await startup;
+    const entries = (await Bun.file(calls).text()).trim().split("\n");
+    expect(entries.filter(url => url === alphaUrl)).toHaveLength(2);
+    expect(entries.filter(url => url === betaUrl)).toHaveLength(1);
+    expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).skills.map((item: any) => item.name)).toEqual(["alpha", "beta"]);
+  } finally {
+    await writeFile(release, "release").catch(() => {});
+    await startup.catch(() => {});
+    await plugin.shutdown();
+  }
+}, 15_000);
+
 test.serial("permanent malformed alpha is not retried by transient beta retry generations", async () => {
   const alphaUrl = "https://github.com/example/alpha", betaUrl = "https://github.com/example/beta";
   const f = await fixture({ repositories: [{ name: "alpha", gitUrl: alphaUrl }, { name: "beta", gitUrl: betaUrl }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
@@ -338,6 +413,27 @@ test.serial("permanent malformed alpha is not retried by transient beta retry ge
   } finally { await plugin.shutdown(); }
 });
 
+test.serial("permanent malformed alpha is not retried by an unrelated numeric settings wake", async () => {
+  const alphaUrl = "https://github.com/example/alpha";
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: alphaUrl }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  await writeFile(join(f.source, "SKILL.md"), "---\nname: [broken\n---\n# Instructions\n");
+  const calls = join(f.root, "git-calls"); process.env.TEST_GIT_CALLS = calls;
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    const before = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(before.reconciliation.entries[0]).toMatchObject({ name: "alpha", status: "error", attempts: 1 });
+    (f.config as any).gitTimeoutMs = 30_000;
+    f.setRevision(1);
+    await f.emit({ type: "organization.settings.changed", data: { namespace: "skills", revision: 1 } });
+    await waitFor(async () => {
+      const status = (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation;
+      return status.desiredRevision === 1 && status.generation > before.reconciliation.generation && status.state === "error";
+    });
+    expect((await Bun.file(calls).text()).trim().split("\n").filter(Boolean)).toEqual([alphaUrl]);
+  } finally { await plugin.shutdown(); }
+});
+
 test.serial("the periodic sweep reconciles settings missed without a status read", async () => {
   const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
   const calls = join(f.root, "git-calls"); process.env.TEST_GIT_CALLS = calls;
@@ -346,6 +442,7 @@ test.serial("the periodic sweep reconciles settings missed without a status read
     await plugin.initialize([]);
     (f.config as any).repositories = [{ name: "alpha", gitUrl: f.source }];
     await waitFor(async () => (await Bun.file(calls).text().catch(() => "")).trim().length > 0, 7_000);
+    await waitFor(async () => (await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation.state === "ready");
     const result = await plugin.endpoints.get("skills.list")!({}, caller) as any;
     expect(result.reconciliation.state).toBe("ready");
     expect(result.skills.map((item: any) => item.name)).toEqual(["alpha"]);
