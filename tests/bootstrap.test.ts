@@ -57,7 +57,7 @@ setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e)
     registerEndpoint(name: string, callback: (params: unknown, caller: { kind: string; id: string }) => unknown) { endpoints.set(name, callback); },
     registerTool() {}, transformTool() {}, beforeSettings() {}, onEvent() {},
     onShutdown(callback: () => Promise<void>) { shutdown = callback; },
-    request: async () => ({}), emit(type: string, payload: unknown) { events.push({ type, payload }); },
+    request: async (method: string) => method === "organization.settings.get" ? { revision: 0, effective: structuredClone(config) } : ({}), emit(type: string, payload: unknown) { events.push({ type, payload }); },
   };
   const start = async () => {
     await (createSkillsPlugin({ home, allowLocalSources }) as ServerPlugin).setup(host as any);
@@ -77,6 +77,7 @@ test.serial("configured repository seeds import once; identical restarts preserv
   await first.initialize([]);
   const initial = await first.endpoints.get("skills.list")!({}, caller) as any;
   expect(initial.skills.map((skill: any) => skill.name)).toEqual(["alpha"]);
+  expect(initial.reconciliation).toMatchObject({ state: "ready", entries: [{ name: "alpha", status: "ready" }] });
   const original = initial.skills[0];
   await first.shutdown();
 
@@ -96,8 +97,9 @@ test.serial("configured repository seeds import once; identical restarts preserv
   const third = await f.start();
   await third.initialize([]);
   const afterRemoval = await third.endpoints.get("skills.list")!({}, caller) as any;
-  expect(afterRemoval.skills).toHaveLength(1);
-  expect(afterRemoval.skills[0]).toMatchObject({ path: original.path, createdAt: original.createdAt });
+  expect(afterRemoval.skills).toHaveLength(0);
+  expect(afterRemoval.retained).toHaveLength(1);
+  expect(afterRemoval.retained[0]).toMatchObject({ path: original.path, createdAt: original.createdAt, status: "retired" });
   await third.shutdown();
 });
 
@@ -111,9 +113,11 @@ test.serial("configured name/source conflicts preserve the existing catalog entr
   (f.config as { repositories: Array<{ name: string; gitUrl: string }> }).repositories[0]!.gitUrl = "https://github.com/example/other";
   const conflict = await f.start();
   await conflict.initialize([]);
-  const items = (await conflict.endpoints.get("skills.list")!({}, caller) as any).skills;
-  expect(items).toHaveLength(1);
-  expect(items[0]).toMatchObject({ path: original.path, gitUrl: original.gitUrl, createdAt: original.createdAt });
+  const view = await conflict.endpoints.get("skills.list")!({}, caller) as any;
+  expect(view.skills).toHaveLength(0);
+  expect(view.retained).toHaveLength(1);
+  expect(view.retained[0]).toMatchObject({ path: original.path, gitUrl: original.gitUrl, createdAt: original.createdAt });
+  expect(view.reconciliation.entries[0]).toMatchObject({ name: "alpha", status: "error" });
   expect(conflict.events.some(event => event.type === "skills.error" && JSON.stringify(event.payload).includes("alpha"))).toBe(true);
   await conflict.shutdown();
 });
@@ -123,7 +127,10 @@ test.serial("invalid configured checkout remains unregistered with an actionable
   await writeFile(join(f.source, "SKILL.md"), "---\nname: wrong\ndescription: Invalid fixture\n---\n# Instructions\n");
   const plugin = await f.start();
   await plugin.initialize([]);
-  expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).skills).toHaveLength(0);
+  const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+  expect(view.skills).toHaveLength(0);
+  expect(view.reconciliation.entries).toMatchObject([{ name: "alpha", status: "error" }]);
+  expect(view.reconciliation.entries[0].error).toContain("SKILL.md");
   expect(plugin.events.some(event => event.type === "skills.error" && JSON.stringify(event.payload).includes("alpha"))).toBe(true);
   await plugin.shutdown();
 });

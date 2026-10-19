@@ -109,15 +109,41 @@ exec ${realGit} "$@"
   expect(whileBlocked.effective.repositories).toEqual([{ name: "alpha", gitUrl: repo }]);
   expect((await client.request<any>("skills.list")).skills).toEqual([]);
 
+  // Remove while the original clone is still blocked. That stale completion
+  // must remain unregistered and cannot create a grantable catalog entry.
+  const removedDuringClone = await promptly(client.request<any>("organization.settings.update", {
+    namespace: "skills", expectedRevision: 1, patch: { repositories: [] },
+  }));
+  expect(removedDuringClone.revision).toBe(2);
+  expect(removedDuringClone.values.repositories).toEqual([]);
+  expect(removedDuringClone.effective.repositories).toEqual([]);
+  expect((await client.request<any>("skills.list")).skills.map((skill: any) => skill.name)).not.toContain("alpha");
+  await expect(server.organization.request("skills.reconcile", {}, { kind: "agent", id: agent.id })).rejects.toThrow("client-only");
+  const staleGrant = await client.wait(await client.request<Operation>("agent.modify", {
+    agentId: agent.id, settings: { extensions: { skills: { alpha: "available" } } },
+  }));
+  expect(staleGrant.status).toBe("failed");
   await writeFile(release, "release");
+  await waitFor(async () => {
+    const result = await client!.request<any>("skills.list");
+    return result.reconciliation.desiredRevision === 2 && result.reconciliation.state === "ready";
+  });
+  expect((await client.request<any>("skills.list")).skills).toEqual([]);
+
+  // Re-add using the same socket/server; the completed retained checkout must
+  // not be mistaken for a stale grant, and the current desired identity wins.
+  const readded = await client.request<any>("organization.settings.update", {
+    namespace: "skills", expectedRevision: 2, patch: { repositories: [{ name: "alpha", gitUrl: repo }] },
+  });
+  expect(readded.revision).toBe(3);
   await waitFor(async () => (await client!.request<any>("skills.list")).skills.some((skill: any) => skill.name === "alpha"));
   const added = await client.request<any>("skills.list");
   expect(added.skills.map((skill: any) => skill.name)).toEqual(["alpha"]);
 
   const removed = await client.request<any>("organization.settings.update", {
-    namespace: "skills", expectedRevision: 1, patch: { repositories: [] },
+    namespace: "skills", expectedRevision: 3, patch: { repositories: [] },
   });
-  expect(removed.revision).toBe(2);
+  expect(removed.revision).toBe(4);
   expect(removed.values.repositories).toEqual([]);
   expect(removed.effective.repositories).toEqual([]);
   const afterRemoval = await client.request<any>("skills.list");

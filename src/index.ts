@@ -17,7 +17,11 @@ import { skillsServerSettings } from "./config.ts";
 export interface Skill { name: string; gitUrl: string; description: string; createdAt: string; path: string }
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
 interface Action { generation: string; from: string; to: string; old: boolean }
-interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string }
+interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string } }
+type RepositoryOrigin = "manual" | "configured";
+type RepositoryStatus = "pending" | "ready" | "retired" | "error";
+interface RepositoryRecordState { name: string; gitUrl: string; origin: RepositoryOrigin; status: RepositoryStatus; error?: string; attempts: number; fingerprint: string }
+interface ReconciliationStatus { generation: number; desiredRevision: number; fingerprint: string; state: "pending" | "running" | "ready" | "error"; lastSuccessfulRevision?: number; entries: Array<{ name: string; gitUrl: string; status: RepositoryStatus; error?: string }> }
 interface Options {
   /** Test/embedded deployments only; normal CLI always uses OS home. */
   home?: string;
@@ -97,8 +101,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       INSERT INTO meta SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM meta);
       CREATE TABLE IF NOT EXISTS catalog(name TEXT PRIMARY KEY, url TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS installations(id TEXT PRIMARY KEY, data TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, data TEXT NOT NULL);`);
-    if ((db.query("SELECT version FROM meta").get() as any).version !== 1) throw new Error("Unsupported skills database version");
+      CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS repository_state(name TEXT NOT NULL, url TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(name,url));
+      CREATE TABLE IF NOT EXISTS reconciliation(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);`);
+    const schemaVersion = (db.query("SELECT version FROM meta").get() as any).version;
+    if (schemaVersion > 2) throw new Error(`Unsupported skills database version ${schemaVersion}`);
+    if (schemaVersion < 2) db.query("UPDATE meta SET version=2").run();
     const rows = <T>(table: string): T[] => db.query(`SELECT data FROM ${table} ORDER BY rowid`).all().map((r: any) => JSON.parse(r.data));
     const put = (table: "installations" | "journal", id: string, value: unknown) => db.query(`INSERT OR REPLACE INTO ${table} VALUES (?,?)`).run(id, JSON.stringify(value));
     const dropJournal = (id: string) => db.query("DELETE FROM journal WHERE id=?").run(id);
@@ -112,11 +120,56 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     function exclusive<T>(work: () => Promise<T>): Promise<T> {
       const next = tail.then(work); tail = next.catch(() => {}); return next;
     }
+    let publishTail: Promise<unknown> = Promise.resolve();
+    function catalogPublish<T>(work: () => T | Promise<T>): Promise<T> {
+      const next = publishTail.then(work); publishTail = next.catch(() => {}); return next;
+    }
+    const identityClaims = new Map<string, string>();
+    const claimIdentity = (name: string, gitUrl: string): string | undefined => {
+      const keys = [`name:${name}`, `url:${gitUrl}`];
+      if (keys.some(key => identityClaims.has(key))) return undefined;
+      const owner = randomUUID(); for (const key of keys) identityClaims.set(key, owner);
+      return owner;
+    };
+    const releaseIdentity = (name: string, gitUrl: string, owner: string) => {
+      for (const key of [`name:${name}`, `url:${gitUrl}`]) if (identityClaims.get(key) === owner) identityClaims.delete(key);
+    };
+    let shuttingDown = false;
+    let reconciliationWorker: Promise<void> | undefined;
+    let reconciliationRequested = false;
+    let sweepTimer: ReturnType<typeof setInterval> | undefined;
+    const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const git = (cwd: string, ...args: string[]) => {
       const effective = host.serverSettings("skills") as { gitTimeoutMs?: number };
       return gitWithTimeout(cwd, effective.gitTimeoutMs ?? 60_000, ...args);
     };
     const effectiveConfig = () => host.serverSettings("skills") as { repositories: Array<{ name: string; gitUrl: string }>; gitTimeoutMs: number; maxCatalogEntries: number };
+    const repositoryStates = () => rows<RepositoryRecordState>("repository_state");
+    const repositoryState = (name: string, gitUrl: string) => repositoryStates().find(state => state.name === name && state.gitUrl === gitUrl);
+    const saveRepositoryState = (state: RepositoryRecordState) => db.query("INSERT OR REPLACE INTO repository_state VALUES (?,?,?)").run(state.name, state.gitUrl, JSON.stringify(state));
+    const desiredRepositories = () => effectiveConfig().repositories;
+    const configuredIdentity = (name: string, gitUrl: string) => desiredRepositories().some(repository => repository.name === name && repository.gitUrl === gitUrl);
+    const identityFingerprint = (repositories: Array<{ name: string; gitUrl: string }>) => hash(JSON.stringify([...repositories].sort((a, b) => a.name.localeCompare(b.name) || a.gitUrl.localeCompare(b.gitUrl))));
+    const reconciliation = (): ReconciliationStatus => {
+      const saved = db.query("SELECT data FROM reconciliation WHERE id=1").get() as { data: string } | null;
+      return saved ? JSON.parse(saved.data) : { generation: 0, desiredRevision: 0, fingerprint: "", state: "ready", entries: [] };
+    };
+    const saveReconciliation = (value: ReconciliationStatus) => db.query("INSERT OR REPLACE INTO reconciliation VALUES (1,?)").run(JSON.stringify(value));
+    const configuredActive = (item: Skill) => {
+      const state = repositoryState(item.name, item.gitUrl);
+      return state?.origin === "manual" || (state?.origin === "configured" && configuredIdentity(item.name, item.gitUrl));
+    };
+    const grantable = (item: Skill) => configuredActive(item) && repositoryState(item.name, item.gitUrl)?.status === "ready";
+    const activeCatalog = () => catalog().filter(grantable);
+    // Schema-v1 catalog entries have no ownership record. Classify once against
+    // the current effective configuration; all nonmatches remain manual.
+    const migrateRepositoryOwnership = () => db.transaction(() => {
+      const configured = desiredRepositories();
+      for (const item of catalog()) if (!repositoryState(item.name, item.gitUrl)) {
+        const origin = configured.some(repository => repository.name === item.name && repository.gitUrl === item.gitUrl) ? "configured" : "manual";
+        saveRepositoryState({ name: item.name, gitUrl: item.gitUrl, origin, status: "ready", attempts: 0, fingerprint: "" });
+      }
+    })();
     async function own(i: Installation, path = i.path) {
       if ((await lstat(path)).isSymbolicLink()) fail(`Skill checkout is a symlink: ${path}`);
       const markerPath = join(path, ".git", "agentorg-skills.json");
@@ -173,11 +226,22 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       dropJournal(journal.id);
     }
-    async function prepare(settings: Settings, agent: Readonly<AgentRecord>, context: { caller: { kind: string; id: string }; selectionSupplied: boolean; creating: boolean }): Promise<MutationChange> {
-      for (const name of Object.keys(states(settings) ?? {})) skill(name);
+    async function prepare(settings: Settings, agent: Readonly<AgentRecord>, context: { caller: { kind: string; id: string }; selectionSupplied: boolean; creating: boolean; previous?: Readonly<AgentRecord> }): Promise<MutationChange> {
+      const nextStates = states(settings) ?? {};
+      const previousStates = context.creating ? {} : (states(context.previous?.settings ?? agent.settings) ?? {});
+      for (const [name, state] of Object.entries(nextStates)) {
+        const item = catalog().find(skill => skill.name === name) ?? fail(`Unknown skill ${name}`);
+        if (state !== "unavailable" && !grantable(item) && previousStates[name] !== state) {
+          const record = repositoryState(item.name, item.gitUrl);
+          fail(`Skill ${name} is ${record?.status === "retired" || !configuredActive(item) ? "retired from the configured repository list" : "not ready"}`, record?.status === "retired" || !configuredActive(item) ? "REPOSITORY_RETIRED" : "SKILL_NOT_READY");
+        }
+      }
       if (context.selectionSupplied && context.caller.kind === "agent") {
         const parent = await host.request("agent.get", { agentId: context.caller.id }, server) as AgentRecord;
-        for (const [name] of selected(states(settings))) {
+        for (const [name, state] of selected(nextStates)) {
+          if (previousStates[name] === state) continue;
+          const item = catalog().find(skill => skill.name === name)!;
+          if (!grantable(item)) fail(`Skill ${name} is not active and ready for delegation`, "REPOSITORY_RETIRED");
           if (!["available", "installed"].includes(states(parent.settings)?.[name] ?? "unavailable"))
             fail(`Caller cannot delegate ${name}`, "FORBIDDEN");
         }
@@ -267,7 +331,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       },
     });
     host.registerServerSettings(skillsServerSettings(options.allowLocalSources ?? false));
-    host.registerCapability("skills", { settingsNamespace: "skills", serverSettingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add" }, version: 1 });
+    migrateRepositoryOwnership();
+    host.registerCapability("skills", { settingsNamespace: "skills", serverSettingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile" }, version: 1 });
     async function uniqueCwd(settings: Settings, agent: Readonly<AgentRecord>, agents: Readonly<AgentRecord>[]) {
       const cwd = await realpath(settings.cwd ?? process.cwd());
       if (!(await lstat(cwd)).isDirectory()) fail("cwd must be a directory");
@@ -285,19 +350,21 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       // Build grants before staging so validation failures do not leave an unowned journal.
       const updates: NonNullable<MutationChange["updates"]> = [];
       if (selectionSupplied && context.caller.kind === "client") {
+        const previousStates = context.method === "agent.create" ? {} : (states((context.previous ?? context.agent).settings) ?? {});
+        const newlySelected = selected(states(settings)).filter(([name, state]) => previousStates[name] !== state);
         let parentId = context.agent.parentId;
-        while (parentId) {
+        while (parentId && newlySelected.length) {
           const parent = context.agents.find(a => a.id === parentId)!;
           const skills = { ...states(parent.settings) };
           let changed = false;
-          for (const [name] of selected(states(settings))) {
+          for (const [name] of newlySelected) {
             if (!["available", "installed"].includes(skills[name] ?? "unavailable")) { skills[name] = "available"; changed = true; }
           }
           if (changed) updates.push({ agentId: parent.id, expectedRevision: parent.revision, settings: { ...parent.settings, extensions: { ...parent.settings.extensions, skills } } });
           parentId = parent.parentId;
         }
       }
-      const change = await exclusive(() => prepare(settings, context.previous ?? context.agent, { caller: context.caller, selectionSupplied, creating: context.method === "agent.create" }));
+      const change = await exclusive(() => prepare(settings, context.previous ?? context.agent, { caller: context.caller, selectionSupplied, creating: context.method === "agent.create", previous: context.previous }));
       return { ...change, settings, updates };
     });
     host.prepareLaunch(async context => {
@@ -313,12 +380,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       if (await realpath(spec.cwd!) !== await realpath(agent.settings.cwd ?? process.cwd()))
         fail("Harness cwd must match the managed workspace", "CWD_CONFLICT");
     });
-    host.onInitialize(agents => exclusive(async () => {
-        // Seeds are additive inputs to the persistent catalog, never a destructive mirror.
-        for (const repository of effectiveConfig().repositories) {
-          try { await registerCatalog(repository.name, repository.gitUrl, true); }
-          catch (error) { report(new Error(`Configured repository ${repository.name} (${repository.gitUrl}) failed: ${(error as Error).message}`)); }
-        }
+    host.onInitialize(async agents => {
+        await runReconciliation("startup");
+        await exclusive(async () => {
         for (const j of rows<Journal>("journal")) {
           if (j.path) {
             report(new Error(`Interrupted catalog clone retained at ${j.path}; not registered`));
@@ -364,48 +428,235 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
             }
           }
         }
-      }));
-    async function registerCatalog(name: string, inputUrl: unknown, configuredSeed: boolean): Promise<Skill> {
+      });
+    });
+    async function registerCatalog(name: string, inputUrl: unknown): Promise<Skill> {
       if (typeof name !== "string" || name.length > 64 || !idPattern.test(name)) fail("Invalid skill name");
       const url = source(inputUrl, options.allowLocalSources ?? false);
+      const claim = claimIdentity(name, url);
+      if (!claim) fail(`Repository registration is already in progress for ${name}`, "DUPLICATE");
+      try {
+        const existing = catalog();
+        const sameName = existing.find(s => s.name === name);
+        const sameUrl = existing.find(s => s.gitUrl === url);
+        if (sameName || sameUrl) fail(`Skill repository conflict for ${name}: name or Git source already registered`, "DUPLICATE");
+        if (existing.length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
+        const path = join(root, hash(name) + "-" + randomUUID());
+        const journalId = `catalog-${randomUUID()}`;
+        put("journal", journalId, { id: journalId, agentId: "catalog", revision: 0, actions: [], path, repository: { name, gitUrl: url } });
+        let description: string;
+        try {
+          await git(root, "-c", `protocol.file.allow=${url.startsWith("/") ? "always" : "never"}`, "clone", "--", url, path);
+          description = await metadata(path, name);
+          await checkoutLimit(path);
+        } catch (error) {
+          throw new Error(`Catalog checkout for ${name} retained at ${path}: ${(error as Error).message}`);
+        }
+        const record: Skill = { name, gitUrl: url, description, path, createdAt: new Date().toISOString() };
+        try {
+          await catalogPublish(() => db.transaction(() => {
+            if (catalog().some(s => s.name === name || s.gitUrl === url)) fail(`Skill repository conflict for ${name}`, "DUPLICATE");
+            if (catalog().length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
+            db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, url, JSON.stringify(record));
+            saveRepositoryState({ name, gitUrl: url, origin: "manual", status: "ready", attempts: 0, fingerprint: "" });
+            dropJournal(journalId);
+          })());
+        } catch (error) {
+          throw new Error(`Catalog registration for ${name} (${url}) failed; checkout and journal retained at ${path}: ${(error as Error).message}`);
+        }
+        host.emit("skills.catalog_added", record);
+        return record;
+      } finally {
+        releaseIdentity(name, url, claim);
+        if (configuredIdentity(name, url)) scheduleReconciliation("catalog-add");
+      }
+    }
+    async function settingsView() {
+      return await host.request("organization.settings.get", { namespace: "skills" }, server) as { revision: number; effective: { repositories: Array<{ name: string; gitUrl: string }> } };
+    }
+    function saveStatus(status: ReconciliationStatus) {
+      saveReconciliation(status);
+      host.emit("skills.reconciliation_changed", status);
+    }
+    function scheduleRetry(name: string, url: string, attempts: number) {
+      if (attempts > 2 || shuttingDown || !configuredIdentity(name, url)) return;
+      const key = `${name}\0${url}`;
+      if (retryTimers.has(key)) return;
+      const delay = attempts === 1 ? 1_000 : 5_000;
+      retryTimers.set(key, setTimeout(() => {
+        retryTimers.delete(key);
+        if (configuredIdentity(name, url)) void runReconciliation("retry");
+      }, delay));
+    }
+    function transient(error: unknown) {
+      const code = (error as any)?.code;
+      if (["INVALID_PARAMS", "DUPLICATE", "LIMIT", "REPOSITORY_RETIRED"].includes(code)) return false;
+      const message = (error as Error)?.message ?? "";
+      return !/SKILL\.md|frontmatter|must match|exceeds|conflict|invalid skill name/i.test(message);
+    }
+    async function reconcileIdentity(repository: { name: string; gitUrl: string }, revision: number, fingerprint: string) {
+      const { name, gitUrl } = repository;
+      if (!configuredIdentity(name, gitUrl) || shuttingDown) return;
+      const previous = repositoryState(name, gitUrl);
+      if (previous?.fingerprint === fingerprint && previous.status === "error" && previous.attempts >= 3) return;
+      let attempts = previous?.fingerprint === fingerprint ? previous.attempts : 0;
+      const update = (status: RepositoryStatus, error?: string) => saveRepositoryState({ name, gitUrl, origin: "configured", status, error, attempts, fingerprint });
       const existing = catalog();
-      const sameName = existing.find(s => s.name === name);
-      const sameUrl = existing.find(s => s.gitUrl === url);
-      if (configuredSeed && sameName?.gitUrl === url) return sameName;
-      if (sameName || sameUrl) fail(`Skill repository conflict for ${name}: name or Git source already registered`, "DUPLICATE");
-      const limit = effectiveConfig().maxCatalogEntries;
-      if (existing.length >= limit) fail(`Catalog limit (${limit}) reached`, "LIMIT");
+      const exact = existing.find(item => item.name === name && item.gitUrl === gitUrl);
+      if (exact) {
+        const oldState = repositoryState(name, gitUrl);
+        if (oldState?.origin === "manual") return;
+        try {
+          await metadata(exact.path, name);
+          await checkoutLimit(exact.path);
+          update("ready");
+        } catch (error) { update("error", (error as Error).message); }
+        return;
+      }
+      const conflict = existing.find(item => item.name === name || item.gitUrl === gitUrl);
+      if (conflict) {
+        const message = `Repository identity conflicts with registered skill ${conflict.name}`;
+        update("error", message); report(new Error(`Configured repository ${name} (${gitUrl}) failed: ${message}`)); return;
+      }
+      if (existing.length >= effectiveConfig().maxCatalogEntries) {
+        const message = `Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`;
+        update("error", message); report(new Error(`Configured repository ${name} (${gitUrl}) failed: ${message}`)); return;
+      }
+      const claim = claimIdentity(name, gitUrl);
+      if (!claim) { update("pending", "Repository registration is already in progress"); return; }
       const path = join(root, hash(name) + "-" + randomUUID());
-      // Retain a journal and partial checkout on every failure for operator diagnosis.
       const journalId = `catalog-${randomUUID()}`;
-      put("journal", journalId, { id: journalId, agentId: "catalog", revision: 0, actions: [], path });
-      let description: string;
+      put("journal", journalId, { id: journalId, agentId: "catalog", revision, actions: [], path, repository: { name, gitUrl } });
+      update("pending");
       try {
+        const url = source(gitUrl, options.allowLocalSources ?? false);
         await git(root, "-c", `protocol.file.allow=${url.startsWith("/") ? "always" : "never"}`, "clone", "--", url, path);
-        description = await metadata(path, name);
+        const description = await metadata(path, name);
         await checkoutLimit(path);
-      } catch (error) {
-        throw new Error(`Catalog checkout for ${name} retained at ${path}: ${(error as Error).message}`);
-      }
-      const record: Skill = { name, gitUrl: url, description, path, createdAt: new Date().toISOString() };
-      try {
-        db.transaction(() => {
-          db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, url, JSON.stringify(record));
+        if (!configuredIdentity(name, gitUrl)) { update("retired"); return; }
+        const record: Skill = { name, gitUrl, description, path, createdAt: new Date().toISOString() };
+        await catalogPublish(() => db.transaction(() => {
+          if (!configuredIdentity(name, gitUrl)) { update("retired"); return; }
+          const now = catalog();
+          const byName = now.find(item => item.name === name), byUrl = now.find(item => item.gitUrl === gitUrl);
+          if (byName || byUrl) {
+            if (byName?.gitUrl === gitUrl) { update("ready"); dropJournal(journalId); return; }
+            update("error", `Repository identity conflicts with registered skill ${byName?.name ?? byUrl?.name}`); return;
+          }
+          if (now.length >= effectiveConfig().maxCatalogEntries) { update("error", `Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`); return; }
+          db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, gitUrl, JSON.stringify(record));
+          update("ready");
           dropJournal(journalId);
-        })();
+        })());
+        if (repositoryState(name, gitUrl)?.status === "ready") host.emit("skills.catalog_added", record);
       } catch (error) {
-        throw new Error(`Catalog registration for ${name} (${url}) failed; checkout and journal retained at ${path}: ${(error as Error).message}`);
+        attempts++;
+        const message = (error as Error).message;
+        update("error", message);
+        report(new Error(`Configured repository ${name} (${gitUrl}) failed; work retained at ${path}: ${message}`));
+        if (transient(error)) scheduleRetry(name, gitUrl, attempts);
+      } finally { releaseIdentity(name, gitUrl, claim); }
+    }
+    async function reconcileCurrent(reason: string, resetRetries = false) {
+      const view = await settingsView();
+      const repositories = view.effective.repositories;
+      const fingerprint = identityFingerprint(repositories);
+      let saved = reconciliation();
+      if (resetRetries || (saved.fingerprint && saved.fingerprint !== fingerprint)) {
+        for (const repository of repositories) {
+          const state = repositoryState(repository.name, repository.gitUrl);
+          if (state) saveRepositoryState({ ...state, attempts: 0, fingerprint });
+          const timer = retryTimers.get(`${repository.name}\0${repository.gitUrl}`);
+          if (timer) clearTimeout(timer);
+          retryTimers.delete(`${repository.name}\0${repository.gitUrl}`);
+        }
       }
-      host.emit("skills.catalog_added", record);
-      return record;
+      for (const state of repositoryStates()) if (state.origin === "configured" && !repositories.some(r => r.name === state.name && r.gitUrl === state.gitUrl)) {
+        const timer = retryTimers.get(`${state.name}\0${state.gitUrl}`);
+        if (timer) clearTimeout(timer);
+        retryTimers.delete(`${state.name}\0${state.gitUrl}`);
+        saveRepositoryState({ ...state, status: "retired", error: undefined });
+      }
+      saved = { generation: saved.generation + 1, desiredRevision: view.revision, fingerprint, state: "running", lastSuccessfulRevision: saved.lastSuccessfulRevision, entries: repositories.map(r => ({ name: r.name, gitUrl: r.gitUrl, status: "pending" })) };
+      saveStatus(saved);
+      for (const repository of repositories) {
+        if (shuttingDown) break;
+        await reconcileIdentity(repository, view.revision, fingerprint);
+        const state = repositoryState(repository.name, repository.gitUrl);
+        saved.entries = repositories.map(r => {
+          const item = repositoryState(r.name, r.gitUrl);
+          return { name: r.name, gitUrl: r.gitUrl, status: item?.status ?? "pending", error: item?.error };
+        });
+        saveStatus(saved);
+      }
+      const current = await settingsView();
+      if (identityFingerprint(current.effective.repositories) !== fingerprint) { reconciliationRequested = true; return; }
+      const finalStates = repositories.map(r => repositoryState(r.name, r.gitUrl));
+      const complete = finalStates.every(state => state?.status === "ready");
+      saved.state = complete ? "ready" : finalStates.some(state => state?.status === "pending") ? "pending" : "error";
+      if (complete) saved.lastSuccessfulRevision = view.revision;
+      saved.entries = repositories.map((r, index) => ({ name: r.name, gitUrl: r.gitUrl, status: finalStates[index]?.status ?? "pending", error: finalStates[index]?.error }));
+      saveStatus(saved);
+      if (reason === "startup" && !complete) report(new Error("Configured repository reconciliation has pending or failed entries"));
+    }
+    async function runReconciliation(reason: string, resetRetries = false) {
+      if (shuttingDown) return;
+      reconciliationRequested = true;
+      if (resetRetries) for (const state of repositoryStates()) if (state.origin === "configured" && state.status === "error") {
+        saveRepositoryState({ ...state, attempts: 0 });
+        const key = `${state.name}\0${state.gitUrl}`, timer = retryTimers.get(key);
+        if (timer) clearTimeout(timer);
+        retryTimers.delete(key);
+      }
+      if (!reconciliationWorker) {
+        reconciliationWorker = (async () => {
+          do { reconciliationRequested = false; await reconcileCurrent(reason, resetRetries); resetRetries = false; }
+          while (reconciliationRequested && !shuttingDown);
+        })().finally(() => {
+          reconciliationWorker = undefined;
+          if (reconciliationRequested && !shuttingDown) void runReconciliation("coalesced").catch(error => report(error));
+        });
+      }
+      await reconciliationWorker;
+    }
+    function scheduleReconciliation(reason = "settings", resetRetries = false) {
+      if (shuttingDown) return;
+      queueMicrotask(() => { if (!shuttingDown) void runReconciliation(reason, resetRetries).catch(error => report(error)); });
     }
     function clientOnly(caller: { kind: string }) { if (caller.kind !== "client") fail("Catalog endpoints are client-only", "FORBIDDEN"); }
-    host.registerEndpoint("skills.list", (_params, caller) => { clientOnly(caller); return { skills: catalog(), recovery: installations().filter(i => i.pending).map(i => ({ agentId: i.agentId, skill: i.skill, path: i.path, error: i.error })) }; });
+    function publicReconciliation(wake = true) {
+      const desired = desiredRepositories(), fingerprint = identityFingerprint(desired), saved = reconciliation();
+      if (wake && fingerprint !== saved.fingerprint) scheduleReconciliation("status-read");
+      const entries = desired.map(repository => {
+        const state = repositoryState(repository.name, repository.gitUrl);
+        const manualReady = state?.origin === "manual" && catalog().some(item => item.name === repository.name && item.gitUrl === repository.gitUrl);
+        const current = manualReady || state?.fingerprint === fingerprint;
+        return { name: repository.name, gitUrl: repository.gitUrl, status: current ? state?.status ?? "ready" : "pending", error: current ? state?.error : undefined };
+      });
+      return { ...saved, fingerprint, state: fingerprint !== saved.fingerprint ? "pending" : saved.state, entries };
+    }
+    host.registerEndpoint("skills.list", (_params, caller) => {
+      clientOnly(caller);
+      const retained = catalog().filter(item => repositoryState(item.name, item.gitUrl)?.origin === "configured" && !configuredIdentity(item.name, item.gitUrl));
+      return {
+        skills: activeCatalog(), retained: retained.map(item => ({ ...item, status: "retired" as const })),
+        reconciliation: publicReconciliation(),
+        recovery: installations().filter(i => i.pending).map(i => ({ agentId: i.agentId, skill: i.skill, path: i.path, error: i.error })),
+        repositoryRecovery: rows<Journal>("journal").filter(j => j.agentId === "catalog" && j.path).map(j => ({ id: j.id, path: j.path, repository: j.repository, revision: j.revision, status: "retained" as const })),
+      };
+    });
+    host.registerEndpoint("skills.reconcile", (params, caller) => {
+      clientOnly(caller);
+      if (params && (typeof params !== "object" || Array.isArray(params) || Object.keys(params).length)) fail("Expected an empty object");
+      const status = publicReconciliation(false);
+      scheduleReconciliation("requested", true);
+      return { accepted: true, reconciliation: status };
+    });
     host.registerEndpoint("skills.add", (params, caller) => exclusive(async () => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).some(k => !["name", "gitUrl"].includes(k))) fail("Expected {name, gitUrl}");
       const { name, gitUrl } = params as any;
-      try { return await registerCatalog(name, gitUrl, false); }
+      try { return await registerCatalog(name, gitUrl); }
       catch (error) {
         const code = (error as any)?.code;
         if (!['INVALID_PARAMS', 'DUPLICATE', 'LIMIT'].includes(code))
@@ -413,9 +664,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         throw error;
       }
     }));
-    host.registerTool({ name: "skills_list", description: "List catalog and your skill states. Only available/installed skills may be delegated; children default to no selections. settings.extensions.skills explicitly replaces all states.", inputSchema: { type: "object", additionalProperties: false }, async execute(_args, caller) {
+    host.registerTool({ name: "skills_list", description: "List active catalog skills and your skill states. Only available/installed active skills may be delegated; retained selections are shown separately.", inputSchema: { type: "object", additionalProperties: false }, async execute(_args, caller) {
       const agent = await host.request("agent.get", { agentId: caller.id }, caller) as AgentRecord;
-      return { skills: catalog().map(s => ({ ...s, state: Object.hasOwn(states(agent.settings) ?? {}, s.name) ? states(agent.settings)![s.name] : "unavailable" })) };
+      const statesForAgent = states(agent.settings) ?? {};
+      const retainedNames = new Set(Object.entries(statesForAgent).filter(([, value]) => value !== "unavailable").map(([name]) => name));
+      const retained = catalog().filter(item => retainedNames.has(item.name) && !configuredActive(item)).map(item => ({ ...item, status: "retired" as const, state: statesForAgent[item.name] }));
+      return { skills: activeCatalog().map(item => ({ ...item, state: Object.hasOwn(statesForAgent, item.name) ? statesForAgent[item.name] : "unavailable" })), retained };
     } });
     for (const name of ["child_create", "descendant_modify"]) host.transformTool(name, tool => {
       const properties = { ...tool.inputSchema.properties };
@@ -425,11 +679,28 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
     });
     host.onEvent(event => {
+      if (event.type === "organization.settings.changed" && (event.data as any)?.namespace === "skills") {
+        scheduleReconciliation("settings");
+        return;
+      }
       if (event.type === "agent.removed") return exclusive(async () => {
         for (const i of installations().filter(i => i.agentId === event.agentId)) await recover(i);
       });
     });
-    host.onShutdown(async () => { await tail; db.close(); });
+    sweepTimer = setInterval(() => {
+      if (shuttingDown) return;
+      const status = reconciliation();
+      if (identityFingerprint(desiredRepositories()) !== status.fingerprint) scheduleReconciliation("sweep");
+    }, 5_000);
+    sweepTimer.unref?.();
+    host.onShutdown(async () => {
+      shuttingDown = true;
+      if (sweepTimer) clearInterval(sweepTimer);
+      for (const timer of retryTimers.values()) clearTimeout(timer);
+      retryTimers.clear();
+      await Promise.all([tail, publishTail, reconciliationWorker].filter(Boolean) as Promise<unknown>[]);
+      db.close();
+    });
   } };
 }
 export default createSkillsPlugin();

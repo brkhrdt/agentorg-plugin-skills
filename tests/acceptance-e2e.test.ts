@@ -21,7 +21,7 @@ const waitFor = async (check: () => boolean | Promise<boolean>, timeoutMs = 8_00
   }
 };
 
-test("TUI configures a seeded local skill, restarts, installs, calls authenticated MCP, then removes it into recovery", async () => {
+test("TUI configures a local skill live, installs it, calls authenticated MCP, then removes it into recovery", async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-acceptance-e2e-"));
   const dataDir = join(dir, "data"), socketPath = join(dataDir, "server.sock");
   const home = join(dir, "home"), work = join(dir, "work"), repo = join(dir, "source");
@@ -47,22 +47,24 @@ test("TUI configures a seeded local skill, restarts, installs, calls authenticat
     // Configure the seed through the actual server-settings form. Local sources
     // are accepted here only because this embedded test explicitly opts in.
     server = await OrganizationServer.start({ dataDir, socketPath, plugins: plugins() });
+    const serverPid = process.pid;
+    admin = await OrganizationClient.connect(socketPath);
     ui = terminalClient(socketPath, dir);
     await ui.visible("No active agents. Press n");
     ui.keys("v"); await ui.visible("CLIENT ONLY"); ui.keys("s"); await ui.visible("Server settings");
     ui.keys("\x1b[B".repeat(3) + "\r"); await ui.visible("Skills · server-wide · revision 0");
-    ui.keys("\r"); await ui.visible("Repository seeds"); ui.keys("\r");
-    await ui.visible("No configurations. Press a to add."); ui.keys("a"); await ui.visible("Repository seeds: New entry");
-    ui.keys("\r"); await ui.visible("Skill name · Lowercase letters"); ui.keys("\x15alpha\r"); await ui.visible("Repository seeds: New entry");
-    ui.keys("\x1b[B\r"); await ui.visible("HTTPS Git URL · Public HTTPS"); ui.keys(`\x15${repo}\r`); await ui.visible("Repository seeds: New entry");
-    ui.keys("S"); await ui.visible("Repository seeds"); ui.keys("S"); await ui.visible("Skills · server-wide · revision 0");
-    ui.keys("S"); await ui.visible("Confirm server-wide"); ui.keys("y"); await ui.visible("RESTART REQUIRED");
-    await ui.close(); ui = undefined;
-    await server.close(); server = undefined;
-
-    // Restart applies the persisted seed before catalog discovery/reconciliation.
-    server = await OrganizationServer.start({ dataDir, socketPath, plugins: plugins() });
-    admin = await OrganizationClient.connect(socketPath);
+    ui.keys("\r"); await ui.visible("Repositories"); ui.keys("\r");
+    await ui.visible("No configurations. Press a to add."); ui.keys("a"); await ui.visible("Repositories: New entry");
+    ui.keys("\r"); await ui.visible("Skill name · Lowercase letters"); ui.keys("\x15alpha\r"); await ui.visible("Repositories: New entry");
+    ui.keys("\x1b[B\r"); await ui.visible("HTTPS Git URL · Public HTTPS"); ui.keys(`\x15${repo}\r`); await ui.visible("Repositories: New entry");
+    ui.keys("S"); await ui.visible("Repositories"); ui.keys("S"); await ui.visible("Skills · server-wide · revision 0");
+    ui.keys("S"); await ui.visible("Confirm server-wide"); ui.keys("y"); await ui.visible("Skills · server-wide · revision 1");
+    expect(ui.screen()).not.toContain("RESTART REQUIRED");
+    await waitFor(async () => {
+      try { return (await admin!.request<any>("skills.list")).skills.some((skill: any) => skill.name === "alpha"); }
+      catch { return false; }
+    });
+    expect(process.pid).toBe(serverPid);
     let snapshot: any;
     await waitFor(async () => {
       try { snapshot = await admin!.request("organization.snapshot"); return true; }

@@ -30,14 +30,17 @@ test.skipIf(!process.env.ORG_BINARY)("compiled host loads the separate skills mo
     }
     expect(snapshot.capabilities.plugins.skills).toEqual({
       settingsNamespace: "skills", serverSettingsNamespace: "skills",
-      endpoints: { list: "skills.list", add: "skills.add" }, version: 1,
+      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile" }, version: 1,
     });
     const settings = await client.request<any>("organization.settings.list");
     expect(settings.groups.find((group: any) => group.namespace === "skills")).toMatchObject({
       defaults: { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
-      fields: [{ key: "repositories", effect: "restart" }, { key: "gitTimeoutMs", effect: "immediate" }, { key: "maxCatalogEntries", effect: "immediate" }],
+      fields: [{ key: "repositories", effect: "immediate" }, { key: "gitTimeoutMs", effect: "immediate" }, { key: "maxCatalogEntries", effect: "immediate" }],
     });
-    expect(await client.request<{ skills: unknown[]; recovery: unknown[] }>("skills.list")).toEqual({ skills: [], recovery: [] });
+    const catalog = await client.request<any>("skills.list");
+    expect(catalog.skills).toEqual([]);
+    expect(catalog.retained).toEqual([]);
+    expect(catalog.reconciliation).toMatchObject({ state: "ready", desiredRevision: 0, entries: [] });
     try {
       await client.request("skills.add", { name: "bad", gitUrl: "ssh://localhost/skill" });
       throw new Error("Unexpected success");

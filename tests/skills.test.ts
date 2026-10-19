@@ -108,7 +108,9 @@ test("MCP delegation is checked inside queue, transforms compose in either plugi
   expect(Object.entries(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings) ?? {})).toContainEqual(["constructor", "available"]);
   await f.run("agent.modify", { agentId: f.root.id, settings: { extensions: { skills: {} } } });
   expect((await f.run("agent.modify", { agentId: child.id, name: "unchanged-skills" }, caller)).status).toBe("completed");
-  expect((await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "installed" } } } }, caller)).error?.code).toBe("FORBIDDEN");
+  const unchangedDelegation = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { alpha: "installed" } } } }, caller);
+  expect(unchangedDelegation.status).toBe("completed");
+  expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings)).toEqual({});
   const list = await f.server.organization.request("mcp.call", { name: "skills_list", arguments: {} }, caller) as any;
   expect(JSON.parse(list.content[0].text).skills[0].state).toBe("unavailable");
 });

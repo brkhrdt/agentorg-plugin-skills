@@ -133,7 +133,7 @@ test("MCP without the skills plugin preserves opaque selections and exposes no s
   try {
     const tools = await f.mcp.listTools();
     expect(tools.tools.some(tool => tool.name === "skills_list")).toBe(false);
-    expect(tools.tools.some(tool => ["skills.list", "skills.add", "organization.settings.list", "organization.settings.get", "organization.settings.update", "organization_settings_list", "organization_settings_get", "organization_settings_update"].includes(tool.name))).toBe(false);
+    expect(tools.tools.some(tool => ["skills.list", "skills.add", "skills.reconcile", "organization.settings.list", "organization.settings.get", "organization.settings.update", "organization_settings_list", "organization_settings_get", "organization_settings_update"].includes(tool.name))).toBe(false);
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: f.root.id })).settings)).toEqual({ alpha: "available" });
     await expect(f.mcp.callTool({ name: "skills_list", arguments: {} })).rejects.toThrow(/Unknown MCP tool/);
   } finally { await f.mcp.close(); }
@@ -192,7 +192,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     const tools = await f.mcp.listTools();
     expect(tools.tools.map(tool => tool.name)).toContain("skills_list");
     expect(tools.tools.map(tool => tool.name)).toContain("operation_wait");
-    expect(tools.tools.some(tool => ["skills.list", "skills.add", "organization.settings.list", "organization.settings.get", "organization.settings.update", "organization_settings_list", "organization_settings_get", "organization_settings_update"].includes(tool.name))).toBe(false);
+    expect(tools.tools.some(tool => ["skills.list", "skills.add", "skills.reconcile", "organization.settings.list", "organization.settings.get", "organization.settings.update", "organization_settings_list", "organization_settings_get", "organization_settings_update"].includes(tool.name))).toBe(false);
     const createTool = tools.tools.find(tool => tool.name === "child_create") as any;
     const modifyTool = tools.tools.find(tool => tool.name === "descendant_modify") as any;
     const createSkills = createTool.inputSchema.properties.settings.properties.extensions.properties.skills;

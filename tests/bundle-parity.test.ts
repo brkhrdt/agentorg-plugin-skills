@@ -50,7 +50,7 @@ test("source and bundled plugin expose identical settings, capability and MCP co
       namespace: "skills", version: 1,
       defaults: { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
       fields: [
-        { key: "repositories", effect: "restart", editor: "list" },
+        { key: "repositories", effect: "immediate", editor: "list" },
         { key: "gitTimeoutMs", effect: "immediate", min: 1_000, max: 60_000 },
         { key: "maxCatalogEntries", effect: "immediate", min: 1, max: 256 },
       ],
