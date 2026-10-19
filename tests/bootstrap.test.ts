@@ -11,7 +11,7 @@ const roots: string[] = [];
 afterEach(async () => {
   process.env.PATH = process.env.TEST_ORIGINAL_PATH ?? process.env.PATH;
   delete process.env.TEST_GIT_SOURCE;
-  for (const key of ["TEST_GIT_CALLS", "TEST_GIT_FAIL", "TEST_GIT_GATE_URL", "TEST_GIT_GATE_ENTERED", "TEST_GIT_GATE_RELEASE"]) delete process.env[key];
+  for (const key of ["TEST_GIT_CALLS", "TEST_GIT_FAIL", "TEST_GIT_FAIL_URL", "TEST_GIT_SOURCES", "TEST_GIT_GATE_URL", "TEST_GIT_GATE_ENTERED", "TEST_GIT_GATE_RELEASE"]) delete process.env[key];
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -34,8 +34,9 @@ if (clone < 0) process.exit(2);
 const destination = args.at(-1);
 const input = args.at(-2);
 if (process.env.TEST_GIT_CALLS) fs.appendFileSync(process.env.TEST_GIT_CALLS, input + '\\n');
-if (process.env.TEST_GIT_FAIL && fs.existsSync(process.env.TEST_GIT_FAIL)) process.exit(1);
-const source = input.startsWith('https://') ? process.env.TEST_GIT_SOURCE : input;
+if (process.env.TEST_GIT_FAIL && fs.existsSync(process.env.TEST_GIT_FAIL) && (!process.env.TEST_GIT_FAIL_URL || input === process.env.TEST_GIT_FAIL_URL)) process.exit(1);
+const sources = process.env.TEST_GIT_SOURCES ? JSON.parse(process.env.TEST_GIT_SOURCES) : {};
+const source = sources[input] || (input.startsWith('https://') ? process.env.TEST_GIT_SOURCE : input);
 const copy = () => { fs.mkdirSync(destination, { recursive: true }); fs.cpSync(source, destination, { recursive: true }); fs.mkdirSync(path.join(destination, '.git'), { recursive: true }); };
 const delay = fs.existsSync(path.join(__dirname, 'delay')) ? Number(fs.readFileSync(path.join(__dirname, 'delay'), 'utf8')) : 0;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -67,7 +68,10 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     registerEndpoint(name: string, callback: (params: unknown, caller: { kind: string; id: string }) => unknown) { endpoints.set(name, callback); },
     registerTool() {}, transformTool() {}, beforeSettings() {}, onEvent() {},
     onShutdown(callback: () => Promise<void>) { shutdown = callback; },
-    request: async (method: string) => method === "organization.settings.get" ? { revision: 0, effective: structuredClone(config) } : ({}), emit(type: string, payload: unknown) { events.push({ type, payload }); },
+    request: async (method: string) => {
+      if (method === "organization.settings.get" && (config as any).rejectSettingsRead) throw new Error("Injected settings read failure");
+      return method === "organization.settings.get" ? { revision: 0, effective: structuredClone(config) } : {};
+    }, emit(type: string, payload: unknown) { events.push({ type, payload }); },
   };
   const start = async () => {
     await (createSkillsPlugin({ home, allowLocalSources }) as ServerPlugin).setup(host as any);
@@ -277,6 +281,112 @@ test.serial("reservation release wakes the reconciler and persists the resulting
       expect(persisted.skills.map((item: any) => item.origin)).toEqual(["manual"]);
     } finally { await restarted.shutdown(); }
   } finally { if (!pluginClosed) await plugin.shutdown(); }
+});
+
+test.serial("manual identity is independent while a different configured source with the same name is cloning", async () => {
+  const configuredUrl = "https://github.com/example/configured-alpha";
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: configuredUrl }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
+  const entered = join(f.root, "configured-entered"), release = join(f.root, "configured-release");
+  process.env.TEST_GIT_GATE_URL = configuredUrl;
+  process.env.TEST_GIT_GATE_ENTERED = entered;
+  process.env.TEST_GIT_GATE_RELEASE = release;
+  const plugin = await f.start(); let closed = false;
+  const startup = plugin.initialize([]);
+  try {
+    await waitFor(async () => Bun.file(entered).exists());
+    let manual: any, addError: unknown;
+    try { manual = await plugin.endpoints.get("skills.add")!({ name: "alpha", gitUrl: f.source }, caller); }
+    catch (error) { addError = error; }
+    expect(addError).toBeUndefined();
+    expect(manual).toMatchObject({ name: "alpha", origin: "manual" });
+    await writeFile(release, "release");
+    await startup;
+    const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(view.reconciliation.entries).toMatchObject([{ name: "alpha", status: "error" }]);
+    expect(view.reconciliation.entries[0].error).toMatch(/conflict/i);
+    expect(view.skills).toMatchObject([{ name: "alpha", gitUrl: f.source, origin: "manual" }]);
+    await plugin.shutdown(); closed = true;
+  } finally {
+    await writeFile(release, "release").catch(() => {});
+    await startup.catch(() => {});
+    if (!closed) await plugin.shutdown();
+  }
+});
+
+test.serial("permanent malformed alpha is not retried by transient beta retry generations", async () => {
+  const alphaUrl = "https://github.com/example/alpha", betaUrl = "https://github.com/example/beta";
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: alphaUrl }, { name: "beta", gitUrl: betaUrl }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  await writeFile(join(f.source, "SKILL.md"), "---\nname: [broken\n---\n# Instructions\n");
+  const betaSource = join(f.root, "source-beta"); await mkdir(betaSource);
+  await writeFile(join(betaSource, "SKILL.md"), "---\nname: beta\ndescription: Beta fixture\n---\n# Instructions\n");
+  const calls = join(f.root, "git-calls"), failure = join(f.root, "git-failure");
+  process.env.TEST_GIT_CALLS = calls;
+  process.env.TEST_GIT_SOURCES = JSON.stringify({ [betaUrl]: betaSource });
+  process.env.TEST_GIT_FAIL = failure; process.env.TEST_GIT_FAIL_URL = betaUrl;
+  await writeFile(failure, "fail");
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    await pause(1_250);
+    const entries = (await Bun.file(calls).text()).trim().split("\n");
+    expect(entries.filter(url => url === alphaUrl)).toHaveLength(1);
+    expect(entries.filter(url => url === betaUrl).length).toBeGreaterThanOrEqual(2);
+    const db = new Database(await databasePath(f.root), { readonly: true });
+    const alpha = JSON.parse((db.query("SELECT data FROM repository_state WHERE name='alpha'").get() as any).data);
+    db.close();
+    expect(alpha.attempts).toBe(1);
+  } finally { await plugin.shutdown(); }
+});
+
+test.serial("the periodic sweep reconciles settings missed without a status read", async () => {
+  const f = await fixture({ repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 4 }, true);
+  const calls = join(f.root, "git-calls"); process.env.TEST_GIT_CALLS = calls;
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: f.source }];
+    await waitFor(async () => (await Bun.file(calls).text().catch(() => "")).trim().length > 0, 7_000);
+    const result = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(result.reconciliation.state).toBe("ready");
+    expect(result.skills.map((item: any) => item.name)).toEqual(["alpha"]);
+  } finally { await plugin.shutdown(); }
+}, 10_000);
+
+test.serial("retry timer settings-read rejection is observable and not unhandled", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const failure = join(f.root, "git-failure"); process.env.TEST_GIT_FAIL = failure;
+  await writeFile(failure, "fail");
+  const plugin = await f.start();
+  const unhandled: unknown[] = [];
+  const capture = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", capture);
+  try {
+    await plugin.initialize([]);
+    (f.config as any).rejectSettingsRead = true;
+    await pause(1_250);
+    expect(unhandled).toEqual([]);
+    expect(plugin.events.some(event => event.type === "skills.error" && JSON.stringify(event.payload).includes("Injected settings read failure"))).toBe(true);
+  } finally { process.off("unhandledRejection", capture); await plugin.shutdown(); }
+});
+
+test.serial("shutdown cancels scheduled retry before settings-read failure can escape", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const calls = join(f.root, "git-calls"), failure = join(f.root, "git-failure");
+  process.env.TEST_GIT_CALLS = calls; process.env.TEST_GIT_FAIL = failure;
+  await writeFile(failure, "fail");
+  const plugin = await f.start();
+  const unhandled: unknown[] = [];
+  const capture = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", capture);
+  let closed = false;
+  try {
+    await plugin.initialize([]);
+    (f.config as any).rejectSettingsRead = true;
+    await plugin.shutdown(); closed = true;
+    await pause(1_250);
+    expect((await Bun.file(calls).text()).trim().split("\n")).toHaveLength(1);
+    expect(unhandled).toEqual([]);
+  } finally { process.off("unhandledRejection", capture); if (!closed) await plugin.shutdown(); }
 });
 
 test.serial("legacy catalog ownership migration exposes configured versus manual provenance", async () => {
