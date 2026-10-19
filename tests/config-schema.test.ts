@@ -40,7 +40,7 @@ test("skills settings persist, fence changes, reset and enforce client-only acce
   const agent = { kind: "agent", id: "test-agent" } as const;
   let org = new Organization(join(root, "server.sock"), dataDir);
   const events: any[] = [];
-  org.onEvent(event => events.push(event));
+  org.onEvent(event => { events.push(event); });
   try {
     await org.use((await import("../src/index.ts")).createSkillsPlugin({ home: root, allowLocalSources: true }));
     const initial = await org.request("organization.settings.get", { namespace: "skills" }, client) as any;
