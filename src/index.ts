@@ -3,7 +3,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve, parse, sep } from "node:path";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
-import { parse as yaml } from "yaml";
 import type { ServerPlugin, MutationChange } from "agent-organization/plugin";
 import type { AgentRecord, Settings } from "agent-organization/types";
 import { z } from "zod";
@@ -14,6 +13,7 @@ export const states = (settings: Settings) => settings.extensions?.skills as Ski
 import { gitWithTimeout } from "./git.ts";
 import { skillsServerSettings } from "./config.ts";
 import { migrateCatalog, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
+import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
@@ -50,33 +50,12 @@ async function privateDirectory(path: string) {
   await chmod(path, 0o700);
 }
 async function checkoutLimit(path: string) {
-  const queue = [path];
-  let bytes = 0, count = 0;
-  while (queue.length) {
-    for (const entry of await readdir(queue.pop()!, { withFileTypes: true })) {
-      const file = join(entry.parentPath, entry.name);
-      if (++count > 20_000) fail("Skill checkout exceeds 20,000 entries", "LIMIT");
-      if (entry.isDirectory()) queue.push(file);
-      else {
-        bytes += (await lstat(file)).size;
-        if (bytes > 256 * 1024 * 1024) fail("Skill checkout exceeds 256 MiB", "LIMIT");
-      }
-    }
-  }
+  try { await checkCheckoutLimits(path); }
+  catch (error: any) { fail(error.message, error.code ?? "INVALID_PARAMS"); }
 }
 async function metadata(path: string, name: string) {
-  const file = join(path, "SKILL.md");
-  const stat = await lstat(file);
-  if (!stat.isFile() || stat.size > 128 * 1024) fail("Root SKILL.md must be a regular file under 128 KiB");
-  const text = await readFile(file, "utf8");
-  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
-  if (!match || !text.slice(match[0].length).trim()) fail("SKILL.md requires YAML frontmatter and instructions");
-  let data: any;
-  try { data = yaml(match![1], { maxAliasCount: 0 }); }
-  catch (error) { fail(`Invalid SKILL.md YAML frontmatter: ${(error as Error).message}`); }
-  if (!data || data.name !== name || typeof data.description !== "string" || !data.description.trim() || data.description.length > 1024)
-    fail("SKILL.md name must match catalog name and description must contain 1–1024 characters");
-  return data.description as string;
+  try { return (await readSkillMetadata(path, name)).description; }
+  catch (error) { fail((error as Error).message); }
 }
 function source(input: unknown, allowLocal: boolean): string {
   if (typeof input !== "string" || input.length > 2048 || /[\x00-\x20]/.test(input)) fail("Invalid Git source");

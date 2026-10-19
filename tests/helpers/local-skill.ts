@@ -14,6 +14,8 @@ export async function createLocalSkillFixture() {
   await writeFile(join(path, "asset.bin"), Buffer.from([0, 255, 1, 128]));
   await writeFile(join(path, ".gitignore"), "ignored-payload.txt\n");
   await writeFile(join(path, "ignored-payload.txt"), "ignored fixture payload\n");
+  await mkdir(join(path, ".agents"), { recursive: true });
+  await writeFile(join(path, ".agents", "keep.txt"), "include managed-looking data\n");
   return {
     root,
     path,
