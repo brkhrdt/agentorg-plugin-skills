@@ -53,6 +53,8 @@ test("reject unsafe entries, symlinked root SKILL.md, source overlap, central ov
     const external = join(root, "outside"); await writeFile(external, "outside");
     await symlink(external, join(fixture.path, "linked-file"));
     await expect(copyLocalSkill(fixture.path, join(root, "unsafe"))).rejects.toThrow(/Unsupported source entry/);
+    const fileAlias = join(root, "skill-alias"); await symlink(join(fixture.path, "SKILL.md"), fileAlias);
+    await expect(resolveLocalSource(fileAlias)).rejects.toThrow(/must not be a symlink/);
     await rm(join(fixture.path, "linked-file"));
     await expect(copyLocalSkill(fixture.path, join(fixture.path, "child"))).rejects.toThrow(/overlap/);
     await expect(copyLocalSkill(fixture.path, join(root, "central-child"), { centralRoot: root })).rejects.toThrow(/central/);
@@ -74,10 +76,7 @@ test("enforce metadata, payload and admitted-entry limits", async () => {
     await expect(copyLocalSkill(fixture.path, join(root, "large-md"))).rejects.toThrow(/128 KiB/);
     await writeFile(join(fixture.path, "SKILL.md"), original);
     const payload = join(fixture.path, "large-payload.bin");
-    const { open } = await import("node:fs/promises");
-    const handle = await open(payload, "w");
-    await handle.truncate(256 * 1024 * 1024 + 1);
-    await handle.close();
+    expect(Bun.spawnSync(["truncate", "-s", String(256 * 1024 * 1024 + 1), payload]).exitCode).toBe(0);
     await expect(copyLocalSkill(fixture.path, join(root, "large-payload"))).rejects.toMatchObject({ code: "LIMIT" });
     await rm(payload);
     const many = join(fixture.path, "many"); await mkdir(many);
@@ -102,5 +101,92 @@ test("copy failure retains only its own partial private stage and metadata is re
     await writeFile(join(fixture.path, "SKILL.md"), "---\nname: invalid\ndescription: missing instructions\n---\n");
     await expect(copyLocalSkill(fixture.path, invalid)).rejects.toThrow(/instructions/);
     expect(await lstat(invalid)).toBeDefined(); // Partial owned stage is preserved for diagnosis.
+
+    await writeFile(join(fixture.path, "SKILL.md"), "---\nname: ../unsafe\ndescription: Unsafe name\n---\n\nInstructions\n");
+    await expect(copyLocalSkill(fixture.path, join(root, "bad-name"))).rejects.toThrow(/name must match/);
+  } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("streaming byte limits catch deterministic source growth before oversized writes", async () => {
+  const fixture = await createLocalSkillFixture();
+  const root = await temporary();
+  try {
+    const skill = join(fixture.path, "SKILL.md");
+    await writeFile(skill, `---\nname: fixture-skill\ndescription: ${"x".repeat(110_000)}\n---\n\n${"i".repeat(10_000)}`);
+    const stage = join(root, "growth");
+    await expect(copyLocalSkill(fixture.path, stage, {
+      afterSourceOpen: async source => { if (source === skill) await writeFile(skill, `${await readFile(skill)}${"z".repeat(20_000)}`); },
+    })).rejects.toMatchObject({ code: "LIMIT" });
+    const copied = await readFile(join(stage, "SKILL.md"));
+    expect(copied.byteLength).toBeLessThanOrEqual(128 * 1024);
+  } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("nofollow nonblocking opens reject deterministic source symlink and FIFO swaps", async () => {
+  const fixture = await createLocalSkillFixture();
+  const root = await temporary();
+  try {
+    const sourceFile = join(fixture.path, "asset.bin");
+    const outside = join(root, "secret"); await writeFile(outside, "external secret");
+    await expect(copyLocalSkill(fixture.path, join(root, "symlink-swap"), {
+      beforeOpenEntry: async entry => {
+        if (entry === sourceFile) { await rm(sourceFile); await symlink(outside, sourceFile); }
+      },
+    })).rejects.toThrow();
+    await expect(readFile(join(root, "symlink-swap", "asset.bin"))).rejects.toThrow();
+
+    await rm(sourceFile, { force: true });
+    const fifo = Bun.spawnSync(["mkfifo", sourceFile]);
+    expect(fifo.exitCode).toBe(0);
+    const started = Date.now();
+    await expect(copyLocalSkill(fixture.path, join(root, "fifo-swap"), {
+      beforeOpenEntry: async entry => {
+        if (entry === sourceFile) { await rm(sourceFile); expect(Bun.spawnSync(["mkfifo", sourceFile]).exitCode).toBe(0); }
+      },
+    })).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(2_000);
+  } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("opened source directory handles reject symlinked-parent swaps without reading outside", async () => {
+  const fixture = await createLocalSkillFixture();
+  const root = await temporary();
+  try {
+    const outside = join(root, "outside"); await mkdir(outside);
+    await writeFile(join(outside, "secret"), "external secret");
+    const nested = join(fixture.path, "nested"); await mkdir(nested);
+    await writeFile(join(nested, "ordinary"), "original");
+    const saved = join(fixture.path, "nested-saved");
+    const stage = join(root, "stage");
+    await expect(copyLocalSkill(fixture.path, stage, {
+      beforeOpenEntry: async entry => {
+        if (entry === nested) { await (await import("node:fs/promises")).rename(nested, saved); await symlink(outside, nested, "dir"); }
+      },
+    })).rejects.toThrow();
+    await expect(readFile(join(stage, "nested", "secret"))).rejects.toThrow();
+  } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("destination stage swaps to symlink are detected before writes reach redirected paths", async () => {
+  const fixture = await createLocalSkillFixture();
+  const root = await temporary();
+  try {
+    const stage = join(root, "stage"), moved = join(root, "moved"), external = join(root, "external");
+    await mkdir(external);
+    await expect(copyLocalSkill(fixture.path, stage, {
+      beforeCopyFile: async source => {
+        if (source.endsWith("asset.bin")) { await (await import("node:fs/promises")).rename(stage, moved); await symlink(external, stage, "dir"); }
+      },
+    })).rejects.toThrow(/Destination stage .*changed/);
+    expect(await (await import("node:fs/promises")).readdir(external)).toEqual([]);
+
+    const parent = join(root, "parent"), movedParent = join(root, "moved-parent"), outsideParent = join(root, "outside-parent");
+    await mkdir(parent); await mkdir(outsideParent);
+    await expect(copyLocalSkill(fixture.path, join(parent, "child"), {
+      beforeCopyFile: async source => {
+        if (source.endsWith("asset.bin")) { await (await import("node:fs/promises")).rename(parent, movedParent); await symlink(outsideParent, parent, "dir"); }
+      },
+    })).rejects.toThrow(/Destination parent changed/);
+    expect(await (await import("node:fs/promises")).readdir(outsideParent)).toEqual([]);
   } finally { await fixture.cleanup(); await rm(root, { recursive: true, force: true }); }
 });

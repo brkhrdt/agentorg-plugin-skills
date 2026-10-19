@@ -16,7 +16,7 @@ export async function readSkillMetadata(path: string, expectedName?: string): Pr
   let data: any;
   try { data = yaml(match[1], { maxAliasCount: 0 }); }
   catch (error) { throw new Error(`Invalid SKILL.md YAML frontmatter: ${(error as Error).message}`); }
-  if (!data || typeof data.name !== "string" || !data.name || (expectedName !== undefined && data.name !== expectedName) ||
+  if (!data || typeof data.name !== "string" || data.name.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(data.name) || (expectedName !== undefined && data.name !== expectedName) ||
       typeof data.description !== "string" || !data.description.trim() || data.description.length > 1024)
     throw new Error("SKILL.md name must match catalog name and description must contain 1–1024 characters");
   return { name: data.name, description: data.description };
