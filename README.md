@@ -13,6 +13,18 @@ bun start --plugin ../agentorg-plugin-pi-agent/src/index.ts --plugin ../agentorg
 
 The plugin has no runtime dependency on core internals; core imports are type-only. For a compiled AgentOrg binary, run `bun run build` here and load `--plugin /absolute/path/dist/skills.js`. Ship that single bundled module: it includes `yaml` and `zod`, since compiled Bun hosts do not reliably resolve external plugins' npm dependencies. Source-mode servers can load `src/index.ts` with its installed dependencies. The plugin uses generic namespaced settings, lifecycle participants, atomic multi-record writes, initialization, launch environment and capability discovery ([host contract](../agentorg/EXTENSIONS.md)). Core has no skills semantics and never exposes its database. Other harnesses must explicitly consume the JSON `AGENTORG_SKILL_FILES` launch environment and declare it in `LaunchSpec.consumesEnv`; the separate Pi adapter already does. Installed selections fail safely for unsupported harnesses. Final validation rejects overwritten managed environment or cwd. Core no longer implicitly loads Pi; see [Pi plugin setup](../agentorg-plugin-pi-agent/README.md).
 
+## Local E2E validation
+
+From this plugin checkout, build/check both authorized feature copies, then run the same socket-to-ACP scenario against source mode and the relocated compiled host with bundled plugins:
+
+```sh
+bun run check && bun run build
+(cd ../agentorg && bun run check && bun run build)
+ORG_BINARY=../agentorg/dist/agentorg bun test tests/local-e2e.test.ts tests/bundle-parity.test.ts tests/binary-loading.test.ts
+```
+
+The E2E fixture is deterministic and makes no model or network calls. Local imports are supported only on Linux with `/proc/self/fd`; limits are 128 KiB for root `SKILL.md`, 256 MiB payload, and 20,000 admitted entries. The fixture copies the binary and bundles into a temporary runtime, then restarts those relocated artifacts.
+
 ## API
 
 > **Local import support is capability-negotiated.** Use `skills.addFromPath` only when `organization.snapshot.capabilities.plugins.skills.localImport === true` and its `endpoints.addFromPath` is `skills.addFromPath`; plugin version alone does not imply support. Registration in the organization catalog does not assign or install a skill for any agent.

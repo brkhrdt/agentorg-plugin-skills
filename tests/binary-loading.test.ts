@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
 
-test.skipIf(!process.env.ORG_BINARY)("compiled host loads the separate skills module and exposes coded errors", async () => {
+test("compiled host loads the separate skills module and exposes coded errors", async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-binary-"));
   const dataDir = join(dir, "data");
   await mkdir(dataDir);
@@ -15,7 +15,9 @@ test.skipIf(!process.env.ORG_BINARY)("compiled host loads the separate skills mo
   await Bun.write(module, bundle.outputs[0]!);
   const wrapper = join(dir, "plugin.ts");
   await writeFile(wrapper, `import {createSkillsPlugin} from ${JSON.stringify(module)}; export default createSkillsPlugin({home:${JSON.stringify(dir)}});`);
-  const child = Bun.spawn([resolve(process.env.ORG_BINARY!), "--data-dir", dataDir, "--plugin", wrapper], { stdout: "ignore", stderr: "pipe" });
+  const binary = resolve(process.env.ORG_BINARY ?? join(import.meta.dir, "../../agentorg/dist/agentorg"));
+  expect(await Bun.file(binary).exists()).toBe(true);
+  const child = Bun.spawn([binary, "--data-dir", dataDir, "--plugin", wrapper], { stdout: "ignore", stderr: "pipe" });
   let client: OrganizationClient | undefined;
   try {
     for (let attempt = 0; attempt < 100 && !client; attempt++) {

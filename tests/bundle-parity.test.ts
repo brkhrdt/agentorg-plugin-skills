@@ -46,6 +46,10 @@ test("source and bundled plugin expose identical settings, capability and MCP co
     const source = await observe(createSkillsPlugin({ home: sourceDir }), join(dir, "source-host"));
     const compiled = await observe(bundled.createSkillsPlugin({ home: bundleDir }), join(dir, "bundle-host"));
     expect(compiled).toEqual(source);
+    expect(source.capability).toEqual({
+      settingsNamespace: "skills", serverSettingsNamespace: "skills", localImport: true,
+      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", addFromPath: "skills.addFromPath" }, version: 1,
+    });
     expect(source.settings).toMatchObject({
       namespace: "skills", version: 1,
       defaults: { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
