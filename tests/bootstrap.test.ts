@@ -11,6 +11,7 @@ const roots: string[] = [];
 afterEach(async () => {
   process.env.PATH = process.env.TEST_ORIGINAL_PATH ?? process.env.PATH;
   delete process.env.TEST_GIT_SOURCE;
+  for (const key of ["TEST_GIT_CALLS", "TEST_GIT_FAIL", "TEST_GIT_GATE_URL", "TEST_GIT_GATE_ENTERED", "TEST_GIT_GATE_RELEASE"]) delete process.env[key];
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -32,10 +33,19 @@ const clone = args.indexOf('clone');
 if (clone < 0) process.exit(2);
 const destination = args.at(-1);
 const input = args.at(-2);
+if (process.env.TEST_GIT_CALLS) fs.appendFileSync(process.env.TEST_GIT_CALLS, input + '\\n');
+if (process.env.TEST_GIT_FAIL && fs.existsSync(process.env.TEST_GIT_FAIL)) process.exit(1);
 const source = input.startsWith('https://') ? process.env.TEST_GIT_SOURCE : input;
 const copy = () => { fs.mkdirSync(destination, { recursive: true }); fs.cpSync(source, destination, { recursive: true }); fs.mkdirSync(path.join(destination, '.git'), { recursive: true }); };
 const delay = fs.existsSync(path.join(__dirname, 'delay')) ? Number(fs.readFileSync(path.join(__dirname, 'delay'), 'utf8')) : 0;
-setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e); process.exit(1); } }, delay);
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+(async () => { try {
+  if (input === process.env.TEST_GIT_GATE_URL) {
+    fs.writeFileSync(process.env.TEST_GIT_GATE_ENTERED, 'entered');
+    while (!fs.existsSync(process.env.TEST_GIT_GATE_RELEASE)) await pause(10);
+  }
+  await pause(delay); copy(); process.exit(0);
+} catch (e) { console.error(e); process.exit(1); } })();
 `);
   await chmod(gitShim, 0o700);
   process.env.TEST_ORIGINAL_PATH ??= process.env.PATH;
@@ -67,6 +77,16 @@ setTimeout(() => { try { copy(); process.exit(0); } catch (e) { console.error(e)
 }
 
 const caller = { kind: "client", id: "test" };
+const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const waitFor = async (check: () => Promise<boolean>, timeoutMs = 5_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for bootstrap fixture state");
+    await pause(20);
+  }
+};
+const databasePath = async (root: string) => join(root, "home", ".agentorg", "skills",
+  createHash("sha256").update(await realpath(join(root, "data"))).digest("hex"), "skills.sqlite");
 
 test.serial("configured repository seeds import once; identical restarts preserve path and metadata", async () => {
   const f = await fixture({
@@ -185,3 +205,99 @@ test.serial("configured Git timeout bounds subsequent clone work using a control
   expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).skills).toHaveLength(0);
   await plugin.shutdown();
 });
+
+test.serial("manual name and URL contention settles configured entries as conflicts", async () => {
+  const f = await fixture({ repositories: [
+    { name: "alpha", gitUrl: "https://github.com/example/configured" },
+    { name: "beta", gitUrl: "https://github.com/example/manual" },
+  ], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const plugin = await f.start();
+  try {
+    const manual = await plugin.endpoints.get("skills.add")!({ name: "alpha", gitUrl: "https://github.com/example/manual" }, caller) as any;
+    expect(manual.name).toBe("alpha");
+    await plugin.initialize([]);
+    const view = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(view.reconciliation.state).toBe("error");
+    expect(view.reconciliation.entries).toMatchObject([
+      { name: "alpha", status: "error" }, { name: "beta", status: "error" },
+    ]);
+    expect(view.reconciliation.entries.every((entry: any) => /conflict/i.test(entry.error))).toBe(true);
+    expect(view.skills.map((item: any) => item.name)).toEqual(["alpha"]);
+  } finally { await plugin.shutdown(); }
+});
+
+test.serial("legacy catalog ownership migration exposes configured versus manual provenance", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const betaSource = join(f.root, "source-beta"); await mkdir(betaSource);
+  await writeFile(join(betaSource, "SKILL.md"), "---\nname: beta\ndescription: Beta fixture\n---\n# Instructions\n");
+  const dbPath = await databasePath(f.root); await mkdir(join(dbPath, ".."), { recursive: true });
+  const legacy = new Database(dbPath);
+  legacy.exec("CREATE TABLE meta(version INTEGER NOT NULL); INSERT INTO meta VALUES (1); CREATE TABLE catalog(name TEXT PRIMARY KEY,url TEXT UNIQUE,data TEXT NOT NULL);");
+  const record = (name: string, gitUrl: string, path: string) => ({ name, gitUrl, path, description: `${name} fixture`, createdAt: "2025-01-01T00:00:00.000Z" });
+  legacy.query("INSERT INTO catalog VALUES (?,?,?)").run("alpha", "https://github.com/example/alpha", JSON.stringify(record("alpha", "https://github.com/example/alpha", f.source)));
+  legacy.query("INSERT INTO catalog VALUES (?,?,?)").run("beta", "https://github.com/example/beta", JSON.stringify(record("beta", "https://github.com/example/beta", betaSource)));
+  legacy.close();
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    const first = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(first.skills.map((item: any) => [item.name, item.origin])).toEqual([["alpha", "configured"], ["beta", "manual"]]);
+    (f.config as any).repositories = [
+      { name: "alpha", gitUrl: "https://github.com/example/alpha" },
+      { name: "beta", gitUrl: "https://github.com/example/beta" },
+    ];
+    await plugin.initialize([]);
+    expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).skills.find((item: any) => item.name === "beta").origin).toBe("manual");
+    (f.config as any).repositories = [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }];
+    await plugin.initialize([]);
+    const afterBetaConfigRemoval = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(afterBetaConfigRemoval.skills.find((item: any) => item.name === "beta").origin).toBe("manual");
+    (f.config as any).repositories = [];
+    await plugin.initialize([]);
+    const afterRemoval = await plugin.endpoints.get("skills.list")!({}, caller) as any;
+    expect(afterRemoval.retained.find((item: any) => item.name === "alpha").origin).toBe("configured");
+    expect(afterRemoval.skills.map((item: any) => item.name)).toContain("beta");
+  } finally { await plugin.shutdown(); }
+});
+
+test.serial("malformed YAML is permanent and does not consume transient retry attempts", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  await writeFile(join(f.source, "SKILL.md"), "---\nname: [broken\n---\n# Instructions\n");
+  const calls = join(f.root, "git-calls"); process.env.TEST_GIT_CALLS = calls;
+  const plugin = await f.start();
+  try {
+    await plugin.initialize([]);
+    expect((await plugin.endpoints.get("skills.list")!({}, caller) as any).reconciliation.entries[0].status).toBe("error");
+    await pause(1_250);
+    expect((await Bun.file(calls).text()).trim().split("\n")).toHaveLength(1);
+    const db = new Database(await databasePath(f.root), { readonly: true });
+    const state = JSON.parse((db.query("SELECT data FROM repository_state WHERE name='alpha'").get() as any).data);
+    db.close();
+    expect(state.attempts).toBe(1);
+  } finally { await plugin.shutdown(); }
+});
+
+test.serial("restart resets an exhausted transient retry budget", async () => {
+  const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
+  const calls = join(f.root, "git-calls"), failure = join(f.root, "git-failure");
+  process.env.TEST_GIT_CALLS = calls; process.env.TEST_GIT_FAIL = failure;
+  await writeFile(failure, "fail");
+  const first = await f.start(); let firstClosed = false;
+  try {
+    await first.initialize([]);
+    await waitFor(async () => (await Bun.file(calls).text().catch(() => "")).trim().split("\n").filter(Boolean).length >= 3, 8_000);
+    await pause(30);
+    const db = new Database(await databasePath(f.root), { readonly: true });
+    const state = JSON.parse((db.query("SELECT data FROM repository_state WHERE name='alpha'").get() as any).data);
+    db.close();
+    expect(state.attempts).toBe(3);
+    await first.shutdown(); firstClosed = true;
+    await rm(failure, { force: true });
+    const restarted = await f.start();
+    await restarted.initialize([]);
+    const count = (await Bun.file(calls).text()).trim().split("\n").filter(Boolean).length;
+    expect(count).toBe(4);
+    expect((await restarted.endpoints.get("skills.list")!({}, caller) as any).reconciliation.state).toBe("ready");
+    await restarted.shutdown();
+  } finally { if (!firstClosed) await first.shutdown(); }
+}, 20_000);

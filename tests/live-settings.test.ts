@@ -49,8 +49,8 @@ const promptly = async <T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> =
 test.serial("repository settings reconcile live after commit without restarting and enforce removal immediately", async () => {
   root = await mkdtemp(join(tmpdir(), "skills-live-settings-"));
   const dataDir = join(root, "data"), socketPath = join(dataDir, "server.sock");
-  const home = join(root, "home"), repo = join(root, "repo"), bin = join(root, "bin"), workspace = join(root, "workspace");
-  await Promise.all([mkdir(home), mkdir(repo), mkdir(bin), mkdir(workspace)]);
+  const home = join(root, "home"), repo = join(root, "repo"), bin = join(root, "bin"), workspace = join(root, "workspace"), newWorkspace = join(root, "new-workspace");
+  await Promise.all([mkdir(home), mkdir(repo), mkdir(bin), mkdir(workspace), mkdir(newWorkspace)]);
   await git(repo, "init", "--initial-branch=main");
   await git(repo, "config", "user.email", "test@example.com");
   await git(repo, "config", "user.name", "Test");
@@ -80,6 +80,7 @@ exec ${realGit} "$@"
       args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")],
       cwd: context.agent.settings.cwd ?? process.cwd(),
       env: { ...process.env, ORG_SOCKET: context.socketPath, ORG_TOKEN: context.token },
+      consumesEnv: ["AGENTORG_SKILL_FILES"],
     }) });
   } };
   const pid = process.pid;
@@ -108,6 +109,11 @@ exec ${realGit} "$@"
   expect(whileBlocked.values.repositories).toEqual([{ name: "alpha", gitUrl: repo }]);
   expect(whileBlocked.effective.repositories).toEqual([{ name: "alpha", gitUrl: repo }]);
   expect((await client.request<any>("skills.list")).skills).toEqual([]);
+  const pendingGrant = await client.wait(await client.request<Operation>("agent.modify", {
+    agentId: agent.id, settings: { extensions: { skills: { alpha: "available" } } },
+  }));
+  expect(pendingGrant.status).toBe("failed");
+  expect(pendingGrant.error?.code).toBe("SKILL_NOT_READY");
 
   // Remove while the original clone is still blocked. That stale completion
   // must remain unregistered and cannot create a grantable catalog entry.
@@ -123,12 +129,17 @@ exec ${realGit} "$@"
     agentId: agent.id, settings: { extensions: { skills: { alpha: "available" } } },
   }));
   expect(staleGrant.status).toBe("failed");
+  expect(staleGrant.error?.code).toBe("REPOSITORY_RETIRED");
   await writeFile(release, "release");
   await waitFor(async () => {
     const result = await client!.request<any>("skills.list");
     return result.reconciliation.desiredRevision === 2 && result.reconciliation.state === "ready";
   });
-  expect((await client.request<any>("skills.list")).skills).toEqual([]);
+  const afterStaleClone = await client.request<any>("skills.list");
+  expect(afterStaleClone.skills).toEqual([]);
+  expect(afterStaleClone.retained.map((item: any) => item.name)).not.toContain("alpha");
+  expect(afterStaleClone.reconciliation.entries).toEqual([]);
+  expect(afterStaleClone.reconciliation).toMatchObject({ desiredRevision: 2, state: "ready" });
 
   // Re-add using the same socket/server; the completed retained checkout must
   // not be mistaken for a stale grant, and the current desired identity wins.
@@ -139,6 +150,14 @@ exec ${realGit} "$@"
   await waitFor(async () => (await client!.request<any>("skills.list")).skills.some((skill: any) => skill.name === "alpha"));
   const added = await client.request<any>("skills.list");
   expect(added.skills.map((skill: any) => skill.name)).toEqual(["alpha"]);
+  const granted = await client.wait(await client.request<Operation>("agent.modify", {
+    agentId: agent.id, settings: { extensions: { skills: { alpha: "available" } } },
+  }));
+  expect(granted.status).toBe("completed");
+  const installed = await client.wait(await client.request<Operation>("agent.modify", {
+    agentId: agent.id, settings: { extensions: { skills: { alpha: "installed" } } },
+  }));
+  expect(installed.status).toBe("completed");
 
   const removed = await client.request<any>("organization.settings.update", {
     namespace: "skills", expectedRevision: 3, patch: { repositories: [] },
@@ -148,11 +167,16 @@ exec ${realGit} "$@"
   expect(removed.effective.repositories).toEqual([]);
   const afterRemoval = await client.request<any>("skills.list");
   expect(afterRemoval.skills.map((skill: any) => skill.name)).not.toContain("alpha");
-  const deniedGrant = await client.wait(await client.request<Operation>("agent.modify", {
+  const downgrade = await client.wait(await client.request<Operation>("agent.modify", {
     agentId: agent.id, settings: { extensions: { skills: { alpha: "available" } } },
   }));
-  expect(deniedGrant.status).toBe("failed");
+  expect(downgrade.status).toBe("completed");
   const unchanged = await client.request<AgentRecord>("agent.get", { agentId: agent.id });
-  expect((unchanged.settings.extensions?.skills as Record<string, string> | undefined)?.alpha).toBeUndefined();
+  expect((unchanged.settings.extensions?.skills as Record<string, string> | undefined)?.alpha).toBe("available");
+  const deniedGrant = await client.wait(await client.request<Operation>("agent.create", {
+    parentId: null, settings: { harness: "fixture", model: "test", cwd: newWorkspace, extensions: { skills: { alpha: "available" } } },
+  }));
+  expect(deniedGrant.status).toBe("failed");
+  expect(deniedGrant.error?.code).toBe("REPOSITORY_RETIRED");
   expect(process.pid).toBe(pid);
 }, 15_000);
