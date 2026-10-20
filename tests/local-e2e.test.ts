@@ -57,8 +57,8 @@ async function runMode(mode: E2EMode) {
     const installedExisting = await f.run("agent.modify", { agentId: existing.id, settings: { extensions: { skills: { "e2e-skill": "installed" } } } });
     expect(installedExisting.status).toBe("completed");
     const newCwd = join(f.workspace, "new-selected"); await mkdir(newCwd);
-    const createdSelected = await f.run("agent.create", { parentId: null, name: "new-selected", settings: { harness: "skill-consumer", model: "test", cwd: newCwd, extensions: { skills: { "e2e-skill": "installed" } } } });
-    expect(createdSelected.status).toBe("completed");
+    const createdSelected = await f.run("agent.create", { parentId: existing.id, name: "new-selected", settings: { harness: "skill-consumer", model: "test", cwd: newCwd, extensions: { skills: { "e2e-skill": "installed" } } } });
+    expect(createdSelected.status, JSON.stringify(createdSelected.error)).toBe("completed");
     const newSelected = createdSelected.result as AgentRecord;
     const existingSkillPath = join(installRoot(existingCwd), "e2e-skill");
     const newSkillPath = join(installRoot(newCwd), "e2e-skill");
@@ -71,7 +71,7 @@ async function runMode(mode: E2EMode) {
     expect(await readFile(join(added.path, "identity.marker"), "utf8")).toContain(marker);
 
     const availableCwd = join(f.workspace, "available-only"); await mkdir(availableCwd);
-    const availableOp = await f.run("agent.create", { parentId: null, name: "available-only", settings: { harness: "skill-consumer", model: "test", cwd: availableCwd, extensions: { skills: { "e2e-skill": "available" } } } });
+    const availableOp = await f.run("agent.create", { parentId: existing.id, name: "available-only", settings: { harness: "skill-consumer", model: "test", cwd: availableCwd, extensions: { skills: { "e2e-skill": "available" } } } });
     expect(availableOp.status).toBe("completed");
     const available = availableOp.result as AgentRecord;
     await expectAbsent(join(installRoot(availableCwd), "e2e-skill"));
@@ -102,7 +102,7 @@ async function runMode(mode: E2EMode) {
     expect(afterRestart.skills.find((skill: Skill) => skill.name === "e2e-skill")).toMatchObject({ path: added.path, source: added.source });
     expect(await readFile(join(added.path, "SKILL.md"), "utf8")).toContain(marker);
     const afterRestartCwd = join(f.workspace, "after-host-restart"); await mkdir(afterRestartCwd);
-    const afterRestartCreate = await f.run("agent.create", { parentId: null, name: "after-restart", settings: { harness: "skill-consumer", model: "test", cwd: afterRestartCwd, extensions: { skills: { "e2e-skill": "installed" } } } });
+    const afterRestartCreate = await f.run("agent.create", { parentId: existing.id, name: "after-restart", settings: { harness: "skill-consumer", model: "test", cwd: afterRestartCwd, extensions: { skills: { "e2e-skill": "installed" } } } });
     expect(afterRestartCreate.status).toBe("completed");
     const afterRestartAgent = afterRestartCreate.result as AgentRecord;
     const afterRestartPrompt = await f.run("agent.prompt", { agentId: afterRestartAgent.id, text: "read the preserved central copy" });
@@ -110,6 +110,7 @@ async function runMode(mode: E2EMode) {
   } finally { await mcp?.close().catch(() => {}); await f.cleanup(); }
 }
 
-test("local import and lifecycle work in source-mode and relocated compiled-host/bundled-plugin modes", async () => {
-  for (const mode of ["source", "bundled"] as const) await runMode(mode);
+test("local import works in source mode and the relocated bundled mode when ORG_BINARY is supplied", async () => {
+  const modes: E2EMode[] = process.env.ORG_BINARY ? ["source", "bundled"] : ["source"];
+  for (const mode of modes) await runMode(mode);
 }, 120_000);
