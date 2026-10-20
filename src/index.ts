@@ -3,7 +3,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve, parse, sep } from "node:path";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
-import { parse as yaml } from "yaml";
 import type { ServerPlugin, MutationChange } from "agent-organization/plugin";
 import type { AgentRecord, Settings } from "agent-organization/types";
 import { z } from "zod";
@@ -11,13 +10,17 @@ import { isDeepStrictEqual } from "node:util";
 export const skillStatesSchema = z.record(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64), z.enum(["unavailable", "available", "installed"]));
 export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
-import { gitWithTimeout } from "./git.ts";
+import { cloneLocalSnapshot, gitWithTimeout } from "./git.ts";
 import { skillsServerSettings } from "./config.ts";
+import { migrateCatalog, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
+import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
+import { LocalSkillImporter } from "./local-import.ts";
+import { localSkillImportSupported } from "./local-source.ts";
 
-export interface Skill { name: string; gitUrl: string; description: string; createdAt: string; path: string }
+export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
 interface Action { generation: string; from: string; to: string; old: boolean }
-interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string } }
+interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string }; localImport?: { phase: "intent" | "copying" | "copied" | "initialized"; sourcePath: string; stagingPath: string; name?: string } }
 type RepositoryOrigin = "manual" | "configured";
 type RepositoryStatus = "pending" | "ready" | "retired" | "error";
 interface RepositoryRecordState { name: string; gitUrl: string; origin: RepositoryOrigin; status: RepositoryStatus; error?: string; attempts: number; fingerprint: string; failureClass?: "transient" | "permanent" }
@@ -49,33 +52,12 @@ async function privateDirectory(path: string) {
   await chmod(path, 0o700);
 }
 async function checkoutLimit(path: string) {
-  const queue = [path];
-  let bytes = 0, count = 0;
-  while (queue.length) {
-    for (const entry of await readdir(queue.pop()!, { withFileTypes: true })) {
-      const file = join(entry.parentPath, entry.name);
-      if (++count > 20_000) fail("Skill checkout exceeds 20,000 entries", "LIMIT");
-      if (entry.isDirectory()) queue.push(file);
-      else {
-        bytes += (await lstat(file)).size;
-        if (bytes > 256 * 1024 * 1024) fail("Skill checkout exceeds 256 MiB", "LIMIT");
-      }
-    }
-  }
+  try { await checkCheckoutLimits(path); }
+  catch (error: any) { fail(error.message, error.code ?? "INVALID_PARAMS"); }
 }
 async function metadata(path: string, name: string) {
-  const file = join(path, "SKILL.md");
-  const stat = await lstat(file);
-  if (!stat.isFile() || stat.size > 128 * 1024) fail("Root SKILL.md must be a regular file under 128 KiB");
-  const text = await readFile(file, "utf8");
-  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
-  if (!match || !text.slice(match[0].length).trim()) fail("SKILL.md requires YAML frontmatter and instructions");
-  let data: any;
-  try { data = yaml(match![1], { maxAliasCount: 0 }); }
-  catch (error) { fail(`Invalid SKILL.md YAML frontmatter: ${(error as Error).message}`); }
-  if (!data || data.name !== name || typeof data.description !== "string" || !data.description.trim() || data.description.length > 1024)
-    fail("SKILL.md name must match catalog name and description must contain 1–1024 characters");
-  return data.description as string;
+  try { return (await readSkillMetadata(path, name)).description; }
+  catch (error) { fail((error as Error).message); }
 }
 function source(input: unknown, allowLocal: boolean): string {
   if (typeof input !== "string" || input.length > 2048 || /[\x00-\x20]/.test(input)) fail("Invalid Git source");
@@ -92,6 +74,9 @@ function source(input: unknown, allowLocal: boolean): string {
 
 export function createSkillsPlugin(options: Options = {}): ServerPlugin {
   return { apiVersion: 1, name: "skills", async setup(host) {
+    const startupSnapshot = await host.request("organization.snapshot", {}, server) as { capabilities?: { cwd?: unknown } };
+    const localImportBase = typeof startupSnapshot?.capabilities?.cwd === "string" ? resolve(startupSnapshot.capabilities.cwd) : process.cwd();
+    const supportsLocalImport = await localSkillImportSupported();
     // Scope independent organizations by canonical data directory; never open core SQLite.
     const scope = hash(await realpath(host.dataDir));
     const root = join(await realpath(options.home ?? homedir()), ".agentorg", "skills", scope);
@@ -106,9 +91,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS repository_state(name TEXT NOT NULL, url TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(name,url));
       CREATE TABLE IF NOT EXISTS reconciliation(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);`);
-    const schemaVersion = (db.query("SELECT version FROM meta").get() as any).version;
-    if (schemaVersion > 2) throw new Error(`Unsupported skills database version ${schemaVersion}`);
-    if (schemaVersion < 2) db.query("UPDATE meta SET version=2").run();
+    migrateCatalog(db);
     const rows = <T>(table: string): T[] => db.query(`SELECT data FROM ${table} ORDER BY rowid`).all().map((r: any) => JSON.parse(r.data));
     const put = (table: "installations" | "journal", id: string, value: unknown) => db.query(`INSERT OR REPLACE INTO ${table} VALUES (?,?)`).run(id, JSON.stringify(value));
     const dropJournal = (id: string) => db.query("DELETE FROM journal WHERE id=?").run(id);
@@ -128,7 +111,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       fail(`Unknown skill ${name}`);
     }
-    const exposedSkill = (item: Skill) => ({ ...item, origin: repositoryState(item.name, item.gitUrl)?.origin ?? "manual" });
+    const gitSource = (item: Skill): string => item.source.kind === "git" ? item.source.gitUrl : fail(`Skill ${item.name} is not Git-backed`);
+    const exposedSkill = (item: Skill) => ({ ...item, origin: item.source.kind === "git" ? repositoryState(item.name, item.source.gitUrl)?.origin ?? "manual" : "manual" });
     const installations = () => rows<Installation>("installations");
     const installation = (generation: string) => installations().find(i => i.generation === generation)!;
     const report = (error: unknown, agentId?: string) => host.emit("skills.error", { message: (error as Error).message }, agentId);
@@ -178,18 +162,19 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     };
     const saveReconciliation = (value: ReconciliationStatus) => db.query("INSERT OR REPLACE INTO reconciliation VALUES (1,?)").run(JSON.stringify(value));
     const configuredActive = (item: Skill) => {
-      const state = repositoryState(item.name, item.gitUrl);
-      return state?.origin === "manual" || (state?.origin === "configured" && configuredIdentity(item.name, item.gitUrl));
+      if (item.source.kind !== "git") return true;
+      const state = repositoryState(item.name, item.source.gitUrl);
+      return state?.origin === "manual" || (state?.origin === "configured" && configuredIdentity(item.name, item.source.gitUrl));
     };
-    const grantable = (item: Skill) => configuredActive(item) && repositoryState(item.name, item.gitUrl)?.status === "ready";
+    const grantable = (item: Skill) => item.source.kind === "local" || (configuredActive(item) && repositoryState(item.name, item.source.gitUrl)?.status === "ready");
     const activeCatalog = () => catalog().filter(grantable);
     // Schema-v1 catalog entries have no ownership record. Classify once against
     // the current effective configuration; all nonmatches remain manual.
     const migrateRepositoryOwnership = () => db.transaction(() => {
       const configured = desiredRepositories();
-      for (const item of catalog()) if (!repositoryState(item.name, item.gitUrl)) {
-        const origin = configured.some(repository => repository.name === item.name && repository.gitUrl === item.gitUrl) ? "configured" : "manual";
-        saveRepositoryState({ name: item.name, gitUrl: item.gitUrl, origin, status: "ready", attempts: 0, fingerprint: "" });
+      for (const item of catalog()) if (item.source.kind === "git" && !repositoryState(item.name, item.source.gitUrl)) {
+        const origin = configured.some(repository => repository.name === item.name && repository.gitUrl === gitSource(item)) ? "configured" : "manual";
+        saveRepositoryState({ name: item.name, gitUrl: item.source.gitUrl, origin, status: "ready", attempts: 0, fingerprint: "" });
       }
     })();
     async function own(i: Installation, path = i.path) {
@@ -259,11 +244,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           continue;
         }
         const retiredDowngrade = !configuredActive(item) && previousStates[name] === "installed" && state === "available";
-        const desiredConflict = desiredRepositories().find(repository => repository.name === name && repository.gitUrl !== item.gitUrl);
-        if (repositoryState(item.name, item.gitUrl)?.origin === "configured" && desiredConflict && state !== "unavailable" && previousStates[name] !== state && !retiredDowngrade)
+        const desiredConflict = item.source.kind === "git" ? desiredRepositories().find(repository => repository.name === name && repository.gitUrl !== gitSource(item)) : undefined;
+        if (item.source.kind === "git" && repositoryState(item.name, item.source.gitUrl)?.origin === "configured" && desiredConflict && state !== "unavailable" && previousStates[name] !== state && !retiredDowngrade)
           fail(`Skill ${name} conflicts with configured source ${desiredConflict.gitUrl}`, "REPOSITORY_CONFLICT");
         if (state !== "unavailable" && !grantable(item) && previousStates[name] !== state && !retiredDowngrade) {
-          const record = repositoryState(item.name, item.gitUrl);
+          const record = item.source.kind === "git" ? repositoryState(item.name, item.source.gitUrl) : undefined;
           fail(`Skill ${name} is ${record?.status === "retired" || !configuredActive(item) ? "retired from the configured repository list" : "not ready"}`, record?.status === "retired" || !configuredActive(item) ? "REPOSITORY_RETIRED" : "SKILL_NOT_READY");
         }
       }
@@ -305,7 +290,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           put("installations", generation, i);
           journal.actions.push({ generation, from: stage, to: dest, old: false });
           put("journal", journal.id, journal);
-          await git(root, "clone", "--no-hardlinks", "--", skill(name).path, stage);
+          const catalogSkill = skill(name);
+          if (catalogSkill.source.kind === "local") await cloneLocalSnapshot(catalogSkill.path, stage, effectiveConfig().gitTimeoutMs);
+          else await git(root, "clone", "--no-hardlinks", "--", catalogSkill.path, stage);
           await metadata(stage, name);
           await checkoutLimit(stage);
           await writeFile(join(stage, ".git", "agentorg-skills.json"), JSON.stringify({ scope, generation, agentId: agent.id, skill: name }), { mode: 0o600 });
@@ -363,7 +350,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     });
     host.registerServerSettings(skillsServerSettings(options.allowLocalSources ?? false));
     migrateRepositoryOwnership();
-    host.registerCapability("skills", { settingsNamespace: "skills", serverSettingsNamespace: "skills", endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile" }, version: 1 });
+    host.registerCapability("skills", {
+      settingsNamespace: "skills", serverSettingsNamespace: "skills",
+      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", ...(supportsLocalImport ? { addFromPath: "skills.addFromPath" } : {}) },
+      localImport: supportsLocalImport, version: 1,
+    });
     async function uniqueCwd(settings: Settings, agent: Readonly<AgentRecord>, agents: Readonly<AgentRecord>[]) {
       const cwd = await realpath(settings.cwd ?? process.cwd());
       if (!(await lstat(cwd)).isDirectory()) fail("cwd must be a directory");
@@ -416,7 +407,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         await exclusive(async () => {
         for (const j of rows<Journal>("journal")) {
           if (j.path) {
-            report(new Error(`Interrupted catalog clone retained at ${j.path}; not registered`));
+            report(new Error(j.localImport
+              ? `Interrupted local skill import (${j.localImport.phase}) retained at ${j.path}; not registered or recopied`
+              : `Interrupted catalog clone retained at ${j.path}; not registered`));
             continue;
           }
           const agent = agents.find(a => a.id === j.agentId);
@@ -483,7 +476,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         } catch (error) {
           throw new Error(`Catalog checkout for ${name} retained at ${path}: ${(error as Error).message}`);
         }
-        const record: Skill = { name, gitUrl: url, description, path, createdAt: new Date().toISOString() };
+        const record: Skill = { name, source: { kind: "git", gitUrl: url }, gitUrl: url, description, path, createdAt: new Date().toISOString() };
         try {
           await catalogPublish(() => db.transaction(() => {
             if (catalog().some(s => s.name === name || s.gitUrl === url)) fail(`Skill repository conflict for ${name}`, "DUPLICATE");
@@ -501,6 +494,32 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         releaseIdentity(name, url, claim);
         if (desiredRepositories().some(repository => repository.name === name || repository.gitUrl === url)) scheduleReconciliation("catalog-add");
       }
+    }
+    const activeLocalImports = new Set<Promise<unknown>>();
+    const localImporter = new LocalSkillImporter({
+      centralRoot: root, stagingRoot: join(root, "local-import-staging"), maxCatalogEntries: effectiveConfig().maxCatalogEntries,
+      gitTimeoutMs: () => effectiveConfig().gitTimeoutMs,
+      putJournal: journal => put("journal", journal.id, journal),
+      publish: async (record, identity, journalId) => {
+        await catalogPublish(() => db.transaction(() => {
+          const entries = catalog();
+          if (entries.some(item => item.name === record.name || item.source && sourceIdentity(item.source) === identity))
+            fail(`Local skill source or name already registered: ${record.name}`, "DUPLICATE");
+          if (entries.length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
+          db.query("INSERT INTO catalog VALUES (?,?,?)").run(record.name, identity, JSON.stringify(record));
+          dropJournal(journalId);
+        })());
+        if (desiredRepositories().some(repository => repository.name === record.name)) scheduleReconciliation("catalog-add");
+      },
+      report: error => report(error),
+      emit: record => host.emit("skills.catalog_added", exposedSkill(record)),
+    });
+    function runLocalImport(input: unknown, pathOptions: { baseDir?: string; home?: string } = {}) {
+      if (shuttingDown) fail("Skills plugin is shutting down", "SHUTTING_DOWN");
+      const operation = exclusive(() => localImporter.import(input, pathOptions));
+      activeLocalImports.add(operation);
+      void operation.finally(() => activeLocalImports.delete(operation)).catch(() => {});
+      return operation;
     }
     async function settingsView() {
       return await host.request("organization.settings.get", { namespace: "skills" }, server) as { revision: number; effective: { repositories: Array<{ name: string; gitUrl: string }> } };
@@ -603,7 +622,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
         await checkoutLimit(path);
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
-        const record: Skill = { name, gitUrl, description, path, createdAt: new Date().toISOString() };
+        const record: Skill = { name, source: { kind: "git", gitUrl }, gitUrl, description, path, createdAt: new Date().toISOString() };
         await catalogPublish(() => db.transaction(() => {
           if (!currentGenerationSync(generation, revision, fingerprint, name, gitUrl)) return;
           const now = catalog();
@@ -745,12 +764,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     }
     host.registerEndpoint("skills.list", (_params, caller) => {
       clientOnly(caller);
-      const retained = catalog().filter(item => repositoryState(item.name, item.gitUrl)?.origin === "configured" && !configuredIdentity(item.name, item.gitUrl));
+      const retained = catalog().filter(item => item.source.kind === "git" && repositoryState(item.name, item.source.gitUrl)?.origin === "configured" && !configuredIdentity(item.name, item.source.gitUrl));
       return {
         skills: activeCatalog().map(exposedSkill), retained: retained.map(item => ({ ...exposedSkill(item), status: "retired" as const })),
         reconciliation: publicReconciliation(),
         recovery: installations().filter(i => i.pending).map(i => ({ agentId: i.agentId, skill: i.skill, path: i.path, error: i.error })),
-        repositoryRecovery: rows<Journal>("journal").filter(j => j.agentId === "catalog" && j.path).map(j => ({ id: j.id, path: j.path, repository: j.repository, origin: (j.repository && repositoryState(j.repository.name, j.repository.gitUrl)?.origin) ?? "manual", revision: j.revision, status: "retained" as const })),
+        repositoryRecovery: rows<Journal>("journal").filter(j => j.agentId === "catalog" && j.path).map(j => ({ id: j.id, path: j.path, repository: j.repository, localImport: j.localImport, origin: (j.repository && repositoryState(j.repository.name, j.repository.gitUrl)?.origin) ?? "manual", revision: j.revision, status: "retained" as const })),
       };
     });
     host.registerEndpoint("skills.reconcile", (params, caller) => {
@@ -759,6 +778,19 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const status = publicReconciliation(false);
       scheduleReconciliation("requested", true);
       return { accepted: true, reconciliation: status };
+    });
+    if (supportsLocalImport) host.registerEndpoint("skills.addFromPath", async (params, caller) => {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 1 || !Object.hasOwn(params, "path") || typeof (params as any).path !== "string")
+        fail("Expected exactly {path: string}", "INVALID_PARAMS");
+      try {
+        const record = await runLocalImport((params as any).path, { baseDir: localImportBase, home: homedir() });
+        return exposedSkill(record);
+      } catch (error: any) {
+        if (["INVALID_PARAMS", "INVALID_PATH", "DUPLICATE", "LIMIT", "SHUTTING_DOWN", "INTERNAL"].includes(error?.code)) throw error;
+        report(new Error(`Local skill import failed: ${(error as Error).message}`));
+        fail("Local skill import failed; inspect server diagnostics", "INTERNAL");
+      }
     });
     host.registerEndpoint("skills.add", (params, caller) => exclusive(async () => {
       clientOnly(caller);
@@ -808,7 +840,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       if (sweepTimer) clearInterval(sweepTimer);
       for (const timer of retryTimers.values()) clearTimeout(timer);
       retryTimers.clear();
-      await Promise.allSettled([tail, publishTail, reconciliationWorker].filter(Boolean) as Promise<unknown>[]);
+      await Promise.allSettled([tail, publishTail, reconciliationWorker, ...activeLocalImports].filter(Boolean) as Promise<unknown>[]);
       db.close();
     });
   } };

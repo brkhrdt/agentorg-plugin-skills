@@ -122,6 +122,7 @@ test.serial("configured repository seeds import once; identical restarts preserv
   await first.initialize([]);
   const initial = await first.endpoints.get("skills.list")!({}, caller) as any;
   expect(initial.skills.map((skill: any) => skill.name)).toEqual(["alpha"]);
+  expect(initial.skills[0].source).toEqual({ kind: "git", gitUrl: "https://github.com/example/alpha" });
   expect(initial.reconciliation).toMatchObject({ state: "ready", entries: [{ name: "alpha", status: "ready" }] });
   const original = initial.skills[0];
   await first.shutdown();
@@ -569,7 +570,7 @@ test.serial("legacy catalog ownership migration exposes configured versus manual
   try {
     await plugin.initialize([]);
     const first = await plugin.endpoints.get("skills.list")!({}, caller) as any;
-    expect(first.skills.map((item: any) => [item.name, item.origin])).toEqual([["alpha", "configured"], ["beta", "manual"]]);
+    expect(first.skills.map((item: any) => [item.name, item.origin, item.source?.kind])).toEqual([["alpha", "configured", "git"], ["beta", "manual", "git"]]);
     (f.config as any).repositories = [
       { name: "alpha", gitUrl: "https://github.com/example/alpha" },
       { name: "beta", gitUrl: "https://github.com/example/beta" },

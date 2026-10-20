@@ -1,16 +1,18 @@
 import { expect, test } from "bun:test";
 import { Organization } from "../../agentorg/src/organization.ts";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createLocalSkillFixture } from "./helpers/local-skill.ts";
 import { createSkillsPlugin } from "../src/index.ts";
 
-test("normal plugin rejects local sources without an explicit trusted factory opt-in", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "skills-policy-"));
-  await mkdir(join(dir, "data"));
-  const org = new Organization(join(dir, "server.sock"), join(dir, "data"));
+test("default plugin rejects a valid plain local skill directory as a Git source", async () => {
+  const fixture = await createLocalSkillFixture();
+  const org = new Organization(join(fixture.root, "server.sock"), join(fixture.root, "data"));
   try {
-    await org.use(createSkillsPlugin({ home: dir }));
-    await expect(org.request("skills.add", { name: "local", gitUrl: dir }, { kind: "client", id: "test" })).rejects.toThrow("HTTPS");
-  } finally { await org.close(); await rm(dir, { recursive: true, force: true }); }
+    await org.use(createSkillsPlugin({ home: fixture.root }));
+    await expect(org.request("skills.add", { name: "local", gitUrl: fixture.path }, { kind: "client", id: "test" }))
+      .rejects.toMatchObject({ code: "INVALID_PARAMS", message: expect.stringMatching(/HTTPS/) });
+    await expect(org.request("skills.addFromPath", null, { kind: "agent", id: "not-real" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(org.request("skills.addFromPath", { path: fixture.path, name: "ignored" }, { kind: "client", id: "test" })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+    await expect(org.request("skills.list", {}, { kind: "client", id: "test" })).resolves.toMatchObject({ skills: [] });
+  } finally { await org.close(); await fixture.cleanup(); }
 });
