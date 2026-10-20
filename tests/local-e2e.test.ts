@@ -110,7 +110,13 @@ async function runMode(mode: E2EMode) {
   } finally { await mcp?.close().catch(() => {}); await f.cleanup(); }
 }
 
-test("local import works in source mode and the relocated bundled mode when ORG_BINARY is supplied", async () => {
-  const modes: E2EMode[] = process.env.ORG_BINARY ? ["source", "bundled"] : ["source"];
-  for (const mode of modes) await runMode(mode);
+test("local import works in the configured source or relocated compiled-host mode", async () => {
+  const configured = process.env.SKILLS_E2E_MODE;
+  if (configured !== undefined && configured !== "source" && configured !== "bundled")
+    throw new Error("SKILLS_E2E_MODE must be 'source' or 'bundled'");
+  if (configured === "source") return runMode("source");
+  if (!process.env.ORG_BINARY) throw new Error("Compiled local e2e is mandatory unless SKILLS_E2E_MODE=source; set ORG_BINARY to the feature-copy AgentOrg binary");
+  if (configured === "bundled") return runMode("bundled");
+  await runMode("source");
+  await runMode("bundled");
 }, 120_000);

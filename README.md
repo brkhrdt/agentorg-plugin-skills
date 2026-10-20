@@ -20,7 +20,8 @@ From this plugin checkout, build/check both authorized feature copies, then run 
 ```sh
 bun run check && bun run build
 (cd ../agentorg && bun run check && bun run build)
-ORG_BINARY=../agentorg/dist/agentorg bun test tests/local-e2e.test.ts tests/bundle-parity.test.ts tests/binary-loading.test.ts
+SKILLS_E2E_MODE=source bun test tests/local-e2e.test.ts tests/bundle-parity.test.ts
+ORG_BINARY=../agentorg/dist/agentorg SKILLS_E2E_MODE=bundled bun test tests/binary-loading.test.ts tests/local-e2e.test.ts
 ```
 
 The E2E fixture is deterministic and makes no model or network calls. Local imports are supported only on Linux with `/proc/self/fd`; limits are 128 KiB for root `SKILL.md`, 256 MiB payload, and 20,000 admitted entries. The fixture copies the binary and bundles into a temporary runtime, then restarts those relocated artifacts.
