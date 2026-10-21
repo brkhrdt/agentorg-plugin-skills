@@ -35,7 +35,7 @@ test.skipIf(!Bun.which("pi"))("a selected managed skill reaches Pi explicitly wh
         await writeFile(wrapper, `import org from ${JSON.stringify(spec.env!.ORG_PI_EXTENSION)};
 import {writeFileSync} from 'node:fs';
 export default function(pi){org(pi);pi.registerCommand('agentorg-probe',{description:'No-model test probe',handler:async()=>{
-for(let i=0;i<200&&!pi.getAllTools().some(t=>t.name==='mcp__organization__child_create');i++)await new Promise(r=>setTimeout(r,10));
+for(let i=0;i<200&&!pi.getAllTools().some(t=>t.name==='mcp__agentorg__create_subagent');i++)await new Promise(r=>setTimeout(r,10));
 writeFileSync(${JSON.stringify(proof)},JSON.stringify({tools:pi.getAllTools().map(t=>t.name),commands:pi.getCommands().map(c=>c.name),servers:pi.getMcpServers(),argv:process.argv}));
 }});}`);
         return { ...spec, env: { ...spec.env, ORG_PI_EXTENSION: wrapper } };
@@ -59,9 +59,9 @@ writeFileSync(${JSON.stringify(proof)},JSON.stringify({tools:pi.getAllTools().ma
     }), 10_000);
     expect(result.status, result.error?.message).toBe("completed");
     const output = JSON.parse(await readFile(proof, "utf8"));
-    expect(output.tools).toContain("mcp__organization__child_create");
-    expect(output.tools).toContain("mcp__organization__skills_list");
-    expect(output.servers.some((entry: any) => entry.name === "organization")).toBe(true);
+    expect(output.tools).toContain("mcp__agentorg__create_subagent");
+    expect(output.tools).toContain("mcp__agentorg__skills_list");
+    expect(output.servers.some((entry: any) => entry.name === "agentorg")).toBe(true);
     expect(output.commands.filter((name: string) => name.startsWith("skill:"))).toEqual(["skill:explicit"]);
     expect(output.argv).toContain("--no-skills");
     expect(output.argv.filter((arg: string, index: number) => output.argv[index - 1] === "--skill"))

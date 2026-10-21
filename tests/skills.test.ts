@@ -120,9 +120,9 @@ test("MCP delegation is checked inside queue, transforms compose in either plugi
   await f.run("agent.modify", { agentId: f.root.id, settings: { extensions: { skills: { alpha: "available" } } } });
   const caller = { kind: "agent", id: f.root.id } as const;
   const tools = await f.server.organization.request("mcp.list", {}, caller) as any;
-  expect(tools.tools.find((t: any) => t.name === "child_create").inputSchema.properties.settings.properties.extensions.properties.skills).toBeDefined();
-  expect(tools.tools.find((t: any) => t.name === "child_create").inputSchema.required).toContain("cwd");
-  const mcp = await f.server.organization.request("mcp.call", { name: "child_create", arguments: { cwd: "child", settings: { harness: "fixture", model: "test", extensions: { skills: { alpha: "installed" } } } } }, caller) as any;
+  expect(tools.tools.find((t: any) => t.name === "create_subagent").inputSchema.properties.settings.properties.extensions.properties.skills).toBeDefined();
+  expect(tools.tools.find((t: any) => t.name === "create_subagent").inputSchema.required).toContain("cwd");
+  const mcp = await f.server.organization.request("mcp.call", { name: "create_subagent", arguments: { cwd: "child", settings: { harness: "fixture", model: "test", extensions: { skills: { alpha: "installed" } } } } }, caller) as any;
   const op = await f.client.wait(JSON.parse(mcp.content[0].text));
   expect(op.status).toBe("completed"); const child = op.result as AgentRecord;
   const denied = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: { beta: "available" } } } }, caller);

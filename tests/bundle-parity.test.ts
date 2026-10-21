@@ -28,7 +28,7 @@ async function observe(plugin: ServerPlugin, dir: string) {
       capability: snapshot.capabilities.plugins.skills,
       settingsCapability: snapshot.capabilities.serverSettings,
       settings: settings.groups.find((group: any) => group.namespace === "skills"),
-      skillTools: mcp.tools.filter(tool => ["skills_list", "child_create", "descendant_modify"].includes(tool.name)),
+      skillTools: mcp.tools.filter(tool => ["skills_list", "create_subagent", "modify_subagent"].includes(tool.name)),
     };
   } finally { client.close(); await server.close(); }
 }
@@ -59,8 +59,8 @@ test("source and bundled plugin expose identical settings, capability and MCP co
         { key: "maxCatalogEntries", effect: "immediate", min: 1, max: 256 },
       ],
     });
-    expect(source.skillTools.map(tool => tool.name).sort()).toEqual(["child_create", "descendant_modify", "skills_list"]);
-    const childCreate = source.skillTools.find(tool => tool.name === "child_create");
+    expect(source.skillTools.map(tool => tool.name).sort()).toEqual(["create_subagent", "modify_subagent", "skills_list"]);
+    const childCreate = source.skillTools.find(tool => tool.name === "create_subagent");
     expect(childCreate.inputSchema.properties.settings.properties.extensions.properties.skills).toBeDefined();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

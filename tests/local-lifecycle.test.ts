@@ -21,7 +21,7 @@ async function waitMcp(client: Client, accepted: any) {
   let operation = accepted;
   while (!["completed", "failed", "stopped"].includes(operation.status)) {
     if (Date.now() >= deadline) throw new Error(`MCP operation ${accepted.id} timed out`);
-    operation = resultText(await client.callTool({ name: "operation_wait", arguments: { operationId: operation.id, waitMs: 1_000 } }));
+    operation = resultText(await client.callTool({ name: "wait_operation", arguments: { operationId: operation.id, waitMs: 1_000 } }));
   }
   return operation;
 }
@@ -168,7 +168,7 @@ test("agent MCP token lists and delegates local skills; authorization rejects un
     expect(listed.skills.find((skill: any) => skill.name === "beta").state).toBe("unavailable");
 
     const childCwd = join(f.workspace, "delegated-child"); await mkdir(childCwd);
-    const accepted = resultText(await mcp.callTool({ name: "child_create", arguments: { settings: { harness: "skill-consumer", model: "test", cwd: childCwd,
+    const accepted = resultText(await mcp.callTool({ name: "create_subagent", arguments: { settings: { harness: "skill-consumer", model: "test", cwd: childCwd,
       extensions: { skills: { alpha: "installed" } } } } }));
     const childOp = await waitMcp(mcp, accepted);
     expect(childOp.status).toBe("completed");
@@ -176,22 +176,22 @@ test("agent MCP token lists and delegates local skills; authorization rejects un
     expect(states(child.settings)).toEqual({ alpha: "installed" });
     expect(await Bun.file(join(installRoot(childCwd), "alpha/SKILL.md")).exists()).toBe(true);
 
-    const denied = resultText(await mcp.callTool({ name: "descendant_modify", arguments: { agentId: child.id, settings: { extensions: { skills: { beta: "available" } } } } }));
+    const denied = resultText(await mcp.callTool({ name: "modify_subagent", arguments: { agentId: child.id, settings: { extensions: { skills: { beta: "available" } } } } }));
     const deniedOp = await waitMcp(mcp, denied);
     expect(deniedOp.status).toBe("failed"); expect(deniedOp.error?.code).toBe("FORBIDDEN");
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).settings)).toEqual({ alpha: "installed" });
-    const omitted = resultText(await mcp.callTool({ name: "descendant_modify", arguments: { agentId: child.id, name: "still-installed" } }));
+    const omitted = resultText(await mcp.callTool({ name: "modify_subagent", arguments: { agentId: child.id, name: "still-installed" } }));
     expect((await waitMcp(mcp, omitted)).status).toBe("completed");
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).settings)).toEqual({ alpha: "installed" });
 
     const siblingCwd = join(f.workspace, "delegated-sibling"); await mkdir(siblingCwd);
-    const siblingAccepted = resultText(await mcp.callTool({ name: "child_create", arguments: { settings: { harness: "skill-consumer", model: "test", cwd: siblingCwd } } }));
+    const siblingAccepted = resultText(await mcp.callTool({ name: "create_subagent", arguments: { settings: { harness: "skill-consumer", model: "test", cwd: siblingCwd } } }));
     const siblingOp = await waitMcp(mcp, siblingAccepted); const sibling = siblingOp.result as AgentRecord;
     expect(siblingOp.status).toBe("completed");
     const childMcp = await connectMcp(f, child.id);
     try {
-      expect((await childMcp.callTool({ name: "descendant_modify", arguments: { agentId: root.id, name: "forbidden-ancestor" } })).isError).toBe(true);
-      expect((await childMcp.callTool({ name: "descendant_modify", arguments: { agentId: sibling.id, name: "forbidden-sibling" } })).isError).toBe(true);
+      expect((await childMcp.callTool({ name: "modify_subagent", arguments: { agentId: root.id, name: "forbidden-ancestor" } })).isError).toBe(true);
+      expect((await childMcp.callTool({ name: "modify_subagent", arguments: { agentId: sibling.id, name: "forbidden-sibling" } })).isError).toBe(true);
     } finally { await childMcp.close(); }
   } finally { await mcp?.close(); await f.cleanup(); }
 });

@@ -90,7 +90,7 @@ Ensure the workspace exists and is not shared with another active/nonremoved age
 Agent MCP tools:
 
 - `skills_list`: catalog with the caller's effective `state` on each record.
-- `child_create` and `descendant_modify`: `settings.extensions.skills` uses the same replacement semantics. Explicit selections may delegate only the caller's currently available/installed skills, checked inside the serialized mutation. Omitted modification selections are not reauthorized. Core still enforces direct-child creation / strict-descendant mutation.
+- `create_subagent` and `modify_subagent`: `settings.extensions.skills` uses the same replacement semantics. Explicit selections may delegate only the caller's currently available/installed skills, checked inside the serialized mutation. Omitted modification selections are not reauthorized. Core still enforces direct-child creation / strict-descendant mutation.
 
 Create/modify still return lifecycle operations. Await them; filesystem or validation errors fail the operation, not a second socket response. Launch failures **after** records commit leave the agent failed with its selections preserved. Without the plugin, namespaced selections cannot be newly granted; existing namespaces and legacy fields block launches/modification with the generic `EXTENSION_REQUIRED` error. Even retained empty/unavailable-only namespaces require their owner, conservatively. Stop/removal remain possible; records/files remain intact.
 

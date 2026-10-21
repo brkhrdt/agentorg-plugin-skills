@@ -811,7 +811,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const retained = catalog().filter(item => retainedNames.has(item.name) && !configuredActive(item)).map(item => ({ ...item, status: "retired" as const, state: statesForAgent[item.name] }));
       return { skills: activeCatalog().map(item => ({ ...exposedSkill(item), state: Object.hasOwn(statesForAgent, item.name) ? statesForAgent[item.name] : "unavailable" })), retained: retained.map(exposedSkill).map(item => ({ ...item, status: "retired" as const, state: statesForAgent[item.name] })) };
     } });
-    for (const name of ["child_create", "descendant_modify"]) host.transformTool(name, tool => {
+    for (const name of ["create_subagent", "modify_subagent"]) host.transformTool(name, tool => {
       const properties = { ...tool.inputSchema.properties };
       const settings = properties.settings as { properties?: Record<string, unknown> };
       const extensions = (settings.properties?.extensions ?? { type: "object" }) as { properties?: Record<string, unknown> };
