@@ -123,6 +123,15 @@ export function migrateCatalog(db: Database): number {
   return 5;
 }
 
+/** Notifications cannot turn a committed catalog change into a reported mutation failure. */
+export function notifyAfterCatalogCommit(emit: () => void, report: (error: unknown) => void): void {
+  try { emit(); }
+  catch (error) {
+    try { report(error); }
+    catch { /* Diagnostic delivery is also best-effort after publication. */ }
+  }
+}
+
 /** Identity encoded in catalog.url; JSON tuple avoids separator and prefix collisions. */
 export const sourceIdentity = (source: SkillSource): string => source.kind === "git"
   ? source.gitUrl

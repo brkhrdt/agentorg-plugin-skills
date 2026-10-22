@@ -12,7 +12,7 @@ export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
 import { cloneManagedRepository, cloneRemoteRepository, gitWithTimeout, managedHead, normalizeRemoteBranches, validateRemoteHistory } from "./git.ts";
 import { canonicalSkillRepositoryUrl, skillsServerSettings } from "./config.ts";
-import { migrateCatalog, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
+import { migrateCatalog, notifyAfterCatalogCommit, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
 import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
 import { LocalSkillImporter } from "./local-import.ts";
 import { localSkillImportSupported } from "./local-source.ts";
@@ -514,7 +514,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           saveRepositoryState({ name: name!, gitUrl: url, origin: "manual", status: "ready", attempts: 0, fingerprint: "" });
           dropJournal(journalId);
         })());
-        try { host.emit("skills.catalog_added", exposedSkill(record)); } catch (error) { report(new Error(`Published ${name}, but catalog event failed: ${(error as Error).message}`)); }
+        notifyAfterCatalogCommit(() => host.emit("skills.catalog_added", exposedSkill(record)),
+          error => report(new Error(`Published ${name}, but catalog event failed: ${(error as Error).message}`)));
         return exposedSkill(record);
       } finally {
         releaseIdentity(claimName, url, claim);
@@ -850,8 +851,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           db.query("UPDATE catalog SET data=? WHERE name=? AND url=?").run(JSON.stringify(updated), name, identity);
         })();
         const record = updated!;
-        try { host.emit("skills.catalog_changed", { name, source: record.source, status: target === "retired" ? "retired" : "ready" }); }
-        catch (error) { report(new Error(`Updated catalog status for ${name}, but catalog event failed: ${(error as Error).message}`)); }
+        notifyAfterCatalogCommit(() => host.emit("skills.catalog_changed", { name, source: record.source, status: target === "retired" ? "retired" : "ready" }),
+          error => report(new Error(`Updated catalog status for ${name}, but catalog event failed: ${(error as Error).message}`)));
         return { skill: exposedSkill(record), status: target === "retired" ? "retired" as const : "ready" as const };
       });
     }
@@ -886,8 +887,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           if (!isRetired(current)) {
             const retired = { ...current, catalogStatus: "retired" as const };
             db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=? AND url=?").run(JSON.stringify(retired), name, identity))();
-            try { host.emit("skills.catalog_changed", { name, source: retired.source, status: "retired" }); }
-            catch (error) { report(new Error(`Retired ${name} before permanent deletion, but catalog event failed: ${(error as Error).message}`)); }
+            notifyAfterCatalogCommit(() => host.emit("skills.catalog_changed", { name, source: retired.source, status: "retired" }),
+              error => report(new Error(`Retired ${name} before permanent deletion, but catalog event failed: ${(error as Error).message}`)));
           }
 
           const snapshot = await host.request("organization.snapshot", {}, server) as { agents?: AgentRecord[]; operations?: Array<{ agentId?: string; status?: string }> };
@@ -964,8 +965,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
             if (current.source.kind === "git") db.query("DELETE FROM repository_state WHERE name=? AND url=?").run(name, current.source.gitUrl);
             for (const item of installationsForSkill()) db.query("DELETE FROM installations WHERE id=?").run(item.generation);
           })();
-          try { host.emit("skills.catalog_deleted", { name, source: current.source, removedAssignments: assigned.map(agent => agent.id), removedInstallations: cleanupInstallations.length }); }
-          catch (error) { report(new Error(`Deleted ${name}, but catalog deletion event failed: ${(error as Error).message}`)); }
+          notifyAfterCatalogCommit(() => host.emit("skills.catalog_deleted", { name, source: current.source, removedAssignments: assigned.map(agent => agent.id), removedInstallations: cleanupInstallations.length }),
+            error => report(new Error(`Deleted ${name}, but catalog deletion event failed: ${(error as Error).message}`)));
           return { name, source: current.source, status: "deleted" as const, removedAssignments: assigned.length, removedInstallations: cleanupInstallations.length };
         });
       } finally { deletingCatalog.delete(name); }
