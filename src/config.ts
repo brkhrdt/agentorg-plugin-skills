@@ -16,6 +16,21 @@ export interface SkillsConfig extends Record<string, unknown> {
   maxCatalogEntries: number;
 }
 
+/** Canonicalize the existing allowlisted HTTPS repository identity without widening source policy. */
+export function canonicalSkillRepositoryUrl(gitUrl: string): string {
+  if (gitUrl.length > 2048 || /[\x00-\x20]/.test(gitUrl)) throw new Error("Invalid Git source");
+  let url: URL;
+  try { url = new URL(gitUrl); } catch { throw new Error("Use an HTTPS Git URL"); }
+  const authority = gitUrl.match(/^https:\/\/([^/?#]+)/i)?.[1];
+  if (!authority || url.protocol !== "https:" || url.username || url.password || authority.includes(":") || url.search || url.hash ||
+      !["github.com", "gitlab.com", "bitbucket.org"].includes(url.hostname) ||
+      !/^\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+\/?$/.test(url.pathname) ||
+      url.pathname.split("/").some(part => part === "." || part === ".."))
+    throw new Error("Only HTTPS repositories on github.com, gitlab.com or bitbucket.org are supported (no credentials, ports, queries or redirects)");
+  url.pathname = url.pathname.replace(/\/+$/, "");
+  return url.toString();
+}
+
 /** Normalize public settings; local absolute sources require an explicit trusted embedded-test factory. */
 export function validateSkillsConfig(value: unknown, allowLocalSources = false): SkillsConfig {
   const parsed = schema.parse(value);
@@ -24,24 +39,13 @@ export function validateSkillsConfig(value: unknown, allowLocalSources = false):
   const repositories = parsed.repositories.map(({ name, gitUrl }) => {
     if (names.has(name)) throw new Error(`Duplicate skills repository name: ${name}`);
     names.add(name);
-    if (/[\x00-\x20]/.test(gitUrl)) throw new Error("Invalid Git source");
     if (allowLocalSources && gitUrl.startsWith("/")) {
       const canonical = resolve(gitUrl);
       if (urls.has(canonical)) throw new Error(`Duplicate skills repository URL: ${canonical}`);
       urls.add(canonical);
       return { name, gitUrl: canonical };
     }
-    let url: URL;
-    try { url = new URL(gitUrl); } catch { throw new Error("Use an HTTPS Git URL"); }
-    // Explicit ports (including :443), credentials, redirects and non-canonical host/path forms are forbidden.
-    const authority = gitUrl.match(/^https:\/\/([^/?#]+)/i)?.[1];
-    if (!authority || url.protocol !== "https:" || url.username || url.password || authority.includes(":") || url.search || url.hash ||
-        !["github.com", "gitlab.com", "bitbucket.org"].includes(url.hostname) ||
-        !/^\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+\/?$/.test(url.pathname) ||
-        url.pathname.split("/").some(part => part === "." || part === ".."))
-      throw new Error("Only HTTPS repositories on github.com, gitlab.com or bitbucket.org are supported (no credentials, ports, queries or redirects)");
-    url.pathname = url.pathname.replace(/\/+$/, "");
-    const canonical = url.toString();
+    const canonical = canonicalSkillRepositoryUrl(gitUrl);
     if (urls.has(canonical)) throw new Error(`Duplicate skills repository URL: ${canonical}`);
     urls.add(canonical);
     return { name, gitUrl: canonical };

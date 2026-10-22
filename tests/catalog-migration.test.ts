@@ -16,22 +16,24 @@ test.each([1, 2])("schema v%d upgrades legacy Git rows and legacy journals", ver
   const db = database(version, [{ name: "alpha", url: legacyGit.gitUrl, data: JSON.stringify(legacyGit) }]);
   db.query("INSERT INTO journal VALUES (?,?)").run(validJournal.id, JSON.stringify(validJournal));
   try {
-    expect(migrateCatalog(db)).toBe(3);
+    expect(migrateCatalog(db)).toBe(5);
     const data = JSON.parse((db.query("SELECT data FROM catalog").get() as any).data);
     expect(data.source).toEqual({ kind: "git", gitUrl: legacyGit.gitUrl });
     expect(data.gitUrl).toBe(legacyGit.gitUrl);
-    expect(migrateCatalog(db)).toBe(3);
-    expect((db.query("SELECT version FROM meta").get() as any).version).toBe(3);
+    expect(data.history).toEqual({ mode: "legacy-git" });
+    expect(data.catalogStatus).toBe("active");
+    expect(migrateCatalog(db)).toBe(5);
+    expect((db.query("SELECT version FROM meta").get() as any).version).toBe(5);
   } finally { db.close(); }
 });
 
-test("v3 local provenance omits top-level gitUrl and preserves central checkout identity", () => {
+test("v3 local provenance is labeled legacy snapshot without changing central checkout identity", () => {
   const local = { name: "local", source: { kind: "local" as const, path: "/original/source" }, description: "local", createdAt: "2025-01-01", path: "/managed/local" };
   const db = database(3, [{ name: "local", url: sourceIdentity(local.source), data: JSON.stringify(local) }]);
   try {
-    migrateCatalog(db);
+    expect(migrateCatalog(db)).toBe(5);
     const data = JSON.parse((db.query("SELECT data FROM catalog").get() as any).data);
-    expect(data).toEqual(local);
+    expect(data).toMatchObject({ ...local, history: { mode: "legacy-snapshot" } });
     expect(data.path).toBe("/managed/local");
     expect(data.gitUrl).toBeUndefined();
   } finally { db.close(); }
@@ -99,14 +101,25 @@ test("v3 local-import journals preserve unknown-name intent and later durable ph
   };
   db.query("INSERT INTO journal VALUES (?,?)").run(id, JSON.stringify(journal));
   try {
-    expect(migrateCatalog(db)).toBe(3);
+    expect(migrateCatalog(db)).toBe(5);
     expect(JSON.parse((db.query("SELECT data FROM journal").get() as any).data)).toEqual(journal);
     db.query("UPDATE journal SET data=? WHERE id=?").run(JSON.stringify({ ...journal, localImport: { ...journal.localImport, phase: "initialized", name: "fixture-skill" } }), id);
-    expect(migrateCatalog(db)).toBe(3);
+    expect(migrateCatalog(db)).toBe(5);
+  } finally { db.close(); }
+});
+
+test("schema v4 adds a reversible catalog status without changing source or managed identity", () => {
+  const retired = { ...legacyGit, source: { kind: "git", gitUrl: legacyGit.gitUrl }, catalogStatus: "retired" };
+  const db = database(4, [{ name: "alpha", url: legacyGit.gitUrl, data: JSON.stringify(retired) }]);
+  try {
+    expect(migrateCatalog(db)).toBe(5);
+    const saved = JSON.parse((db.query("SELECT data FROM catalog").get() as any).data);
+    expect(saved).toMatchObject({ name: "alpha", path: "/managed/alpha", source: retired.source, catalogStatus: "retired" });
+    expect((db.query("SELECT url FROM catalog").get() as any).url).toBe(legacyGit.gitUrl);
   } finally { db.close(); }
 });
 
 test("newer schema fails closed", () => {
-  const db = database(4);
+  const db = database(6);
   try { expect(() => migrateCatalog(db)).toThrow(/unsupported schema/); } finally { db.close(); }
 });

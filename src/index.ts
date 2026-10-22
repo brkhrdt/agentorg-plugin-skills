@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve, parse, sep } from "node:path";
-import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
+import { join, resolve, parse, relative, sep } from "node:path";
+import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import type { ServerPlugin, MutationChange } from "agent-organization/plugin";
 import type { AgentRecord, Settings } from "agent-organization/types";
 import { z } from "zod";
@@ -10,17 +10,18 @@ import { isDeepStrictEqual } from "node:util";
 export const skillStatesSchema = z.record(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64), z.enum(["unavailable", "available", "installed"]));
 export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
-import { cloneLocalSnapshot, gitWithTimeout } from "./git.ts";
-import { skillsServerSettings } from "./config.ts";
+import { cloneManagedRepository, cloneRemoteRepository, gitWithTimeout, managedHead, normalizeRemoteBranches, validateRemoteHistory } from "./git.ts";
+import { canonicalSkillRepositoryUrl, skillsServerSettings } from "./config.ts";
 import { migrateCatalog, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
 import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
 import { LocalSkillImporter } from "./local-import.ts";
 import { localSkillImportSupported } from "./local-source.ts";
+import { classifyRepositoryLocator } from "./source-locator.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
 interface Action { generation: string; from: string; to: string; old: boolean }
-interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string }; localImport?: { phase: "intent" | "copying" | "copied" | "initialized"; sourcePath: string; stagingPath: string; name?: string } }
+interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string }; source?: { name?: string; source: SkillSource }; localImport?: { phase: "intent" | "copying" | "copied" | "initialized"; sourcePath: string; stagingPath: string; name?: string } }
 type RepositoryOrigin = "manual" | "configured";
 type RepositoryStatus = "pending" | "ready" | "retired" | "error";
 interface RepositoryRecordState { name: string; gitUrl: string; origin: RepositoryOrigin; status: RepositoryStatus; error?: string; attempts: number; fingerprint: string; failureClass?: "transient" | "permanent" }
@@ -32,6 +33,10 @@ interface Options {
   allowLocalSources?: boolean;
 }
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+const isDescendant = (base: string, candidate: string) => {
+  const path = relative(resolve(base), resolve(candidate));
+  return path !== "" && path !== ".." && !path.startsWith(`..${sep}`) && !parse(path).root;
+};
 function fail(message: string, code = "INVALID_PARAMS"): never { throw Object.assign(new Error(message), { code }); }
 const idPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const server = { kind: "server", id: "skills" } as const;
@@ -137,6 +142,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       if (identityClaims.get(key) === owner) identityClaims.delete(key);
     };
     let shuttingDown = false;
+    const deletingCatalog = new Set<string>();
     let reconciliationWorker: Promise<void> | undefined;
     let fullReconciliationRequest: { reason: string; resetRetries: boolean; allowPermanentRetry: boolean } | undefined;
     let activePermanentRetryPermission = false;
@@ -166,8 +172,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const state = repositoryState(item.name, item.source.gitUrl);
       return state?.origin === "manual" || (state?.origin === "configured" && configuredIdentity(item.name, item.source.gitUrl));
     };
-    const grantable = (item: Skill) => item.source.kind === "local" || (configuredActive(item) && repositoryState(item.name, item.source.gitUrl)?.status === "ready");
+    const isManualCatalogEntry = (item: Skill) => item.source.kind === "local" || repositoryState(item.name, item.source.gitUrl)?.origin !== "configured";
+    const isRetired = (item: Skill) => item.catalogStatus === "retired";
+    const grantable = (item: Skill) => !isRetired(item) && !deletingCatalog.has(item.name) && (item.source.kind === "local" || (configuredActive(item) && repositoryState(item.name, item.source.gitUrl)?.status === "ready"));
     const activeCatalog = () => catalog().filter(grantable);
+    const managedCatalog = () => catalog().filter(isManualCatalogEntry).map(item => ({ ...exposedSkill(item), status: isRetired(item) ? "retired" as const : "ready" as const }));
     // Schema-v1 catalog entries have no ownership record. Classify once against
     // the current effective configuration; all nonmatches remain manual.
     const migrateRepositoryOwnership = () => db.transaction(() => {
@@ -243,7 +252,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           if (state !== "unavailable") selectionSkill(name);
           continue;
         }
-        const retiredDowngrade = !configuredActive(item) && previousStates[name] === "installed" && state === "available";
+        const retiredDowngrade = (!configuredActive(item) || isRetired(item)) && previousStates[name] === "installed" && state === "available";
         const desiredConflict = item.source.kind === "git" ? desiredRepositories().find(repository => repository.name === name && repository.gitUrl !== gitSource(item)) : undefined;
         if (item.source.kind === "git" && repositoryState(item.name, item.source.gitUrl)?.origin === "configured" && desiredConflict && state !== "unavailable" && previousStates[name] !== state && !retiredDowngrade)
           fail(`Skill ${name} conflicts with configured source ${desiredConflict.gitUrl}`, "REPOSITORY_CONFLICT");
@@ -291,8 +300,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           journal.actions.push({ generation, from: stage, to: dest, old: false });
           put("journal", journal.id, journal);
           const catalogSkill = skill(name);
-          if (catalogSkill.source.kind === "local") await cloneLocalSnapshot(catalogSkill.path, stage, effectiveConfig().gitTimeoutMs);
-          else await git(root, "clone", "--no-hardlinks", "--", catalogSkill.path, stage);
+          await cloneManagedRepository(catalogSkill.path, stage, effectiveConfig().gitTimeoutMs);
           await metadata(stage, name);
           await checkoutLimit(stage);
           await writeFile(join(stage, ".git", "agentorg-skills.json"), JSON.stringify({ scope, generation, agentId: agent.id, skill: name }), { mode: 0o600 });
@@ -320,6 +328,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       const result: string[] = [];
       for (const [name, state] of selected(states(agent.settings))) {
+        if (deletingCatalog.has(name)) fail(`Skill ${name} is being permanently deleted`, "DELETE_IN_PROGRESS");
         skill(name);
         if (state !== "installed") continue;
         const path = join(installRoot(agent.settings.cwd!), name);
@@ -352,8 +361,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     migrateRepositoryOwnership();
     host.registerCapability("skills", {
       settingsNamespace: "skills", serverSettingsNamespace: "skills",
-      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", ...(supportsLocalImport ? { addFromPath: "skills.addFromPath" } : {}) },
-      localImport: supportsLocalImport, version: 1,
+      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", registerRepository: "skills.registerRepository",
+        retireRepository: "skills.retireRepository", restoreRepository: "skills.restoreRepository", deleteRepository: "skills.deleteRepository", ...(supportsLocalImport ? { addFromPath: "skills.addFromPath" } : {}) },
+      localImport: supportsLocalImport, localImportHistory: supportsLocalImport ? "preserve-v1" : undefined,
+      repositoryRegistration: { version: 1, sourceKinds: supportsLocalImport ? ["https", "server-path"] : ["https"], history: "preserve-v1" },
+      catalogManagement: { version: 1, semantics: "reversible-retirement-v1", sourceIdentity: "name+source-v1" }, version: 1,
     });
     async function uniqueCwd(settings: Settings, agent: Readonly<AgentRecord>, agents: Readonly<AgentRecord>[]) {
       const cwd = await realpath(settings.cwd ?? process.cwd());
@@ -454,44 +466,59 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         }
       });
     });
-    async function registerCatalog(name: string, inputUrl: unknown): Promise<Skill> {
-      if (typeof name !== "string" || name.length > 64 || !idPattern.test(name)) fail("Invalid skill name");
+    async function registerCatalog(expectedName: string | undefined, inputUrl: unknown, unified = false): Promise<Skill> {
+      if (expectedName !== undefined && (typeof expectedName !== "string" || expectedName.length > 64 || !idPattern.test(expectedName))) fail("Invalid skill name");
       const url = source(inputUrl, options.allowLocalSources ?? false);
-      const claim = claimIdentity(name, url);
-      if (!claim) fail(`Repository registration is already in progress for ${name}`, "DUPLICATE");
+      const claimName = expectedName ?? `source-${hash(url)}`;
+      const claim = claimIdentity(claimName, url);
+      if (!claim) fail("Repository registration is already in progress for this source", "DUPLICATE");
+      let derivedClaim: string | undefined, name = expectedName;
+      const path = join(root, hash(url) + "-" + randomUUID());
+      const journalId = `catalog-${randomUUID()}`;
       try {
-        const existing = catalog();
-        const sameName = existing.find(s => s.name === name);
-        const sameUrl = existing.find(s => s.gitUrl === url);
-        if (sameName || sameUrl) fail(`Skill repository conflict for ${name}: name or Git source already registered`, "DUPLICATE");
-        if (existing.length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
-        const path = join(root, hash(name) + "-" + randomUUID());
-        const journalId = `catalog-${randomUUID()}`;
-        put("journal", journalId, { id: journalId, agentId: "catalog", revision: 0, actions: [], path, repository: { name, gitUrl: url } });
-        let description: string;
+        if (catalog().some(s => s.gitUrl === url || (expectedName && s.name === expectedName)) || unified && desiredRepositories().some(repository => repository.gitUrl === url || expectedName && repository.name === expectedName)) fail("Skill repository source or name already registered or configured as a legacy seed", "DUPLICATE");
+        if (catalog().length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
+        put("journal", journalId, { id: journalId, agentId: "catalog", revision: 0, actions: [], path,
+          ...(expectedName ? { repository: { name: expectedName, gitUrl: url } } : { source: { source: { kind: "git", gitUrl: url } } }) });
+        let description: string, originalHead = "";
         try {
-          await git(root, "-c", `protocol.file.allow=${url.startsWith("/") ? "always" : "never"}`, "clone", "--", url, path);
-          description = await metadata(path, name);
+          await cloneRemoteRepository(url, path, effectiveConfig().gitTimeoutMs);
+          originalHead = await validateRemoteHistory(path, effectiveConfig().gitTimeoutMs);
+          const parsed = await readSkillMetadata(path, expectedName);
+          name = parsed.name; description = parsed.description;
+          if (!idPattern.test(name) || name.length > 64) fail("Skill name in root SKILL.md is invalid");
+          if (!expectedName) {
+            derivedClaim = claimIdentity(name, url);
+            if (!derivedClaim) fail(`Repository registration conflicts with an in-progress skill ${name}`, "DUPLICATE");
+          }
           await checkoutLimit(path);
         } catch (error) {
-          throw new Error(`Catalog checkout for ${name} retained at ${path}: ${(error as Error).message}`);
+          throw Object.assign(new Error(`Catalog checkout retained at ${path}: ${(error as Error).message}`), { code: (error as any)?.code ?? "SOURCE_FAILED" });
         }
-        const record: Skill = { name, source: { kind: "git", gitUrl: url }, gitUrl: url, description, path, createdAt: new Date().toISOString() };
+        // Keep every fetched supported branch tip in the central managed repository.
+        let manifest: Array<[string, string]>, selectedCommit: string;
         try {
-          await catalogPublish(() => db.transaction(() => {
-            if (catalog().some(s => s.name === name || s.gitUrl === url)) fail(`Skill repository conflict for ${name}`, "DUPLICATE");
-            if (catalog().length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
-            db.query("INSERT INTO catalog VALUES (?,?,?)").run(name, url, JSON.stringify(record));
-            saveRepositoryState({ name, gitUrl: url, origin: "manual", status: "ready", attempts: 0, fingerprint: "" });
-            dropJournal(journalId);
-          })());
+          manifest = await normalizeRemoteBranches(path, effectiveConfig().gitTimeoutMs);
+          selectedCommit = unified ? await managedHead(path, effectiveConfig().gitTimeoutMs) : await git(path, "rev-parse", "HEAD");
         } catch (error) {
-          throw new Error(`Catalog registration for ${name} (${url}) failed; checkout and journal retained at ${path}: ${(error as Error).message}`);
+          throw Object.assign(new Error(`Catalog history retained at ${path}: ${(error as Error).message}`), { code: (error as any)?.code ?? "SOURCE_FAILED" });
         }
-        host.emit("skills.catalog_added", exposedSkill(record));
+        const refManifest = [...manifest, ["HEAD", originalHead] as [string, string]].sort(([a], [b]) => a.localeCompare(b));
+        const record: Skill = { name: name!, source: { kind: "git", gitUrl: url }, gitUrl: url, description: description!, path, createdAt: new Date().toISOString(),
+          history: { mode: "git-preserved", scope: "branches-tags-head-v1", selectedCommit, originalHead, refCount: refManifest.length, refManifest: hash(JSON.stringify(refManifest)) }, catalogStatus: "active" };
+        await catalogPublish(() => db.transaction(() => {
+          if (deletingCatalog.has(name!)) fail(`Catalog skill ${name} is being permanently deleted`, "DELETE_IN_PROGRESS");
+          if (catalog().some(s => s.name === name || s.source.kind === "git" && s.source.gitUrl === url) || unified && desiredRepositories().some(repository => repository.name === name || repository.gitUrl === url)) fail(`Skill repository conflict for ${name}`, "DUPLICATE");
+          if (catalog().length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
+          db.query("INSERT INTO catalog VALUES (?,?,?)").run(name!, url, JSON.stringify(record));
+          saveRepositoryState({ name: name!, gitUrl: url, origin: "manual", status: "ready", attempts: 0, fingerprint: "" });
+          dropJournal(journalId);
+        })());
+        try { host.emit("skills.catalog_added", exposedSkill(record)); } catch (error) { report(new Error(`Published ${name}, but catalog event failed: ${(error as Error).message}`)); }
         return exposedSkill(record);
       } finally {
-        releaseIdentity(name, url, claim);
+        releaseIdentity(claimName, url, claim);
+        if (derivedClaim) releaseIdentity(name!, url, derivedClaim);
         if (desiredRepositories().some(repository => repository.name === name || repository.gitUrl === url)) scheduleReconciliation("catalog-add");
       }
     }
@@ -500,11 +527,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       centralRoot: root, stagingRoot: join(root, "local-import-staging"), maxCatalogEntries: effectiveConfig().maxCatalogEntries,
       gitTimeoutMs: () => effectiveConfig().gitTimeoutMs,
       putJournal: journal => put("journal", journal.id, journal),
-      publish: async (record, identity, journalId) => {
+      publish: async (record, identity, journalId, unified) => {
         await catalogPublish(() => db.transaction(() => {
           const entries = catalog();
-          if (entries.some(item => item.name === record.name || item.source && sourceIdentity(item.source) === identity))
-            fail(`Local skill source or name already registered: ${record.name}`, "DUPLICATE");
+          if (deletingCatalog.has(record.name)) fail(`Catalog skill ${record.name} is being permanently deleted`, "DELETE_IN_PROGRESS");
+          if (entries.some(item => item.name === record.name || item.source && sourceIdentity(item.source) === identity) || unified && desiredRepositories().some(repository => repository.name === record.name))
+            fail(`Local skill source or name already registered or configured as a legacy seed: ${record.name}`, "DUPLICATE");
           if (entries.length >= effectiveConfig().maxCatalogEntries) fail(`Catalog limit (${effectiveConfig().maxCatalogEntries}) reached`, "LIMIT");
           db.query("INSERT INTO catalog VALUES (?,?,?)").run(record.name, identity, JSON.stringify(record));
           dropJournal(journalId);
@@ -514,9 +542,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       report: error => report(error),
       emit: record => host.emit("skills.catalog_added", exposedSkill(record)),
     });
-    function runLocalImport(input: unknown, pathOptions: { baseDir?: string; home?: string } = {}) {
+    function runLocalImport(input: unknown, pathOptions: { baseDir?: string; home?: string } = {}, unified = false) {
       if (shuttingDown) fail("Skills plugin is shutting down", "SHUTTING_DOWN");
-      const operation = exclusive(() => localImporter.import(input, pathOptions));
+      const operation = exclusive(() => localImporter.import(input, pathOptions, unified));
       activeLocalImports.add(operation);
       void operation.finally(() => activeLocalImports.delete(operation)).catch(() => {});
       return operation;
@@ -622,7 +650,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
         await checkoutLimit(path);
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
-        const record: Skill = { name, source: { kind: "git", gitUrl }, gitUrl, description, path, createdAt: new Date().toISOString() };
+        const record: Skill = { name, source: { kind: "git", gitUrl }, gitUrl, description, path, createdAt: new Date().toISOString(), history: { mode: "legacy-git" }, catalogStatus: "active" };
         await catalogPublish(() => db.transaction(() => {
           if (!currentGenerationSync(generation, revision, fingerprint, name, gitUrl)) return;
           const now = catalog();
@@ -766,7 +794,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       clientOnly(caller);
       const retained = catalog().filter(item => item.source.kind === "git" && repositoryState(item.name, item.source.gitUrl)?.origin === "configured" && !configuredIdentity(item.name, item.source.gitUrl));
       return {
-        skills: activeCatalog().map(exposedSkill), retained: retained.map(item => ({ ...exposedSkill(item), status: "retired" as const })),
+        skills: activeCatalog().map(exposedSkill), managed: managedCatalog(), retained: retained.map(item => ({ ...exposedSkill(item), status: "retired" as const })),
         reconciliation: publicReconciliation(),
         recovery: installations().filter(i => i.pending).map(i => ({ agentId: i.agentId, skill: i.skill, path: i.path, error: i.error })),
         repositoryRecovery: rows<Journal>("journal").filter(j => j.agentId === "catalog" && j.path).map(j => ({ id: j.id, path: j.path, repository: j.repository, localImport: j.localImport, origin: (j.repository && repositoryState(j.repository.name, j.repository.gitUrl)?.origin) ?? "manual", revision: j.revision, status: "retained" as const })),
@@ -779,6 +807,169 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       scheduleReconciliation("requested", true);
       return { accepted: true, reconciliation: status };
     });
+    host.registerEndpoint("skills.registerRepository", async (params, caller) => {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params as object).length !== 1 || typeof (params as any).source !== "string") fail("Expected exactly {source}");
+      const classified = classifyRepositoryLocator((params as { source: string }).source);
+      if (classified.kind === "https") {
+        let url: string;
+        try { url = canonicalSkillRepositoryUrl(classified.source); }
+        catch (error) { fail((error as Error).message, "INVALID_PARAMS"); }
+        return exclusive(() => registerCatalog(undefined, url, true));
+      }
+      if (!supportsLocalImport) fail("Server-side path registration is unsupported on this host", "UNSUPPORTED_SOURCE");
+      return runLocalImport(classified.source, { baseDir: localImportBase, home: homedir() }, true).then(exposedSkill);
+    });
+    async function transitionCatalogRetirement(params: unknown, caller: { kind: string }, target: "active" | "retired", expectedStatus: "ready" | "retired") {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 3 ||
+          typeof (params as any).name !== "string" || !idPattern.test((params as any).name) ||
+          ((params as any).expectedStatus !== "ready" && (params as any).expectedStatus !== "retired"))
+        fail("Expected exactly {name, source, expectedStatus}", "INVALID_PARAMS");
+      const rawSource = (params as any).source;
+      if (!rawSource || typeof rawSource !== "object" || Array.isArray(rawSource)) fail("Invalid catalog source identity", "INVALID_PARAMS");
+      let identity: string;
+      if (rawSource.kind === "git" && typeof rawSource.gitUrl === "string" && Object.keys(rawSource).length === 2) identity = sourceIdentity({ kind: "git", gitUrl: rawSource.gitUrl });
+      else if (rawSource.kind === "local" && typeof rawSource.path === "string" && Object.keys(rawSource).length === 2) identity = sourceIdentity({ kind: "local", path: rawSource.path });
+      else fail("Invalid catalog source identity", "INVALID_PARAMS");
+      if ((params as any).expectedStatus !== expectedStatus) fail(`Expected status ${expectedStatus}`, "INVALID_PARAMS");
+      const name = (params as any).name as string;
+      return catalogPublish(async () => {
+        const before = catalog().find(item => item.name === name);
+        if (target === "active" && before && !(await exists(before.path))) fail(`Managed checkout for ${name} is missing; it cannot be restored`, "SKILL_NOT_READY");
+        let updated: Skill | undefined;
+        db.transaction(() => {
+          const current = catalog().find(item => item.name === name);
+          if (!current) fail(`Catalog skill ${name} no longer exists`, "NOT_FOUND");
+          if (deletingCatalog.has(name)) fail(`Catalog skill ${name} is being permanently deleted`, "DELETE_IN_PROGRESS");
+          if (sourceIdentity(current.source) !== identity) fail(`Catalog identity changed for ${name}; refresh before managing it`, "CONFLICT");
+          if (!isManualCatalogEntry(current)) fail(`Configured seed ${name} cannot be retired through catalog management`, "FORBIDDEN");
+          const status = isRetired(current) ? "retired" : "ready";
+          if (status !== expectedStatus) fail(`Catalog status changed for ${name}; refresh before managing it`, "CONFLICT");
+          updated = { ...current, catalogStatus: target };
+          db.query("UPDATE catalog SET data=? WHERE name=? AND url=?").run(JSON.stringify(updated), name, identity);
+        })();
+        const record = updated!;
+        try { host.emit("skills.catalog_changed", { name, source: record.source, status: target === "retired" ? "retired" : "ready" }); }
+        catch (error) { report(new Error(`Updated catalog status for ${name}, but catalog event failed: ${(error as Error).message}`)); }
+        return { skill: exposedSkill(record), status: target === "retired" ? "retired" as const : "ready" as const };
+      });
+    }
+    host.registerEndpoint("skills.retireRepository", (params, caller) => transitionCatalogRetirement(params, caller, "retired", "ready"));
+    host.registerEndpoint("skills.restoreRepository", (params, caller) => transitionCatalogRetirement(params, caller, "active", "retired"));
+    host.registerEndpoint("skills.deleteRepository", async (params, caller) => {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 3 ||
+          typeof (params as any).name !== "string" || !idPattern.test((params as any).name) ||
+          ((params as any).expectedStatus !== "ready" && (params as any).expectedStatus !== "retired"))
+        fail("Expected exactly {name, source, expectedStatus}", "INVALID_PARAMS");
+      const name = (params as any).name as string, expectedStatus = (params as any).expectedStatus as "ready" | "retired";
+      const rawSource = (params as any).source;
+      if (!rawSource || typeof rawSource !== "object" || Array.isArray(rawSource)) fail("Invalid catalog source identity", "INVALID_PARAMS");
+      let identity: string;
+      if (rawSource.kind === "git" && typeof rawSource.gitUrl === "string" && Object.keys(rawSource).length === 2) identity = sourceIdentity({ kind: "git", gitUrl: rawSource.gitUrl });
+      else if (rawSource.kind === "local" && typeof rawSource.path === "string" && Object.keys(rawSource).length === 2) identity = sourceIdentity({ kind: "local", path: rawSource.path });
+      else fail("Invalid catalog source identity", "INVALID_PARAMS");
+      if (deletingCatalog.has(name)) fail(`Catalog skill ${name} is already being permanently deleted`, "DELETE_IN_PROGRESS");
+      deletingCatalog.add(name);
+      try {
+        return await catalogPublish(async () => {
+          const current = catalog().find(item => item.name === name);
+          if (!current) fail(`Catalog skill ${name} no longer exists`, "NOT_FOUND");
+          if (sourceIdentity(current.source) !== identity) fail(`Catalog identity changed for ${name}; refresh before deleting it`, "CONFLICT");
+          if (!isManualCatalogEntry(current) || desiredRepositories().some(repository => repository.name === name)) fail(`Configured seed ${name} cannot be permanently deleted here`, "FORBIDDEN");
+          const status = isRetired(current) ? "retired" : "ready";
+          if (status !== expectedStatus) fail(`Catalog status changed for ${name}; refresh before deleting it`, "CONFLICT");
+
+          // Reserve the identity as retired first. A failed/partial cascade is
+          // safe to retry and cannot admit new grants while cleanup is pending.
+          if (!isRetired(current)) {
+            const retired = { ...current, catalogStatus: "retired" as const };
+            db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=? AND url=?").run(JSON.stringify(retired), name, identity))();
+            try { host.emit("skills.catalog_changed", { name, source: retired.source, status: "retired" }); }
+            catch (error) { report(new Error(`Retired ${name} before permanent deletion, but catalog event failed: ${(error as Error).message}`)); }
+          }
+
+          const snapshot = await host.request("organization.snapshot", {}, server) as { agents?: AgentRecord[]; operations?: Array<{ agentId?: string; status?: string }> };
+          const agents = snapshot.agents ?? [];
+          const installationsForSkill = () => installations().filter(item => item.skill === name);
+          const relatedInstallations = installationsForSkill();
+          const generations = new Set(relatedInstallations.map(item => item.generation));
+          const journals = rows<Journal>("journal");
+          const assigned = agents.filter(agent => !agent.removedAt && (states(agent.settings)?.[name] ?? "unavailable") !== "unavailable");
+          const affectedAgentIds = new Set([...assigned.map(agent => agent.id), ...relatedInstallations.map(item => item.agentId)]);
+          const blockedJournal = journals.find(journal => journal.actions.some(action => generations.has(action.generation)) || affectedAgentIds.has(journal.agentId) ||
+            journal.agentId === "catalog" && (journal.path === current.path || journal.repository && current.source.kind === "git" && journal.repository.name === name && journal.repository.gitUrl === current.source.gitUrl ||
+              journal.source && (journal.source.name === name || sourceIdentity(journal.source.source) === identity) || journal.localImport && journal.localImport.name === name));
+          if (blockedJournal) fail(`Skill ${name} has pending recovery work; resolve it before permanent deletion`, "DELETE_BLOCKED");
+          if (relatedInstallations.some(item => item.pending || item.status === "staged")) fail(`Skill ${name} has pending installation recovery; resolve it before permanent deletion`, "DELETE_BLOCKED");
+          const activeOperation = (snapshot.operations ?? []).find(operation => affectedAgentIds.has(operation.agentId ?? "") && operation.status && !["completed", "failed", "stopped"].includes(operation.status));
+          if (activeOperation) fail(`Skill ${name} is assigned to an agent with active work; wait for it to finish before permanent deletion`, "DELETE_BLOCKED");
+
+          const verifyInstallation = async (item: Installation) => {
+            const owner = agents.find(agent => agent.id === item.agentId);
+            if (!owner) fail(`Cannot verify owner of installed ${name} copy (${item.agentId}); permanent deletion is blocked`, "DELETE_BLOCKED");
+            const cwd = await realpath(owner.settings.cwd ?? process.cwd());
+            const activePath = resolve(join(installRoot(cwd), name));
+            const recoveryRoot = join(cwd, ".agents", "agentorg-recovery");
+            const recoveryPath = resolve(join(recoveryRoot, scope, item.generation));
+            if (resolve(item.path) !== activePath && resolve(item.path) !== recoveryPath) fail(`Refusing to delete ${name} data outside its managed install/recovery directory`, "DELETE_BLOCKED");
+            if (!await exists(item.path)) {
+              if (item.status === "active") fail(`Active installed copy for ${name} is missing; resolve it before deletion`, "DELETE_BLOCKED");
+              return;
+            }
+            const parents = resolve(item.path) === activePath ? [join(cwd, ".agents"), installRoot(cwd)] : [join(cwd, ".agents"), recoveryRoot, join(recoveryRoot, scope)];
+            for (const parent of parents) {
+              const info = await lstat(parent).catch((error: any) => error.code === "ENOENT" ? null : Promise.reject(error));
+              if (!info?.isDirectory() || info.isSymbolicLink()) fail(`Unverified managed parent directory for ${name}: ${parent}`, "DELETE_BLOCKED");
+            }
+            await own(item);
+          };
+          for (const item of relatedInstallations) await verifyInstallation(item);
+          if (await exists(current.path)) {
+            const centralInfo = await lstat(current.path);
+            if (!centralInfo.isDirectory() || centralInfo.isSymbolicLink() || !isDescendant(root, await realpath(current.path)))
+              fail(`Refusing to delete unverified central skill directory for ${name}`, "DELETE_BLOCKED");
+          } else if (!isRetired(current)) fail(`Central skill directory for ${name} is missing`, "DELETE_BLOCKED");
+
+          for (const agent of assigned) {
+            const originalSettings = structuredClone(agent.settings) as Settings;
+            const extensions = { ...(originalSettings.extensions ?? {}) } as Record<string, unknown>;
+            const skillMap = { ...(extensions.skills as SkillStates | undefined) };
+            delete skillMap[name];
+            extensions.skills = skillMap;
+            const settings = { ...originalSettings, extensions } as Settings;
+            let operation = await host.request("agent.modify", { agentId: agent.id, expectedRevision: agent.revision, settings }, server) as any;
+            while (operation && !done(operation)) operation = await host.request("operation.wait", { operationId: operation.id, waitMs: 1000 }, server) as any;
+            if (!operation || operation.status !== "completed") fail(`Could not clear ${name} assignment from ${agent.id}: ${operation?.error?.message ?? operation?.status ?? "unknown operation result"}. Skill remains retired; retry deletion after review.`, "DELETE_PARTIAL");
+          }
+
+          const after = await host.request("organization.snapshot", {}, server) as { agents?: AgentRecord[]; operations?: Array<{ agentId?: string; status?: string }> };
+          const stillAssigned = (after.agents ?? []).filter(agent => !agent.removedAt && (states(agent.settings)?.[name] ?? "unavailable") !== "unavailable");
+          if (stillAssigned.length) fail(`Could not verify removal of ${name} assignments from ${stillAssigned.map(agent => agent.id).join(", ")}; skill remains retired`, "DELETE_PARTIAL");
+          const workStarted = (after.operations ?? []).find(operation => affectedAgentIds.has(operation.agentId ?? "") && operation.status && !["completed", "failed", "stopped"].includes(operation.status));
+          if (workStarted) fail(`Agent work started while deleting ${name}; assignments are cleared but owned files were retained. Retry after work finishes`, "DELETE_BLOCKED");
+          const cleanupInstallations = installationsForSkill();
+          for (const item of cleanupInstallations) {
+            if (item.pending || item.status === "staged") fail(`Skill ${name} has pending installation recovery; resolve it before permanent deletion`, "DELETE_BLOCKED");
+            await verifyInstallation(item);
+            if (await exists(item.path)) await rm(item.path, { recursive: true, force: false });
+            db.query("DELETE FROM installations WHERE id=?").run(item.generation);
+          }
+          if (await exists(current.path)) await rm(current.path, { recursive: true, force: false });
+          db.transaction(() => {
+            const latest = catalog().find(item => item.name === name);
+            if (!latest || sourceIdentity(latest.source) !== identity || !isRetired(latest)) fail(`Catalog identity changed during deletion of ${name}`, "CONFLICT");
+            db.query("DELETE FROM catalog WHERE name=? AND url=?").run(name, identity);
+            if (current.source.kind === "git") db.query("DELETE FROM repository_state WHERE name=? AND url=?").run(name, current.source.gitUrl);
+            for (const item of installationsForSkill()) db.query("DELETE FROM installations WHERE id=?").run(item.generation);
+          })();
+          try { host.emit("skills.catalog_deleted", { name, source: current.source, removedAssignments: assigned.map(agent => agent.id), removedInstallations: cleanupInstallations.length }); }
+          catch (error) { report(new Error(`Deleted ${name}, but catalog deletion event failed: ${(error as Error).message}`)); }
+          return { name, source: current.source, status: "deleted" as const, removedAssignments: assigned.length, removedInstallations: cleanupInstallations.length };
+        });
+      } finally { deletingCatalog.delete(name); }
+    });
     if (supportsLocalImport) host.registerEndpoint("skills.addFromPath", async (params, caller) => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 1 || !Object.hasOwn(params, "path") || typeof (params as any).path !== "string")
@@ -787,7 +978,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         const record = await runLocalImport((params as any).path, { baseDir: localImportBase, home: homedir() });
         return exposedSkill(record);
       } catch (error: any) {
-        if (["INVALID_PARAMS", "INVALID_PATH", "DUPLICATE", "LIMIT", "SHUTTING_DOWN", "INTERNAL"].includes(error?.code)) throw error;
+        if (["INVALID_PARAMS", "INVALID_PATH", "UNSUPPORTED_SOURCE", "INCOMPLETE_HISTORY", "DUPLICATE", "LIMIT", "SHUTTING_DOWN", "INTERNAL"].includes(error?.code)) throw error;
         report(new Error(`Local skill import failed: ${(error as Error).message}`));
         fail("Local skill import failed; inspect server diagnostics", "INTERNAL");
       }
@@ -808,7 +999,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const agent = await host.request("agent.get", { agentId: caller.id }, caller) as AgentRecord;
       const statesForAgent = states(agent.settings) ?? {};
       const retainedNames = new Set(Object.entries(statesForAgent).filter(([, value]) => value !== "unavailable").map(([name]) => name));
-      const retained = catalog().filter(item => retainedNames.has(item.name) && !configuredActive(item)).map(item => ({ ...item, status: "retired" as const, state: statesForAgent[item.name] }));
+      const retained = catalog().filter(item => retainedNames.has(item.name) && (isRetired(item) || !configuredActive(item))).map(item => ({ ...item, status: "retired" as const, state: statesForAgent[item.name] }));
       return { skills: activeCatalog().map(item => ({ ...exposedSkill(item), state: Object.hasOwn(statesForAgent, item.name) ? statesForAgent[item.name] : "unavailable" })), retained: retained.map(exposedSkill).map(item => ({ ...item, status: "retired" as const, state: statesForAgent[item.name] })) };
     } });
     for (const name of ["child_create", "descendant_modify"]) host.transformTool(name, tool => {

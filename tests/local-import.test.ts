@@ -49,7 +49,7 @@ async function setup() {
 test("durable local import journals before staging, publishes local provenance atomically, and emits afterward", async () => {
   const f = await setup(), fixture = await createLocalSkillFixture();
   try {
-    await mkdir(join(fixture.path, ".git")); await writeFile(join(fixture.path, ".git", "private"), "must be excluded");
+    await mkdir(join(fixture.path, "nested", ".git"), { recursive: true }); await writeFile(join(fixture.path, "nested", ".git", "private"), "must be excluded");
     let intentPrecededStageCreation = false;
     const h = makeImporter(f.db, f.central, { beforeJournal: journal => {
       if (journal.localImport.phase === "intent") {
@@ -65,7 +65,7 @@ test("durable local import journals before staging, publishes local provenance a
     expect(h.published).toHaveLength(1); expect(h.emitted).toHaveLength(1);
     expect(f.db.query("SELECT COUNT(*) AS n FROM journal").get()).toEqual({ n: 0 });
     expect((JSON.parse((f.db.query("SELECT data FROM catalog").get() as any).data)).source).toEqual({ kind: "local", path: fixture.path });
-    await expect(access(join(record.path, ".git", "private"))).rejects.toThrow();
+    await expect(access(join(record.path, "nested", ".git", "private"))).rejects.toThrow();
     expect(await readFile(join(record.path, "asset.bin"))).toEqual(await readFile(join(fixture.path, "asset.bin")));
     expect(await readFile(join(record.path, "ignored-payload.txt"), "utf8")).toContain("ignored fixture payload");
     expect(await readFile(join(record.path, ".agents", "keep.txt"), "utf8")).toContain("include managed-looking data");

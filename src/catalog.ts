@@ -2,6 +2,14 @@ import type { Database } from "bun:sqlite";
 import { isAbsolute } from "node:path";
 
 export type SkillSource = { kind: "git"; gitUrl: string } | { kind: "local"; path: string };
+export interface SkillHistory {
+  mode: "git-preserved" | "directory-initialized" | "legacy-snapshot" | "legacy-git";
+  scope?: "branches-tags-head-v1";
+  selectedCommit?: string;
+  originalHead?: string;
+  refCount?: number;
+  refManifest?: string;
+}
 export interface CatalogSkill {
   name: string;
   source: SkillSource;
@@ -11,6 +19,9 @@ export interface CatalogSkill {
   createdAt: string;
   /** Central managed checkout, never the original local source. */
   path: string;
+  history: SkillHistory;
+  /** Reversible retirement hides manual entries from new grants without deleting identity or files. */
+  catalogStatus?: "active" | "retired";
 }
 export interface CatalogJournal {
   id: string;
@@ -38,6 +49,16 @@ function parseSkill(raw: string, url: string | null): CatalogSkill {
       typeof value.createdAt !== "string" || typeof value.path !== "string") return fail("malformed catalog record");
   const source = decodeSource(value.source ?? (typeof value.gitUrl === "string" ? { kind: "git", gitUrl: value.gitUrl } :
     typeof url === "string" ? { kind: "git", gitUrl: url } : undefined), value.name);
+  if (value.catalogStatus === undefined) value.catalogStatus = "active";
+  if (value.catalogStatus !== "active" && value.catalogStatus !== "retired") return fail(`malformed catalog status for ${value.name}`);
+  if (!value.history) value.history = source.kind === "local" ? { mode: "legacy-snapshot" } : { mode: "legacy-git" };
+  const history = value.history;
+  if (!history || typeof history !== "object" || !["git-preserved", "directory-initialized", "legacy-snapshot", "legacy-git"].includes(history.mode)) return fail(`malformed history for ${value.name}`);
+  const oid = (item: unknown) => typeof item === "string" && /^[0-9a-f]{40}$/.test(item);
+  if (history.mode === "git-preserved" && (history.scope !== "branches-tags-head-v1" || !oid(history.selectedCommit) ||
+      history.originalHead !== undefined && !oid(history.originalHead) || !Number.isInteger(history.refCount) || history.refCount < 1 || history.refCount > 4097 ||
+      typeof history.refManifest !== "string" || !/^[0-9a-f]{64}$/.test(history.refManifest))) return fail(`malformed preserved history for ${value.name}`);
+  if (history.mode === "directory-initialized" && !oid(history.selectedCommit)) return fail(`malformed initialized history for ${value.name}`);
   if (source.kind === "git") {
     if (value.gitUrl !== undefined && value.gitUrl !== source.gitUrl) return fail(`Git source mismatch for ${value.name}`);
     value.source = source;
@@ -56,7 +77,7 @@ export function migrateCatalog(db: Database): number {
   const versionRows = db.query("SELECT version FROM meta").all() as Array<{ version: number }>;
   if (versionRows.length !== 1 || !Number.isInteger(versionRows[0]!.version) || versionRows[0]!.version < 1) return fail("invalid schema version");
   const version = versionRows[0]!.version;
-  if (version > 3) return fail(`unsupported schema version ${version}`);
+  if (version > 5) return fail(`unsupported schema version ${version}`);
   try {
     db.transaction(() => {
       const identities = new Map<string, string>();
@@ -96,10 +117,10 @@ export function migrateCatalog(db: Database): number {
           if (journal.path !== local.stagingPath) fail(`local import journal path mismatch ${row.id}`);
         }
       }
-      if (version < 3) db.query("UPDATE meta SET version=3").run();
+      if (version < 5) db.query("UPDATE meta SET version=5").run();
     })();
   } catch (error) { throw error; }
-  return 3;
+  return 5;
 }
 
 /** Identity encoded in catalog.url; JSON tuple avoids separator and prefix collisions. */

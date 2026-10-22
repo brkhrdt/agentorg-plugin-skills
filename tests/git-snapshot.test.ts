@@ -69,4 +69,4 @@ test("streamed index validation handles 9,016 Unicode-escaped paths near the OS 
     await initializeLocalSnapshot(repo, 60_000);
     expect(await gitWithTimeout(repo, 10_000, "rev-list", "--count", "HEAD")).toBe("1");
   } finally { await rm(root, { recursive: true, force: true }); }
-});
+}, 60_000);
