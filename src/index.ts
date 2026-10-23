@@ -17,6 +17,7 @@ import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
 import { LocalSkillImporter } from "./local-import.ts";
 import { localSkillImportSupported } from "./local-source.ts";
 import { classifyRepositoryLocator } from "./source-locator.ts";
+import { isTerminalOperation } from "./operation-status.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
@@ -941,7 +942,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
             extensions.skills = skillMap;
             const settings = { ...originalSettings, extensions } as Settings;
             let operation = await host.request("agent.modify", { agentId: agent.id, expectedRevision: agent.revision, settings }, server) as any;
-            while (operation && !done(operation)) operation = await host.request("operation.wait", { operationId: operation.id, waitMs: 1000 }, server) as any;
+            while (operation && !isTerminalOperation(operation)) operation = await host.request("operation.wait", { operationId: operation.id, waitMs: 1000 }, server) as any;
             if (!operation || operation.status !== "completed") fail(`Could not clear ${name} assignment from ${agent.id}: ${operation?.error?.message ?? operation?.status ?? "unknown operation result"}. Skill remains retired; retry deletion after review.`, "DELETE_PARTIAL");
           }
 
