@@ -23,6 +23,80 @@ async function namedFixture(name: string) {
   return fixture;
 }
 
+test("unified repository registration derives a local directory record and advertises its history contract", async () => {
+  const f = await setup(), fixture = await namedFixture("unified-directory");
+  try {
+    const capability = (await f.org.request("organization.snapshot", {}, client) as any).capabilities.plugins.skills;
+    expect(capability).toMatchObject({
+      endpoints: { registerRepository: "skills.registerRepository" },
+      repositoryRegistration: { version: 1, sourceKinds: ["https", "server-path"], history: "preserve-v1" },
+      localImportHistory: "preserve-v1",
+    });
+    const response = await f.org.request("skills.registerRepository", { source: fixture.path }, client) as any;
+    expect(response).toMatchObject({
+      name: "unified-directory", description: "unified-directory local API fixture",
+      source: { kind: "local", path: fixture.path }, origin: "manual",
+      history: { mode: "directory-initialized" },
+    });
+    expect(response.gitUrl).toBeUndefined();
+    expect(response.path).toContain("local-import-staging");
+    expect(response.history.selectedCommit).toMatch(/^[0-9a-f]{40}$/);
+    const listing = await f.org.request("skills.list", {}, client) as any;
+    expect(listing.skills.find((item: any) => item.name === "unified-directory")).toEqual(response);
+    expect(f.events.some(event => event.type === "skills.catalog_added" && event.data?.name === "unified-directory")).toBe(true);
+  } finally { await fixture.cleanup(); await f.cleanup(); }
+});
+
+test("manual catalog retirement is reversible and identity-fenced without deleting the catalog row", async () => {
+  const f = await setup(), fixture = await namedFixture("retire-me");
+  try {
+    const capability = (await f.org.request("organization.snapshot", {}, client) as any).capabilities.plugins.skills;
+    expect(capability).toMatchObject({
+      catalogManagement: { version: 1, semantics: "reversible-retirement-v1", sourceIdentity: "name+source-v1" },
+      endpoints: { retireRepository: "skills.retireRepository", restoreRepository: "skills.restoreRepository" },
+    });
+    const record = await f.org.request("skills.registerRepository", { source: fixture.path }, client) as any;
+    const stale = { name: record.name, source: { ...record.source, path: `${fixture.path}-stale` }, expectedStatus: "ready" };
+    await expect(f.org.request("skills.retireRepository", stale, client)).rejects.toMatchObject({ code: "CONFLICT" });
+    const retired = await f.org.request("skills.retireRepository", { name: record.name, source: record.source, expectedStatus: "ready" }, client) as any;
+    expect(retired.status).toBe("retired");
+    expect(retired.skill).toMatchObject({ name: record.name, path: record.path, source: record.source, history: record.history });
+    const retiredList = await f.org.request("skills.list", {}, client) as any;
+    expect(retiredList.skills.some((item: any) => item.name === record.name)).toBe(false);
+    expect(retiredList.managed.find((item: any) => item.name === record.name)).toMatchObject({ status: "retired", path: record.path, source: record.source });
+    const restored = await f.org.request("skills.restoreRepository", { name: record.name, source: record.source, expectedStatus: "retired" }, client) as any;
+    expect(restored.status).toBe("ready");
+    expect((await f.org.request("skills.list", {}, client) as any).skills.some((item: any) => item.name === record.name)).toBe(true);
+  } finally { await fixture.cleanup(); await f.cleanup(); }
+});
+
+test("permanent deletion clears a manual catalog entry and its central managed directory but preserves the original source", async () => {
+  const f = await setup(), fixture = await namedFixture("delete-me");
+  try {
+    const capability = (await f.org.request("organization.snapshot", {}, client) as any).capabilities.plugins.skills;
+    expect(capability.endpoints.deleteRepository).toBe("skills.deleteRepository");
+    const record = await f.org.request("skills.registerRepository", { source: fixture.path }, client) as any;
+    expect(existsSync(record.path)).toBe(true);
+    const deleted = await f.org.request("skills.deleteRepository", { name: record.name, source: record.source, expectedStatus: "ready" }, client) as any;
+    expect(deleted).toMatchObject({ name: record.name, source: record.source, status: "deleted", removedAssignments: 0, removedInstallations: 0 });
+    expect(existsSync(record.path)).toBe(false);
+    expect(existsSync(fixture.path)).toBe(true);
+    const listing = await f.org.request("skills.list", {}, client) as any;
+    expect(listing.skills.some((item: any) => item.name === record.name)).toBe(false);
+    expect(listing.managed.some((item: any) => item.name === record.name)).toBe(false);
+  } finally { await fixture.cleanup(); await f.cleanup(); }
+});
+
+test("unified registration validates exact params and authorization before path access", async () => {
+  const f = await setup();
+  try {
+    await expect(f.org.request("skills.registerRepository", null, { kind: "agent", id: "not-real" }))
+      .rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(f.org.request("skills.registerRepository", { source: "/definitely/missing", extra: true }, client))
+      .rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  } finally { await f.cleanup(); }
+});
+
 test("client endpoint imports directory, SKILL.md, relative path, and OS-home tilde with consistent records/events", async () => {
   const f = await setup();
   const dirFixture = await namedFixture("directory-skill"), fileFixture = await namedFixture("file-skill"), relativeFixture = await namedFixture("relative-skill"), tildeFixture = await namedFixture("tilde-skill"), spacesFixture = await namedFixture("spaces-skill");
