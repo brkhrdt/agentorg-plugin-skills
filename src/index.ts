@@ -116,14 +116,18 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     const put = (table: "installations" | "journal", id: string, value: unknown) => db.query(`INSERT OR REPLACE INTO ${table} VALUES (?,?)`).run(id, JSON.stringify(value));
     const dropJournal = (id: string) => db.query("DELETE FROM journal WHERE id=?").run(id);
     const catalog = () => rows<Skill>("catalog");
+    const unresolvedCanonicalPublications = new Set<string>();
     async function recoverCanonicalPublications() {
       for (const journal of rows<Journal>("journal")) {
         const p = journal.canonicalPublication;
         if (!p) continue;
         try {
           const activeLock = canonicalLockPath(p.canonicalPath);
-          if (await exists(activeLock) && !await staleCanonicalLock(activeLock)) continue;
+          if (await exists(activeLock) && !await staleCanonicalLock(activeLock)) { unresolvedCanonicalPublications.add(p.name); continue; }
           const expected = join(canonicalRoot, p.name);
+          const current = catalog().find(item => item.name === p.name);
+          if (!current || (JSON.stringify(current) !== JSON.stringify(p.oldCatalog) && JSON.stringify(current) !== JSON.stringify(p.newCatalog)))
+            throw new Error(`Catalog identity changed during canonical publication recovery: ${p.name}`);
           if (p.phase !== "prepared" || !idPattern.test(p.name) || p.canonicalPath !== expected ||
               resolve(p.stage) === expected || resolve(p.backup) === expected || dirname(p.stage) !== canonicalRoot || dirname(p.backup) !== canonicalRoot ||
               !(/^\.skills-update-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(basename(p.stage)) || new RegExp(`^\\.skills-revert-${p.name}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).test(basename(p.stage))) ||
@@ -147,18 +151,19 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           if (backupExists && (backupHead !== p.oldHead || await gitWithTimeout(p.backup, 60_000, "status", "--porcelain", "--untracked-files=all")))
             throw new Error(`Canonical publication backup failed verification: ${p.backup}`);
           if (canonicalHead === p.oldHead && stageHead === p.head && backupHead === undefined) {
+            await validateManagedCheckout(expected);
             await rename(expected, p.backup); await rename(p.stage, expected);
           } else if (canonicalHead === undefined && backupHead === p.oldHead && stageHead === p.head) await rename(p.stage, expected);
           else if (!(canonicalHead === p.head && backupHead === p.oldHead && stageHead === undefined))
             throw new Error(`Ambiguous canonical publication layout retained: ${p.canonicalPath}`);
-          const current = catalog().find(item => item.name === p.name);
-          if (!current || (JSON.stringify(current) !== JSON.stringify(p.oldCatalog) && JSON.stringify(current) !== JSON.stringify(p.newCatalog)))
-            throw new Error(`Catalog identity changed during canonical publication recovery: ${p.name}`);
           db.transaction(() => {
             db.query("UPDATE catalog SET data=? WHERE name=?").run(JSON.stringify(p.newCatalog), p.name);
             dropJournal(journal.id);
           })();
-        } catch (error) { host.emit("skills.error", { message: `Canonical publication recovery retained: ${(error as Error).message}` }); }
+        } catch (error) {
+          unresolvedCanonicalPublications.add(p.name);
+          host.emit("skills.error", { message: `Canonical publication recovery retained: ${(error as Error).message}` });
+        }
       }
       for (const entry of await readdir(canonicalRoot, { withFileTypes: true })) {
         if (!entry.name.startsWith(".skills-lock-") || !entry.isSymbolicLink()) continue;
@@ -174,6 +179,10 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     // Copy-before-switch migration. Each row is committed only after the named
     // destination has been verified; legacy trees and DB remain untouched.
     for (const item of catalog()) {
+      if (unresolvedCanonicalPublications.has(item.name)) {
+        host.emit("skills.error", { message: `Canonical migration skipped for ${item.name}: publication recovery is unresolved` });
+        continue;
+      }
       const resolved = await realpath(item.path).catch(() => item.path);
       if (resolved !== join(canonicalRoot, item.name) && !isDescendant(legacyRoot, resolved)) {
         // Older/hand-authored ledgers may point outside the managed legacy root.
@@ -500,6 +509,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         await runReconciliation("startup");
         await exclusive(async () => {
         for (const j of rows<Journal>("journal")) {
+          // Catalog publications are replayed during setup and are never agent
+          // lifecycle transactions, even if their owner lock is still active.
+          if (j.canonicalPublication) continue;
           if (j.agentUpdate && j.path) {
             const staged = installations().find(item => item.generation === j.agentUpdate!.generation);
             const agent = agents.find(item => item.id === j.agentId);
