@@ -143,14 +143,31 @@ async function checkCheckoutStatus(path: string, timeoutMs: number) {
     throw new Error("Cloned Git worktree differs from its index");
 }
 
-export async function cloneManagedRepository(source: string, destination: string, timeoutMs = 60_000): Promise<void> {
-  // Preserve every managed supported branch/tag in independent agent clones too.
-  await safeSnapshotGit(dirname(destination), timeoutMs, "clone", "--no-checkout", "--no-hardlinks", "--no-local", "--no-single-branch", "--tags", "--", source, destination);
+/** Create an isolated, pinned, one-commit checkout. --no-local is essential: local
+ * clones otherwise ignore --depth and can share objects through alternates. */
+export async function clonePinnedSkill(source: string, destination: string, commit: string, timeoutMs = 60_000): Promise<void> {
+  if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Invalid canonical skill commit");
+  await safeSnapshotGit(dirname(destination), timeoutMs, "clone", "--depth=1", "--no-checkout", "--no-hardlinks", "--no-local", "--no-single-branch", "--", source, destination);
   await configureSnapshotWorktree(destination, timeoutMs, false);
-  await snapshotGit(destination, timeoutMs, "checkout", "--force", "HEAD");
+  await snapshotGit(destination, timeoutMs, "checkout", "--detach", "--force", commit);
+  await snapshotGit(destination, timeoutMs, "remote", "remove", "origin").catch(() => "");
   await snapshotGit(destination, timeoutMs, "config", "--local", "--unset", "core.hooksPath");
   await checkCheckoutStatus(destination, timeoutMs);
   await validateSnapshotIndex(destination, timeoutMs);
+  if (await snapshotGit(destination, timeoutMs, "rev-parse", "--is-shallow-repository") !== "true" ||
+      (await snapshotGit(destination, timeoutMs, "rev-list", "--count", "HEAD")) !== "1")
+    throw new Error("Pinned skill checkout is not a single-commit shallow repository");
+  const gitDir = await snapshotGit(destination, timeoutMs, "rev-parse", "--git-dir");
+  if (await exists(join(destination, gitDir, "objects", "info", "alternates"))) throw new Error("Pinned skill checkout uses shared Git objects");
+}
+
+async function exists(path: string): Promise<boolean> {
+  try { await lstat(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+}
+
+export async function cloneManagedRepository(source: string, destination: string, timeoutMs = 60_000): Promise<void> {
+  const commit = await managedHead(source, timeoutMs);
+  await clonePinnedSkill(source, destination, commit, timeoutMs);
 }
 
 export async function cloneLocalSnapshot(source: string, destination: string, timeoutMs = 60_000): Promise<void> {

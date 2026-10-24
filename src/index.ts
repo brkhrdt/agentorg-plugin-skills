@@ -196,21 +196,13 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         fail(`Managed checkout identity mismatch: ${path}`);
       if (await git(path, "rev-parse", "--show-toplevel") !== await realpath(path)) fail(`Not a skill repository root: ${path}`);
     }
-    async function remote(i: Installation) {
-      const central = skill(i.skill).path;
-      const names = (await git(central, "remote")).split("\n");
-      await git(central, "remote", names.includes(i.remote) ? "set-url" : "add", i.remote, i.path);
-    }
+    // Agent checkouts are intentionally isolated: never register a remote in the
+    // canonical repository or in the per-agent clone, and never fetch/push user work.
+    async function remote(_i: Installation) { return; }
     async function recover(i: Installation) {
-      i.pending = true; put("installations", i.generation, i);
-      try {
-        await own(i); await remote(i);
-        const ref = `refs/agentorg-recovery/${i.remote}/${randomUUID()}`;
-        await git(skill(i.skill).path, "fetch", "--no-tags", "--no-prune", "--no-prune-tags", "--recurse-submodules=no", "--no-write-fetch-head", i.remote,
-          `refs/heads/*:${ref}/heads/*`, `HEAD:${ref}/HEAD`);
-        i.pending = false; delete i.error;
-        host.emit("skills.recovered", { skill: i.skill, path: i.path, ref }, i.agentId);
-      } catch (error) { i.error = (error as Error).message; report(error, i.agentId); }
+      // Downgrade/cwd-change moves preserve the complete local worktree in the
+      // plugin-owned recovery directory. Network recovery is deliberately absent.
+      i.pending = false; delete i.error;
       put("installations", i.generation, i);
     }
     async function move(action: Action, forward: boolean) {

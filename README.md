@@ -1,5 +1,13 @@
 # @agentorg/plugin-skills
 
+## Skill checkout policy (v1 simplification)
+
+Every agent installation is now a pinned, detached, depth-one clone of the canonical checkout's current commit. Local Git sources use `--no-local --no-hardlinks` so Git cannot silently ignore `--depth` or use alternates. The installer verifies that the result is shallow, contains exactly one reachable commit, and has no object alternates. The per-agent clone's `origin` is removed; no remote is configured to the canonical repository and the plugin never pushes or fetches agent commits. An agent can edit and commit locally. Those changes stay in that isolated worktree and are not synchronized automatically.
+
+A newly created agent receives the current canonical `HEAD`; existing agents remain pinned and do not drift. Refreshing an installation is an explicit owner/agent action only after validating that its worktree is clean; this release does not offer an update endpoint and refuses to overwrite an existing installation. A dirty worktree must be retained/copied by its owner before any future refresh. Downgrades and cwd changes retain managed installations under the existing `.agents/agentorg-recovery` location. Import does not modify the original local source; local non-Git inputs are copied and initialized, local Git inputs are imported as managed copies, and HTTPS imports are cloned into managed storage.
+
+The current catalog path/database migration remains backward-compatible and nondestructive. This release's legacy catalog layout remains in place; moving canonical repositories into `<dataDir>/skills/<name>` requires a separate journaled migration of existing hashed catalog entries and must not be approximated by moving paths during startup. Do not manually relocate the catalog or its metadata database.
+
 Trusted, separately loadable AgentOrg API-v1 plugin. Requires Bun, Git and the generic API-v1 extension contract in this checkout. Local path import requires Linux with `/proc/self/fd`. TUI and Pi integration are not validated by the socket-to-ACP tests; container workspace identity is unsupported.
 
 ```sh
