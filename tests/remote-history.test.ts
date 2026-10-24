@@ -39,9 +39,11 @@ test("full managed clones and independent installs retain supported history and 
     expect(manifest.some(([ref]) => ref === "refs/tags/v1")).toBe(true);
     expect(await git(managed, "rev-parse", "refs/tags/orphan-v0^{commit}")).toBe(tagOnly);
     await cloneManagedRepository(managed, install, 60_000);
-    expect(await git(install, "rev-parse", "refs/remotes/origin/alternate")).toBe(first);
-    expect(await git(install, "rev-parse", "refs/tags/v1^{commit}")).toBe(first);
-    expect(await git(install, "rev-parse", "refs/tags/orphan-v0^{commit}")).toBe(tagOnly);
+    expect(await git(install, "rev-parse", "--is-shallow-repository")).toBe("true");
+    expect(await git(install, "rev-list", "--count", "HEAD")).toBe("1");
+    expect(await git(install, "remote")).toBe("");
+    expect(await git(install, "show-ref", "--heads")).not.toContain("alternate");
+    expect(await git(install, "symbolic-ref", "-q", "HEAD").catch(() => "")).toBe("");
     expect(await readFile(await (await import("node:fs/promises")).realpath(join(install, "scripts", "current.txt")), "utf8")).toBe("second\n");
     await rm(bare, { recursive: true, force: true });
     expect(await git(managed, "show", "refs/heads/alternate:history.txt")).toBe("first");
