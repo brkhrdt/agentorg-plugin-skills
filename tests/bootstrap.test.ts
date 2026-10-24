@@ -91,7 +91,8 @@ const waitFor = async (check: () => Promise<boolean>, timeoutMs = 5_000) => {
     await pause(20);
   }
 };
-const databasePath = async (root: string) => join(root, "home", ".agentorg", "skills",
+const databasePath = async (root: string) => join(root, "data", "skills.sqlite");
+const legacyDatabasePath = async (root: string) => join(root, "home", ".agentorg", "skills",
   createHash("sha256").update(await realpath(join(root, "data"))).digest("hex"), "skills.sqlite");
 
 test.serial("a status read schedules reconciliation after a missed settings event", async () => {
@@ -184,8 +185,7 @@ test.serial("invalid configured checkout remains unregistered with an actionable
 test.serial("catalog write failures report source and retain the checkout and journal", async () => {
   const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
   const plugin = await f.start();
-  const scope = createHash("sha256").update(await realpath(join(f.root, "data"))).digest("hex");
-  const db = new Database(join(f.root, "home", ".agentorg", "skills", scope, "skills.sqlite"));
+  const db = new Database(await databasePath(f.root));
   db.exec("CREATE TRIGGER fail_catalog_insert BEFORE INSERT ON catalog BEGIN SELECT RAISE(ABORT, 'injected catalog write failure'); END;");
   await plugin.initialize([]);
   const listed = await plugin.endpoints.get("skills.list")!({}, caller) as any;
@@ -559,7 +559,7 @@ test.serial("legacy catalog ownership migration exposes configured versus manual
   const f = await fixture({ repositories: [{ name: "alpha", gitUrl: "https://github.com/example/alpha" }], gitTimeoutMs: 60_000, maxCatalogEntries: 4 });
   const betaSource = join(f.root, "source-beta"); await mkdir(betaSource);
   await writeFile(join(betaSource, "SKILL.md"), "---\nname: beta\ndescription: Beta fixture\n---\n# Instructions\n");
-  const dbPath = await databasePath(f.root); await mkdir(join(dbPath, ".."), { recursive: true });
+  const dbPath = await legacyDatabasePath(f.root); await mkdir(join(dbPath, ".."), { recursive: true });
   const legacy = new Database(dbPath);
   legacy.exec("CREATE TABLE meta(version INTEGER NOT NULL); INSERT INTO meta VALUES (1); CREATE TABLE catalog(name TEXT PRIMARY KEY,url TEXT UNIQUE,data TEXT NOT NULL);");
   const record = (name: string, gitUrl: string, path: string) => ({ name, gitUrl, path, description: `${name} fixture`, createdAt: "2025-01-01T00:00:00.000Z" });
