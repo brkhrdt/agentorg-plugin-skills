@@ -39,6 +39,7 @@ test("explicit canonical update fast-forwards from a local Git source; dirty, di
     const updated = await fastForwardCanonicalCheckout({ canonicalPath: canonical, source, expectedHead: first });
     expect(updated.head).toBe(git(source, "rev-parse", "HEAD"));
     expect(git(canonical, "rev-list", "--count", "HEAD")).toBe("2");
+    expect(git(canonical, "remote", "get-url", "origin")).toBe(source);
     await writeFile(join(source, "extra"), "third\n"); git(source, "commit", "-qam", "third");
     await writeFile(join(canonical, "local"), "dirty\n");
     const cleanHead = git(canonical, "rev-parse", "HEAD");
