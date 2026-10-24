@@ -19,7 +19,12 @@ test("metadata DB migrates transactionally from legacy home to dataDir and remai
     expect(db.query("SELECT data FROM catalog WHERE name='demo'").get()).toEqual({ data: "{\"name\":\"demo\"}" });
     migrateMetadataDatabase(db, oldPath);
     expect(db.query("SELECT count(*) AS n FROM catalog").get()).toEqual({ n: 1 });
+    db.query("UPDATE catalog SET data='edited-after-migration' WHERE name='demo'").run();
     db.close();
+    const restarted = new Database(newPath);
+    expect(() => migrateMetadataDatabase(restarted, oldPath)).not.toThrow();
+    expect(restarted.query("SELECT data FROM catalog WHERE name='demo'").get()).toEqual({ data: "edited-after-migration" });
+    restarted.close();
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
