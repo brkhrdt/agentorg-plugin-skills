@@ -116,6 +116,15 @@ export function migrateCatalog(db: Database): number {
               (local.name !== undefined && (typeof local.name !== "string" || !local.name))) fail(`malformed local import journal ${row.id}`);
           if (journal.path !== local.stagingPath) fail(`local import journal path mismatch ${row.id}`);
         }
+        if (journal.agentUpdate !== undefined) {
+          const update = journal.agentUpdate;
+          if (!update || !["staging", "swapping"].includes(update.phase) || typeof update.generation !== "string" || !update.generation ||
+              typeof update.oldGeneration !== "string" || !update.oldGeneration || typeof update.destination !== "string" || !isAbsolute(update.destination) ||
+              typeof update.backup !== "string" || !isAbsolute(update.backup) ||
+              update.phase === "staging" && (typeof journal.path !== "string" || !isAbsolute(journal.path)) ||
+              update.phase === "swapping" && journal.path !== undefined)
+            fail(`malformed agent-update journal ${row.id}`);
+        }
       }
       if (version < 5) db.query("UPDATE meta SET version=5").run();
     })();

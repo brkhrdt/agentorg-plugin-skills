@@ -10,7 +10,7 @@ import { isDeepStrictEqual } from "node:util";
 export const skillStatesSchema = z.record(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64), z.enum(["unavailable", "available", "installed"]));
 export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
-import { cloneManagedRepository, clonePinnedSkill, cloneRemoteRepository, gitWithTimeout, managedHead, normalizeRemoteBranches, validateRemoteHistory, revertCleanRepository } from "./git.ts";
+import { cloneManagedRepository, clonePinnedSkill, cloneRemoteRepository, gitWithTimeout, managedHead, normalizeRemoteBranches, validateRemoteHistory } from "./git.ts";
 import { canonicalSkillRepositoryUrl, skillsServerSettings } from "./config.ts";
 import { migrateCatalog, notifyAfterCatalogCommit, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
 import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
@@ -18,13 +18,13 @@ import { LocalSkillImporter } from "./local-import.ts";
 import { localSkillImportSupported } from "./local-source.ts";
 import { classifyRepositoryLocator } from "./source-locator.ts";
 import { isTerminalOperation } from "./operation-status.ts";
-import { migrateCanonicalCheckout, fastForwardCanonicalCheckout, rollbackCanonicalUpdate } from "./canonical-store.ts";
+import { migrateCanonicalCheckout, fastForwardCanonicalCheckout, prepareCanonicalRevert } from "./canonical-store.ts";
 import { migrateMetadataDatabase } from "./metadata-store.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
 interface Action { generation: string; from: string; to: string; old: boolean }
-interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string }; source?: { name?: string; source: SkillSource }; localImport?: { phase: "intent" | "copying" | "copied" | "initialized"; sourcePath: string; stagingPath: string; name?: string } }
+interface Journal { id: string; agentId: string; revision: number; actions: Action[]; path?: string; repository?: { name: string; gitUrl: string }; source?: { name?: string; source: SkillSource }; localImport?: { phase: "intent" | "copying" | "copied" | "initialized"; sourcePath: string; stagingPath: string; name?: string }; agentUpdate?: { phase: "staging" | "swapping"; generation: string; oldGeneration: string; destination: string; backup: string } }
 type RepositoryOrigin = "manual" | "configured";
 type RepositoryStatus = "pending" | "ready" | "retired" | "error";
 interface RepositoryRecordState { name: string; gitUrl: string; origin: RepositoryOrigin; status: RepositoryStatus; error?: string; attempts: number; fingerprint: string; failureClass?: "transient" | "permanent" }
@@ -109,6 +109,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       CREATE TABLE IF NOT EXISTS reconciliation(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);`);
     migrateMetadataDatabase(db, legacyDbPath);
     migrateCatalog(db);
+    // Host settings must be registered before reads (including startup migration).
+    host.registerServerSettings(skillsServerSettings(options.allowLocalSources ?? false));
     const rows = <T>(table: string): T[] => db.query(`SELECT data FROM ${table} ORDER BY rowid`).all().map((r: any) => JSON.parse(r.data));
     const put = (table: "installations" | "journal", id: string, value: unknown) => db.query(`INSERT OR REPLACE INTO ${table} VALUES (?,?)`).run(id, JSON.stringify(value));
     const dropJournal = (id: string) => db.query("DELETE FROM journal WHERE id=?").run(id);
@@ -172,6 +174,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     };
     let shuttingDown = false;
     const deletingCatalog = new Set<string>();
+    const updatingAgents = new Set<string>();
     let reconciliationWorker: Promise<void> | undefined;
     let fullReconciliationRequest: { reason: string; resetRetries: boolean; allowPermanentRetry: boolean } | undefined;
     let activePermanentRetryPermission = false;
@@ -378,7 +381,6 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         return { ...rest, extensions: { ...extensions, skills: legacy } };
       },
     });
-    host.registerServerSettings(skillsServerSettings(options.allowLocalSources ?? false));
     migrateRepositoryOwnership();
     host.registerCapability("skills", {
       settingsNamespace: "skills", serverSettingsNamespace: "skills",
@@ -401,6 +403,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       return { ...settings, cwd };
     }
     host.beforeMutation(async context => {
+      if (updatingAgents.has(context.agent.id)) fail("Agent skill update is in progress", "SKILL_UPDATE_IN_PROGRESS");
       if (!["agent.create", "agent.modify"].includes(context.method)) return;
       const settings = await uniqueCwd(context.agent.settings, context.agent, context.agents);
       const selectionSupplied = context.settingsPatch?.extensions?.skills !== undefined;
@@ -425,6 +428,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       return { ...change, settings, updates };
     });
     host.prepareLaunch(async context => {
+      if (updatingAgents.has(context.agent.id)) fail("Agent skill update is in progress", "SKILL_UPDATE_IN_PROGRESS");
       const snapshot = await host.request("organization.snapshot", {}, server) as { agents: AgentRecord[] };
       await uniqueCwd(context.agent.settings, context.agent, snapshot.agents);
       context.env.AGENTORG_SKILL_FILES = JSON.stringify(await exclusive(() => launchPaths(context.agent)));
@@ -441,6 +445,29 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         await runReconciliation("startup");
         await exclusive(async () => {
         for (const j of rows<Journal>("journal")) {
+          if (j.agentUpdate && j.path) {
+            const staged = installations().find(item => item.generation === j.agentUpdate!.generation);
+            const agent = agents.find(item => item.id === j.agentId);
+            if (staged && agent) {
+              const expected = join(agent.settings.cwd!, ".agents", "agentorg-recovery", scope, j.agentUpdate.generation);
+              if (resolve(expected) !== resolve(j.path) || resolve(staged.path) !== resolve(j.path)) { report(new Error(`Unsafe interrupted agent update path retained: ${j.path}`), j.agentId); continue; }
+              const recoveryParents = [join(agent.settings.cwd!, ".agents"), join(agent.settings.cwd!, ".agents", "agentorg-recovery"), join(agent.settings.cwd!, ".agents", "agentorg-recovery", scope)];
+              let parentMissing = false, unsafeParent = false;
+              for (const parent of recoveryParents) {
+                const info = await lstat(parent).catch((error: any) => error.code === "ENOENT" ? null : Promise.reject(error));
+                if (!info) { parentMissing = true; break; }
+                if (!info.isDirectory() || info.isSymbolicLink()) { report(new Error(`Unsafe interrupted agent update parent retained: ${parent}`), j.agentId); unsafeParent = true; break; }
+              }
+              if (unsafeParent) continue;
+              if (!parentMissing && await exists(j.path)) {
+                const info = await lstat(j.path);
+                if (!info.isDirectory() || info.isSymbolicLink()) { report(new Error(`Unsafe interrupted agent update stage retained: ${j.path}`), j.agentId); continue; }
+                await rm(j.path, { recursive: true, force: true });
+              }
+              db.transaction(() => { db.query("DELETE FROM installations WHERE id=?").run(j.agentUpdate!.generation); dropJournal(j.id); })();
+            } else report(new Error(`Interrupted agent update retained for review: ${j.path}`), j.agentId);
+            continue;
+          }
           if (j.path) {
             report(new Error(j.localImport
               ? `Interrupted local skill import (${j.localImport.phase}) retained at ${j.path}; not registered or recopied`
@@ -840,8 +867,16 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           typeof (params as any).agentId !== "string" || typeof (params as any).name !== "string" || !idPattern.test((params as any).name))
         fail("Expected exactly {agentId, name}", "INVALID_PARAMS");
       const agent = await host.request("agent.get", { agentId: (params as any).agentId }, server) as AgentRecord;
+      if (agent.removedAt) fail("Cannot update skills for a removed agent", "NOT_FOUND");
+      if (updatingAgents.has(agent.id)) fail("Agent skill update is already in progress", "SKILL_UPDATE_IN_PROGRESS");
+      updatingAgents.add(agent.id);
+      try {
       if (states(agent.settings)?.[(params as any).name] !== "installed") fail("Skill is not installed for this agent", "INVALID_PARAMS");
-      const item = skill((params as any).name), dest = join(installRoot(agent.settings.cwd!), item.name);
+      if (!(agent.state === "stopped" || agent.state === "failed")) fail("Stop the agent before refreshing its installed skill", "AGENT_ACTIVE");
+      const snapshot = await host.request("organization.snapshot", {}, server) as { operations?: Array<{ agentId?: string; status?: string }> };
+      if ((snapshot.operations ?? []).some(op => op.agentId === agent.id && op.status && !["completed", "failed", "stopped", "interrupted"].includes(op.status)))
+        fail("Agent has active operations; wait for them to finish before refreshing", "AGENT_ACTIVE");
+      const item = skill((params as any).name), cwd = await realpath(agent.settings.cwd!), dest = join(installRoot(cwd), item.name);
       const old = installations().find(i => i.agentId === agent.id && i.skill === item.name && i.path === dest && i.status === "active");
       if (!old) fail("Installed checkout is not ready", "SKILL_NOT_READY");
       await own(old);
@@ -849,27 +884,51 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const canonicalHead = await managedHead(item.path, effectiveConfig().gitTimeoutMs);
       const currentHead = await managedHead(dest, effectiveConfig().gitTimeoutMs);
       if (canonicalHead === currentHead) return { agentId: agent.id, name: item.name, head: currentHead, updated: false };
-      const generation = randomUUID(), stage = join(agent.settings.cwd!, ".agents", "agentorg-recovery", scope, `update-${generation}`);
-      const backup = join(agent.settings.cwd!, ".agents", "agentorg-recovery", scope, `before-update-${old.generation}`);
+      const generation = randomUUID(), stage = join(cwd, ".agents", "agentorg-recovery", scope, generation);
+      const backup = join(cwd, ".agents", "agentorg-recovery", scope, old.generation);
       await privateDirectory(join(stage, ".."));
+      if (await exists(backup)) fail(`Update backup already exists: ${backup}`, "COLLISION");
       const next: Installation = { generation, agentId: agent.id, skill: item.name, path: stage, remote: `agent-${agent.id}-${generation}`, status: "staged", pending: false };
-      put("installations", generation, next);
-      await clonePinnedSkill(item.path, stage, canonicalHead, effectiveConfig().gitTimeoutMs);
-      await metadata(stage, item.name); await checkoutLimit(stage);
-      await writeFile(join(stage, ".git", "agentorg-skills.json"), JSON.stringify({ scope, generation, agentId: agent.id, skill: item.name }), { mode: 0o600 });
-      await own(next);
+      const journal: Journal = { id: randomUUID(), agentId: agent.id, revision: agent.revision, actions: [], path: stage,
+        agentUpdate: { phase: "staging", generation, oldGeneration: old.generation, destination: dest, backup } };
+      put("installations", generation, next); put("journal", journal.id, journal);
       try {
-        if (await exists(backup)) fail(`Update backup already exists: ${backup}`, "COLLISION");
-        await rename(dest, backup);
-        try { await rename(stage, dest); }
-        catch (error) { await rename(backup, dest); throw error; }
-        old.path = backup; old.status = "retained"; put("installations", old.generation, old);
-        next.path = dest; next.status = "active"; put("installations", generation, next);
+        await clonePinnedSkill(item.path, stage, canonicalHead, effectiveConfig().gitTimeoutMs);
+        await metadata(stage, item.name); await checkoutLimit(stage);
+        await writeFile(join(stage, ".git", "agentorg-skills.json"), JSON.stringify({ scope, generation, agentId: agent.id, skill: item.name }), { mode: 0o600 });
+        await own(next);
+        const oldAction: Action = { generation: old.generation, from: dest, to: backup, old: true };
+        const newAction: Action = { generation, from: stage, to: dest, old: false };
+        const latestAgent = await host.request("agent.get", { agentId: agent.id }, server) as AgentRecord;
+        if (latestAgent.revision !== agent.revision || !(latestAgent.state === "stopped" || latestAgent.state === "failed")) fail("Agent changed or restarted during update", "CONFLICT");
+        if (await realpath(dest) !== dest || await git(dest, "rev-parse", "HEAD") !== currentHead || await git(dest, "status", "--porcelain", "--untracked-files=all"))
+          fail("Agent checkout changed during update; refusing to replace it", "CONFLICT");
+        if (await managedHead(item.path, effectiveConfig().gitTimeoutMs) !== canonicalHead) fail("Canonical skill changed during agent update", "CONFLICT");
+        journal.path = undefined; journal.actions = [oldAction, newAction]; journal.agentUpdate!.phase = "swapping"; put("journal", journal.id, journal);
+        for (const action of journal.actions) {
+          const record = installation(action.generation);
+          await own(record, action.from);
+          await privateDirectory(join(action.to, ".."));
+          await rename(action.from, action.to);
+        }
+        old.path = backup; old.status = "retained";
+        next.path = dest; next.status = "active";
+        db.transaction(() => {
+          db.query("UPDATE installations SET data=? WHERE id=?").run(JSON.stringify(old), old.generation);
+          db.query("UPDATE installations SET data=? WHERE id=?").run(JSON.stringify(next), generation);
+          dropJournal(journal.id);
+        })();
+        return { agentId: agent.id, name: item.name, head: canonicalHead, updated: true, retainedPrevious: backup };
       } catch (error) {
-        // Keep staging/backup artifacts for recovery; never remove agent data.
+        if (journal.path) {
+          try {
+            if (await exists(stage)) await rm(stage, { recursive: true, force: true });
+            db.transaction(() => { db.query("DELETE FROM installations WHERE id=?").run(generation); dropJournal(journal.id); })();
+          } catch (cleanupError) { report(cleanupError, agent.id); }
+        }
         throw error;
       }
-      return { agentId: agent.id, name: item.name, head: canonicalHead, updated: true, retainedPrevious: backup };
+      } finally { updatingAgents.delete(agent.id); }
     }));
     host.registerEndpoint("skills.updateRepository", (params, caller) => exclusive(() => catalogPublish(async () => {
       clientOnly(caller);
@@ -885,17 +944,14 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         upstream = await realpath(item.source.path);
         if (await git(upstream, "rev-parse", "--show-toplevel") !== upstream) fail("Local source is not a Git repository root", "UNSUPPORTED_SOURCE");
       }
-      const result = await fastForwardCanonicalCheckout({ canonicalPath: item.path, source: upstream, expectedHead: (params as any).expectedHead, timeoutMs: effectiveConfig().gitTimeoutMs });
-      try {
+      let updated: Skill | undefined;
+      const result = await fastForwardCanonicalCheckout({ canonicalPath: item.path, source: upstream, expectedHead: (params as any).expectedHead, timeoutMs: effectiveConfig().gitTimeoutMs }, async candidate => {
         const description = await metadata(item.path, item.name);
-        const updated = { ...item, description, history: { ...item.history, selectedCommit: result.head } };
+        updated = { ...item, description, history: { ...item.history, selectedCommit: candidate.head } };
         db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=?").run(JSON.stringify(updated), item.name))();
-        host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: result.head });
-        return { skill: exposedSkill(updated), head: result.head, retainedPreviousRepository: result.backup, installedAgentsUnchanged: true };
-      } catch (error) {
-        await rollbackCanonicalUpdate(item.path, result.backup);
-        throw error;
-      }
+      });
+      notifyAfterCatalogCommit(() => host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: result.head }), error => report(error));
+      return { skill: exposedSkill(updated!), head: result.head, retainedPreviousRepository: result.backup, installedAgentsUnchanged: true };
     })));
     host.registerEndpoint("skills.revertRepository", (params, caller) => exclusive(async () => {
       clientOnly(caller);
@@ -906,13 +962,16 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const item = skill((params as any).name);
       if (item.path !== join(canonicalRoot, item.name) || !isDescendant(canonicalRoot, await realpath(item.path)))
         fail("Skill is not in the canonical owner-controlled store", "FORBIDDEN");
-      const head = await revertCleanRepository(item.path, (params as any).expectedHead, (params as any).targetCommit, effectiveConfig().gitTimeoutMs);
-      const description = await metadata(item.path, item.name);
-      const updated = { ...item, description, history: { ...item.history, selectedCommit: head } };
-      db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=?").run(JSON.stringify(updated), item.name))();
-      host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: head });
+      let updated: Skill | undefined;
+      const reverted = await prepareCanonicalRevert({ canonicalPath: item.path, expectedHead: (params as any).expectedHead,
+        targetCommit: (params as any).targetCommit, timeoutMs: effectiveConfig().gitTimeoutMs }, async candidate => {
+        const description = await metadata(item.path, item.name);
+        updated = { ...item, description, history: { ...item.history, selectedCommit: candidate.head } };
+        db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=?").run(JSON.stringify(updated), item.name))();
+      });
+      notifyAfterCatalogCommit(() => host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: reverted.head }), error => report(error));
       // Existing agent installs intentionally remain pinned until an explicit clean update.
-      return { skill: exposedSkill(updated), head, installedAgentsUnchanged: true };
+      return { skill: exposedSkill(updated!), head: reverted.head, retainedPreviousRepository: reverted.backup, installedAgentsUnchanged: true };
     }));
     host.registerEndpoint("skills.registerRepository", async (params, caller) => {
       clientOnly(caller);

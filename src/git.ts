@@ -147,7 +147,7 @@ async function checkCheckoutStatus(path: string, timeoutMs: number) {
  * clones otherwise ignore --depth and can share objects through alternates. */
 export async function clonePinnedSkill(source: string, destination: string, commit: string, timeoutMs = 60_000): Promise<void> {
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Invalid canonical skill commit");
-  await safeSnapshotGit(dirname(destination), timeoutMs, "clone", "--depth=1", "--no-checkout", "--no-hardlinks", "--no-local", "--no-single-branch", "--", source, destination);
+  await safeSnapshotGit(dirname(destination), timeoutMs, "clone", "--depth=1", "--no-tags", "--no-checkout", "--no-hardlinks", "--no-local", "--single-branch", "--", source, destination);
   await configureSnapshotWorktree(destination, timeoutMs, false);
   await snapshotGit(destination, timeoutMs, "checkout", "--detach", "--force", commit);
   await snapshotGit(destination, timeoutMs, "remote", "remove", "origin").catch(() => "");
@@ -383,14 +383,10 @@ export function git(cwd: string, ...args: string[]): Promise<string> {
   return gitWithTimeout(cwd, 60_000, ...args);
 }
 
-/** Explicit owner revert. Never discards dirty/untracked canonical work. */
-export async function revertCleanRepository(path: string, expectedHead: string, targetCommit: string, timeoutMs = 60_000): Promise<string> {
-  if (!/^[0-9a-f]{40}$/.test(expectedHead) || !/^[0-9a-f]{40}$/.test(targetCommit)) throw new Error("Commit IDs must be full SHA-1 object IDs");
-  const head = await gitWithTimeout(path, timeoutMs, "rev-parse", "HEAD");
-  if (head !== expectedHead) throw Object.assign(new Error("Canonical HEAD changed; refresh before reverting"), { code: "CONFLICT" });
-  if (await gitWithTimeout(path, timeoutMs, "status", "--porcelain", "--untracked-files=all")) throw Object.assign(new Error("Canonical worktree is dirty; commit or preserve changes before reverting"), { code: "DIRTY_WORKTREE" });
-  const target = await gitWithTimeout(path, timeoutMs, "rev-parse", "--verify", `${targetCommit}^{commit}`);
-  if (target !== targetCommit) throw new Error("Revert target is not a commit in canonical history");
-  await gitWithTimeout(path, timeoutMs, "reset", "--hard", targetCommit);
-  return targetCommit;
+/** Validate checked-out Git index/tree structure, symlink confinement and clean status. */
+export async function validateManagedCheckout(path: string, timeoutMs = 60_000): Promise<void> {
+  await validateSnapshotIndex(path, timeoutMs);
+  const head = await snapshotGit(path, timeoutMs, "rev-parse", "HEAD");
+  await validateSelectedTreeNoGitlinks(path, head, timeoutMs);
+  await checkCheckoutStatus(path, timeoutMs);
 }

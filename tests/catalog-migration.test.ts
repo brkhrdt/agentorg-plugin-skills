@@ -76,6 +76,24 @@ test("malformed or mismatched journals fail before recovery can address another 
   }
 });
 
+test("agent update journals validate staging/swap phases and preserve recovery addressing", () => {
+  const valid = (phase: "staging" | "swapping") => ({ id: "update-1", agentId: "agent-1", revision: 4, actions: phase === "swapping" ? [
+    { generation: "old-gen", from: "/workspace/.agents/skills/demo", to: "/workspace/.agents/agentorg-recovery/scope/old-gen", old: true },
+    { generation: "new-gen", from: "/workspace/.agents/agentorg-recovery/scope/new-gen", to: "/workspace/.agents/skills/demo", old: false },
+  ] : [], ...(phase === "staging" ? { path: "/workspace/.agents/agentorg-recovery/scope/new-gen" } : {}),
+  agentUpdate: { phase, generation: "new-gen", oldGeneration: "old-gen", destination: "/workspace/.agents/skills/demo", backup: "/workspace/.agents/agentorg-recovery/scope/old-gen" } });
+  for (const journal of [valid("staging"), valid("swapping")]) {
+    const db = database(5);
+    db.query("INSERT INTO journal VALUES (?,?)").run(journal.id, JSON.stringify(journal));
+    try { expect(migrateCatalog(db)).toBe(5); }
+    finally { db.close(); }
+  }
+  const invalid = valid("staging"); invalid.path = "relative-stage";
+  const db = database(5); db.query("INSERT INTO journal VALUES (?,?)").run(invalid.id, JSON.stringify(invalid));
+  try { expect(() => migrateCatalog(db)).toThrow(/journal/); }
+  finally { db.close(); }
+});
+
 test("failed migration rolls back earlier catalog rewrites and schema version", () => {
   const first = { name: "a", gitUrl: "https://github.com/example/a", description: "a", createdAt: "today", path: "/managed/a" };
   const db = database(2, [

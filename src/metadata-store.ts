@@ -4,9 +4,15 @@ import { Database } from "bun:sqlite";
  * The source is opened read-only and never removed. Existing active destination
  * data is never merged implicitly. */
 export function migrateMetadataDatabase(destination: Database, legacyPath: string): void {
-  let legacy: Database;
+  destination.exec("CREATE TABLE IF NOT EXISTS migration_state(name TEXT PRIMARY KEY, completed_at TEXT NOT NULL, source TEXT)");
+  if (destination.query("SELECT 1 FROM migration_state WHERE name='legacy-plugin-home-v1'").get()) return;
+  let legacy: Database | undefined;
   try { legacy = new Database(legacyPath, { readonly: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "SQLITE_CANTOPEN") return; throw error; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "SQLITE_CANTOPEN") throw error;
+    destination.query("INSERT INTO migration_state VALUES ('legacy-plugin-home-v1', ?, NULL)").run(new Date().toISOString());
+    return;
+  }
   try {
     const tables = new Set((legacy.query("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(row => row.name));
     if (!tables.has("catalog") || !tables.has("meta")) throw new Error("Legacy skills metadata database is incomplete");
@@ -30,7 +36,10 @@ export function migrateMetadataDatabase(destination: Database, legacyPath: strin
         const current = destination.query(`SELECT ${cols.join(",")} FROM ${table}`).all();
         return JSON.stringify(current) === JSON.stringify(oldRows.get(table) ?? []);
       });
-      if (same) return;
+      if (same) {
+        destination.query("INSERT INTO migration_state VALUES ('legacy-plugin-home-v1', ?, ?)").run(new Date().toISOString(), legacyPath);
+        return;
+      }
       throw new Error("Refusing to merge legacy skills metadata into a nonempty dataDir database");
     }
     destination.transaction(() => {
@@ -41,6 +50,7 @@ export function migrateMetadataDatabase(destination: Database, legacyPath: strin
         const statement = destination.query(`INSERT INTO ${table} (${cols.join(",")}) VALUES (${placeholders})`);
         for (const row of oldRows.get(table) ?? []) statement.run(...cols.map(column => row[column]));
       }
+      destination.query("INSERT INTO migration_state VALUES ('legacy-plugin-home-v1', ?, ?)").run(new Date().toISOString(), legacyPath);
     })();
   } finally { legacy.close(); }
 }
