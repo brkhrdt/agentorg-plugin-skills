@@ -116,6 +116,17 @@ export function migrateCatalog(db: Database): number {
               (local.name !== undefined && (typeof local.name !== "string" || !local.name))) fail(`malformed local import journal ${row.id}`);
           if (journal.path !== local.stagingPath) fail(`local import journal path mismatch ${row.id}`);
         }
+        if (journal.canonicalPublication !== undefined) {
+          const publication = journal.canonicalPublication;
+          if (!publication || publication.phase !== "prepared" || publication.operationId !== journal.id ||
+              typeof publication.name !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(publication.name) ||
+              ![publication.canonicalPath, publication.stage, publication.backup].every(value => typeof value === "string" && isAbsolute(value)) ||
+              typeof publication.oldHead !== "string" || !/^[0-9a-f]{40}$/.test(publication.oldHead) ||
+              typeof publication.head !== "string" || !/^[0-9a-f]{40}$/.test(publication.head) ||
+              !publication.oldCatalog || publication.oldCatalog.name !== publication.name ||
+              !publication.newCatalog || publication.newCatalog.name !== publication.name)
+            fail(`malformed canonical-publication journal ${row.id}`);
+        }
         if (journal.agentUpdate !== undefined) {
           const update = journal.agentUpdate;
           if (!update || !["staging", "swapping"].includes(update.phase) || typeof update.generation !== "string" || !update.generation ||

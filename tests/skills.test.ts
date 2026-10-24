@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, writeFile, symlink, rm, readdir, rename } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, symlink, rm, readdir, rename, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -66,6 +66,7 @@ test("explicit agent refresh is clean-only, stopped-agent-only, journaled and ke
   expect(created.status).toBe("completed");
   const agent = created.result as AgentRecord;
   const canonical = skill.path!;
+  await git(canonical, "config", "user.name", "Refresh Test"); await git(canonical, "config", "user.email", "refresh@example.invalid");
   const initial = await git(canonical, "rev-parse", "HEAD");
   await writeFile(join(canonical, "owner-change.txt"), "new canonical revision\n");
   await git(canonical, "add", "."); await git(canonical, "commit", "-m", "owner update");
@@ -78,12 +79,16 @@ test("explicit agent refresh is clean-only, stopped-agent-only, journaled and ke
   expect(await git(installed, "rev-parse", "--is-shallow-repository")).toBe("true");
   expect(await git(installed, "remote")).toBe("");
   expect(await readFile(join(installed, "owner-change.txt"), "utf8")).toBe("new canonical revision\n");
-  expect(await Bun.file(updated.retainedPrevious).exists()).toBe(true);
+  expect((await stat(updated.retainedPrevious)).isDirectory()).toBe(true);
   expect(await git(updated.retainedPrevious, "rev-parse", "HEAD")).toBe(initial);
   await writeFile(join(installed, "local-dirty.txt"), "preserve me\n");
   await writeFile(join(canonical, "another.txt"), "next revision\n"); await git(canonical, "add", "."); await git(canonical, "commit", "-m", "next owner update");
   await expect(f.client.request("skills.updateAgent", { agentId: agent.id, name: "refreshable" })).rejects.toMatchObject({ code: "DIRTY_WORKTREE" });
   expect(await readFile(join(installed, "local-dirty.txt"), "utf8")).toBe("preserve me\n");
+  await rm(join(installed, "local-dirty.txt"));
+  const removed = await f.client.request<any>("skills.deleteRepository", { name: "refreshable", source: { kind: "git", gitUrl: skill.gitUrl }, expectedStatus: "ready" });
+  expect(removed.status).toBe("deleted");
+  await expect(stat(installed)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 test("catalog validation, duplicate/source policy, durable catalog and scoped capability", async () => {

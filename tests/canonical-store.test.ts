@@ -94,15 +94,32 @@ test("owner revert is explicit, compare-and-swap fenced, and refuses dirty workt
     const invalid = git(repo, "rev-parse", "HEAD");
     await writeFile(join(repo, "SKILL.md"), "---\nname: sample\ndescription: fixture\n---\nrestored\n"); git(repo, "commit", "-qam", "restored identity");
     const current = git(repo, "rev-parse", "HEAD");
+    git(repo, "config", "--local", "remote.origin.url", "/upstream/demo.git");
+    git(repo, "config", "--local", "--add", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    git(repo, "config", "--local", "remote.backup.url", "/backup/demo.git");
+    const remotesBefore = git(repo, "config", "--local", "--get-regexp", "^remote\\.");
     await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: current, targetCommit: invalid })).rejects.toThrow(/name|identity/i);
     expect(git(repo, "rev-parse", "HEAD")).toBe(current);
     const reverted = await prepareCanonicalRevert({ canonicalPath: repo, expectedHead: current, targetCommit: first });
     expect(reverted.head).toBe(first);
+    expect(git(repo, "config", "--local", "--get-regexp", "^remote\\.")).toBe(remotesBefore); // Preserve remotes exactly; never retain the candidate's self-origin.
     expect(await readFile(join(repo, "SKILL.md"), "utf8")).toContain("one");
     await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: current, targetCommit: first })).rejects.toMatchObject({ code: "CONFLICT" });
     await writeFile(join(repo, "untracked"), "keep\n");
     await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: first, targetCommit: invalid })).rejects.toMatchObject({ code: "DIRTY_WORKTREE" });
     expect(await readFile(join(repo, "untracked"), "utf8")).toBe("keep\n");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("owner revert preserves the absence of upstream remotes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skills-revert-no-remotes-")), repo = join(root, "skills", "sample");
+  try {
+    await mkdir(repo, { recursive: true }); git(repo, "init", "-q"); git(repo, "config", "user.email", "x@y.invalid"); git(repo, "config", "user.name", "x");
+    await writeFile(join(repo, "SKILL.md"), "---\nname: sample\ndescription: fixture\n---\none\n"); git(repo, "add", "."); git(repo, "commit", "-qm", "one");
+    const first = git(repo, "rev-parse", "HEAD"); await writeFile(join(repo, "content"), "two\n"); git(repo, "add", "."); git(repo, "commit", "-qm", "two");
+    const current = git(repo, "rev-parse", "HEAD"); expect(git(repo, "remote")).toBe("");
+    await prepareCanonicalRevert({ canonicalPath: repo, expectedHead: current, targetCommit: first });
+    expect(git(repo, "remote")).toBe("");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
