@@ -15,7 +15,7 @@ import { clonePinnedSkill, git } from "../src/git.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
-async function fixture(order = false) {
+async function fixture(order = false, additionalPlugins: ServerPlugin[] = []) {
   const dir = await mkdtemp(join(tmpdir(), "org-skills-"));
   const workspace = join(dir, "work");
   await mkdir(join(workspace, "child", "leaf"), { recursive: true });
@@ -28,7 +28,7 @@ async function fixture(order = false) {
     } });
   } };
   const plugin = () => createSkillsPlugin({ home: dir, allowLocalSources: true });
-  const plugins = () => [harness, ...(order ? [plugin(), cwdPlugin] : [cwdPlugin, plugin()])];
+  const plugins = () => [...additionalPlugins, harness, ...(order ? [plugin(), cwdPlugin] : [cwdPlugin, plugin()])];
   const options = { dataDir: join(dir, "data"), socketPath: join(dir, "data/server.sock"), plugins: plugins(), limits: { stopTimeoutMs: 2000, killTimeoutMs: 50 } };
   let server = await OrganizationServer.start(options);
   let client = await OrganizationClient.connect(server.organization.socketPath);
@@ -53,7 +53,7 @@ async function fixture(order = false) {
     get client() { return client; }, get server() { return server; },
     async restart(enabled = true) {
       client.close(); await server.close();
-      server = await OrganizationServer.start({ ...options, plugins: enabled ? plugins() : [harness, cwdPlugin] });
+      server = await OrganizationServer.start({ ...options, plugins: enabled ? plugins() : [...additionalPlugins, harness, cwdPlugin] });
       client = await OrganizationClient.connect(server.organization.socketPath);
     },
   };
@@ -131,6 +131,53 @@ test.each(["before-renames", "after-old-rename", "after-both-renames"] as const)
   expect(reopened.query("SELECT id FROM journal WHERE id=?").get(journalId)).toBeNull(); reopened.close();
   await f.restart();
   expect(await git(dest, "rev-parse", "HEAD")).toBe(newHead);
+});
+
+test.each(["update", "revert"] as const)("catalog deletion and owner %s serialize without deadlock while an assigned agent is modified", async ownerAction => {
+  let releaseModify!: () => void, enteredModify!: () => void, shouldBlock = false;
+  const blocked = new Promise<void>(resolve => { releaseModify = resolve; });
+  const entered = new Promise<void>(resolve => { enteredModify = resolve; });
+  const blocker: ServerPlugin = { apiVersion: 1, name: "modify-gate", setup(host) {
+    host.beforeMutation(async context => {
+      if (shouldBlock && context.method === "agent.modify") { enteredModify(); await blocked; }
+    });
+  } };
+  const f = await fixture(false, [blocker]);
+  const skill = await f.add("concurrent-delete"), cwd = join(f.workspace, "child");
+  const created = await f.create(f.root.id, cwd, { "concurrent-delete": "installed" });
+  const agent = created.result as AgentRecord;
+  await f.run("agent.stop", { agentId: agent.id });
+  const canonical = skill.path!, original = await git(canonical, "rev-parse", "HEAD");
+  await git(canonical, "config", "user.name", "Queue Test"); await git(canonical, "config", "user.email", "queue@example.invalid");
+  if (ownerAction === "revert") {
+    await writeFile(join(canonical, "owner-commit.txt"), "revert target\n"); await git(canonical, "add", "."); await git(canonical, "commit", "-m", "owner commit");
+  } else {
+    const upstream = skill.gitUrl!;
+    await git(upstream, "config", "user.name", "Queue Test"); await git(upstream, "config", "user.email", "queue@example.invalid");
+    await writeFile(join(upstream, "upstream-commit.txt"), "fast forward\n"); await git(upstream, "add", "."); await git(upstream, "commit", "-m", "upstream commit");
+  }
+  const expectedHead = await git(canonical, "rev-parse", "HEAD");
+  shouldBlock = true;
+  let deletion: Promise<any> | undefined;
+  try {
+    deletion = f.client.request<any>("skills.deleteRepository", { name: skill.name, source: { kind: "git", gitUrl: skill.gitUrl }, expectedStatus: "ready" });
+    await Promise.race([entered, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("deletion did not reach agent.modify")), 5000))]);
+    const owner = ownerAction === "update"
+      ? f.client.request<any>("skills.updateRepository", { name: skill.name, expectedHead })
+      : f.client.request<any>("skills.revertRepository", { name: skill.name, expectedHead, targetCommit: original });
+    releaseModify();
+    const [deleted, changed] = await Promise.race([
+      Promise.allSettled([deletion, owner]),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("catalog delete/owner action deadlocked")), 10_000)),
+    ]);
+    expect(deleted.status).toBe("fulfilled");
+    expect(deleted.status === "fulfilled" && deleted.value.status).toBe("deleted");
+    expect(changed.status).toBe("rejected");
+    if (changed.status === "rejected") expect(String(changed.reason)).toMatch(/Unknown skill/);
+    expect((await f.client.request<any>("skills.list")).skills.some((item: Skill) => item.name === skill.name)).toBe(false);
+    await expect(stat(canonical)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: agent.id })).settings)?.[skill.name]).toBeUndefined();
+  } finally { releaseModify(); }
 });
 
 test("catalog validation, duplicate/source policy, durable catalog and scoped capability", async () => {

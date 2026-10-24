@@ -664,7 +664,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     });
     function runLocalImport(input: unknown, pathOptions: { baseDir?: string; home?: string } = {}, unified = false) {
       if (shuttingDown) fail("Skills plugin is shutting down", "SHUTTING_DOWN");
-      const operation = exclusive(() => localImporter.import(input, pathOptions, unified));
+      const operation = localImporter.import(input, pathOptions, unified);
       activeLocalImports.add(operation);
       void operation.finally(() => activeLocalImports.delete(operation)).catch(() => {});
       return operation;
@@ -943,7 +943,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const snapshot = await host.request("organization.snapshot", {}, server) as { operations?: Array<{ agentId?: string; status?: string }> };
       if ((snapshot.operations ?? []).some(op => op.agentId === agent.id && op.status && !["completed", "failed", "stopped", "interrupted"].includes(op.status)))
         fail("Agent has active operations; wait for them to finish before refreshing", "AGENT_ACTIVE");
-      const item = skill((params as any).name), cwd = await realpath(agent.settings.cwd!), dest = join(installRoot(cwd), item.name);
+      const item = skill((params as any).name);
+      if (deletingCatalog.has(item.name)) fail(`Catalog skill ${item.name} is being permanently deleted`, "DELETE_IN_PROGRESS");
+      const cwd = await realpath(agent.settings.cwd!), dest = join(installRoot(cwd), item.name);
       const old = installations().find(i => i.agentId === agent.id && i.skill === item.name && i.path === dest && i.status === "active");
       if (!old) fail("Installed checkout is not ready", "SKILL_NOT_READY");
       await own(old);
@@ -1004,7 +1006,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       } finally { updatingAgents.delete(agent.id); }
     }));
-    host.registerEndpoint("skills.updateRepository", (params, caller) => exclusive(() => catalogPublish(async () => {
+    host.registerEndpoint("skills.updateRepository", (params, caller) => catalogPublish(() => exclusive(async () => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 2 ||
           typeof (params as any).name !== "string" || !idPattern.test((params as any).name) || typeof (params as any).expectedHead !== "string")
@@ -1036,7 +1038,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       notifyAfterCatalogCommit(() => host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: result.head }), error => report(error));
       return { skill: exposedSkill(updated!), head: result.head, retainedPreviousRepository: result.backup, installedAgentsUnchanged: true };
     })));
-    host.registerEndpoint("skills.revertRepository", (params, caller) => exclusive(() => catalogPublish(async () => {
+    host.registerEndpoint("skills.revertRepository", (params, caller) => catalogPublish(() => exclusive(async () => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 3 ||
           typeof (params as any).name !== "string" || !idPattern.test((params as any).name) ||
@@ -1073,7 +1075,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         let url: string;
         try { url = canonicalSkillRepositoryUrl(classified.source); }
         catch (error) { fail((error as Error).message, "INVALID_PARAMS"); }
-        return exclusive(() => registerCatalog(undefined, url, true));
+        return registerCatalog(undefined, url, true);
       }
       if (!supportsLocalImport) fail("Server-side path registration is unsupported on this host", "UNSUPPORTED_SOURCE");
       return runLocalImport(classified.source, { baseDir: localImportBase, home: homedir() }, true).then(exposedSkill);
@@ -1243,7 +1245,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         fail("Local skill import failed; inspect server diagnostics", "INTERNAL");
       }
     });
-    host.registerEndpoint("skills.add", (params, caller) => exclusive(async () => {
+    host.registerEndpoint("skills.add", async (params, caller) => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).some(k => !["name", "gitUrl"].includes(k))) fail("Expected {name, gitUrl}");
       const { name, gitUrl } = params as any;
@@ -1254,7 +1256,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           report(new Error(`Catalog add failed for ${String(name)} (${String(gitUrl)}): ${(error as Error).message}`));
         throw error;
       }
-    }));
+    });
     host.registerTool({ name: "skills_list", description: "List active catalog skills and your skill states. Only available/installed active skills may be delegated; retained selections are shown separately.", inputSchema: { type: "object", additionalProperties: false }, async execute(_args, caller) {
       const agent = await host.request("agent.get", { agentId: caller.id }, caller) as AgentRecord;
       const statesForAgent = states(agent.settings) ?? {};
