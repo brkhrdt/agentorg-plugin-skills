@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile, symlink, rm, readdir, rename, stat
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { OrganizationServer } from "../../agentorg/src/server.ts";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
@@ -10,7 +11,7 @@ import { cwdPlugin } from "@agentorg/plugin-unique-cwd";
 import type { ServerPlugin } from "../../agentorg/src/plugin.ts";
 import type { AgentRecord, Operation } from "../../agentorg/src/types.ts";
 import { createSkillsPlugin, installRoot, states, type Skill } from "../src/index.ts";
-import { git } from "../src/git.ts";
+import { clonePinnedSkill, git } from "../src/git.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -89,6 +90,47 @@ test("explicit agent refresh is clean-only, stopped-agent-only, journaled and ke
   const removed = await f.client.request<any>("skills.deleteRepository", { name: "refreshable", source: { kind: "git", gitUrl: skill.gitUrl }, expectedStatus: "ready" });
   expect(removed.status).toBe("deleted");
   await expect(stat(installed)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test.each(["before-renames", "after-old-rename", "after-both-renames"] as const)("real plugin restart replays agent refresh at %s", async boundary => {
+  const f = await fixture();
+  const skill = await f.add("replayable"), cwd = join(f.workspace, "child");
+  const created = await f.create(f.root.id, cwd, { replayable: "installed" });
+  const child = created.result as AgentRecord;
+  await f.run("agent.stop", { agentId: child.id });
+  const agent = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
+  const dest = join(installRoot(cwd), skill.name), marker = JSON.parse(await readFile(join(dest, ".git", "agentorg-skills.json"), "utf8"));
+  const oldHead = await git(dest, "rev-parse", "HEAD"), canonical = skill.path!;
+  await git(canonical, "config", "user.name", "Refresh Replay Test"); await git(canonical, "config", "user.email", "replay@example.invalid");
+  await writeFile(join(canonical, "update.txt"), "new revision\n"); await git(canonical, "add", "."); await git(canonical, "commit", "-m", "owner update");
+  const newHead = await git(canonical, "rev-parse", "HEAD"), oldPath = join(cwd, ".agents", "agentorg-recovery", marker.scope);
+  const generation = randomUUID(), stage = join(oldPath, generation), backup = join(oldPath, marker.generation);
+  await mkdir(oldPath, { recursive: true }); await clonePinnedSkill(canonical, stage, newHead);
+  await writeFile(join(stage, ".git", "agentorg-skills.json"), JSON.stringify({ scope: marker.scope, generation, agentId: child.id, skill: skill.name }), { mode: 0o600 });
+  const identity = await (await import("node:fs/promises")).lstat(stage);
+  const dbPath = join(canonical, "..", "..", "skills.sqlite"), db = new Database(dbPath);
+  const entries = db.query("SELECT id,data FROM installations").all() as Array<{ id: string; data: string }>;
+  const old = entries.map(row => JSON.parse(row.data)).find((record: any) => record.agentId === child.id && record.skill === skill.name && record.status === "active")!;
+  const next = { generation, agentId: child.id, skill: skill.name, path: stage, remote: `agent-${child.id}-${generation}`, status: "staged", pending: false, fsDevice: identity.dev, fsInode: identity.ino };
+  const journalId = randomUUID(), journal = { id: journalId, agentId: child.id, revision: agent.revision, actions: [
+    { generation: old.generation, from: dest, to: backup, old: true }, { generation, from: stage, to: dest, old: false },
+  ], agentUpdate: { phase: "swapping", generation, oldGeneration: old.generation, destination: dest, backup } };
+  db.transaction(() => {
+    db.query("INSERT INTO installations VALUES (?,?)").run(generation, JSON.stringify(next));
+    db.query("INSERT INTO journal VALUES (?,?)").run(journalId, JSON.stringify(journal));
+  })();
+  if (boundary !== "before-renames") await rename(dest, backup);
+  if (boundary === "after-both-renames") await rename(stage, dest);
+  db.close();
+  await f.restart();
+  expect(await git(dest, "rev-parse", "HEAD")).toBe(newHead);
+  expect(await readFile(join(dest, "update.txt"), "utf8")).toBe("new revision\n");
+  expect(await git(backup, "rev-parse", "HEAD")).toBe(oldHead);
+  const reopened = new Database(dbPath, { readonly: true });
+  expect(JSON.parse((reopened.query("SELECT data FROM installations WHERE id=?").get(generation) as any).data)).toMatchObject({ path: dest, status: "active" });
+  expect(reopened.query("SELECT id FROM journal WHERE id=?").get(journalId)).toBeNull(); reopened.close();
+  await f.restart();
+  expect(await git(dest, "rev-parse", "HEAD")).toBe(newHead);
 });
 
 test("catalog validation, duplicate/source policy, durable catalog and scoped capability", async () => {
