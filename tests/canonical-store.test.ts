@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { migrateCanonicalCheckout } from "../src/canonical-store.ts";
+import { revertCleanRepository } from "../src/git.ts";
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
 test("canonical migration atomically copies and verifies full history while retaining legacy data", async () => {
@@ -24,6 +25,23 @@ test("canonical migration atomically copies and verifies full history while reta
     expect(await readFile(join(source, "extra"), "utf8")).toBe("history\n");
     expect(await migrateCanonicalCheckout({ name: "sample", source, legacyRoot: legacy, canonicalRoot: canonical })).toBe(path);
     await expect(migrateCanonicalCheckout({ name: "../evil", source, legacyRoot: legacy, canonicalRoot: canonical })).rejects.toThrow(/name/i);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("owner revert is explicit, compare-and-swap fenced, and refuses dirty worktrees", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skills-revert-"));
+  try {
+    git(root, "init", "-q"); git(root, "config", "user.email", "x@y.invalid"); git(root, "config", "user.name", "x");
+    await writeFile(join(root, "SKILL.md"), "one\n"); git(root, "add", "."); git(root, "commit", "-qm", "one");
+    const first = git(root, "rev-parse", "HEAD");
+    await writeFile(join(root, "SKILL.md"), "two\n"); git(root, "commit", "-qam", "two");
+    const second = git(root, "rev-parse", "HEAD");
+    expect(await revertCleanRepository(root, second, first)).toBe(first);
+    expect(await readFile(join(root, "SKILL.md"), "utf8")).toBe("one\n");
+    await expect(revertCleanRepository(root, second, first)).rejects.toMatchObject({ code: "CONFLICT" });
+    await writeFile(join(root, "untracked"), "keep\n");
+    await expect(revertCleanRepository(root, first, second)).rejects.toMatchObject({ code: "DIRTY_WORKTREE" });
+    expect(await readFile(join(root, "untracked"), "utf8")).toBe("keep\n");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
