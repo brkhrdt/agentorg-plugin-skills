@@ -1010,6 +1010,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           typeof (params as any).name !== "string" || !idPattern.test((params as any).name) || typeof (params as any).expectedHead !== "string")
         fail("Expected exactly {name, expectedHead}", "INVALID_PARAMS");
       const item = skill((params as any).name);
+      if (deletingCatalog.has(item.name)) fail(`Catalog skill ${item.name} is being permanently deleted`, "DELETE_IN_PROGRESS");
       if (item.path !== join(canonicalRoot, item.name) || !isDescendant(canonicalRoot, await realpath(item.path)))
         fail("Skill is not in the canonical owner-controlled store", "FORBIDDEN");
       let upstream: string;
@@ -1035,13 +1036,14 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       notifyAfterCatalogCommit(() => host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: result.head }), error => report(error));
       return { skill: exposedSkill(updated!), head: result.head, retainedPreviousRepository: result.backup, installedAgentsUnchanged: true };
     })));
-    host.registerEndpoint("skills.revertRepository", (params, caller) => exclusive(async () => {
+    host.registerEndpoint("skills.revertRepository", (params, caller) => exclusive(() => catalogPublish(async () => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 3 ||
           typeof (params as any).name !== "string" || !idPattern.test((params as any).name) ||
           typeof (params as any).expectedHead !== "string" || typeof (params as any).targetCommit !== "string")
         fail("Expected exactly {name, expectedHead, targetCommit}", "INVALID_PARAMS");
       const item = skill((params as any).name);
+      if (deletingCatalog.has(item.name)) fail(`Catalog skill ${item.name} is being permanently deleted`, "DELETE_IN_PROGRESS");
       if (item.path !== join(canonicalRoot, item.name) || !isDescendant(canonicalRoot, await realpath(item.path)))
         fail("Skill is not in the canonical owner-controlled store", "FORBIDDEN");
       let updated: Skill | undefined;
@@ -1062,7 +1064,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       notifyAfterCatalogCommit(() => host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: reverted.head }), error => report(error));
       // Existing agent installs intentionally remain pinned until an explicit clean update.
       return { skill: exposedSkill(updated!), head: reverted.head, retainedPreviousRepository: reverted.backup, installedAgentsUnchanged: true };
-    }));
+    })));
     host.registerEndpoint("skills.registerRepository", async (params, caller) => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params as object).length !== 1 || typeof (params as any).source !== "string") fail("Expected exactly {source}");
@@ -1139,6 +1141,8 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
 
           // Reserve the identity as retired first. A failed/partial cascade is
           // safe to retry and cannot admit new grants while cleanup is pending.
+          const unresolvedPublication = rows<Journal>("journal").find(journal => journal.canonicalPublication?.name === name);
+          if (unresolvedPublication) fail(`Skill ${name} has unresolved canonical publication recovery; resolve it before deletion`, "DELETE_BLOCKED");
           if (!isRetired(current)) {
             const retired = { ...current, catalogStatus: "retired" as const };
             db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=? AND url=?").run(JSON.stringify(retired), name, identity))();

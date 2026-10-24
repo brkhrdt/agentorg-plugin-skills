@@ -40,6 +40,7 @@ test.each(["before-swap", "after-old-rename", "after-both-renames", "after-db-co
   const lock = join(canonicalRoot, ".skills-lock-demo"), ownerPid = ["active-lock", "active-lock-after-old-rename"].includes(boundary) ? process.pid : 99999999;
   await (await import("node:fs/promises")).symlink(`skills-lock-v1:${ownerPid}:${operationId}`, lock);
   let registered = false, shutdown: (() => Promise<void>) | undefined, initialize: ((agents: any[]) => Promise<void>) | undefined;
+  const endpoints = new Map<string, (params: unknown, caller: any) => Promise<unknown>>();
   const host: any = new Proxy({ dataDir, async request(method: string) {
     if (method === "organization.snapshot") return { capabilities: {}, agents: [], operations: [] };
     if (method === "organization.settings.get") return { revision: 0, effective: { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 } };
@@ -47,6 +48,7 @@ test.each(["before-swap", "after-old-rename", "after-both-renames", "after-db-co
   },
     registerServerSettings() { registered = true; }, serverSettings() { if (!registered) throw new Error("settings read before registration"); return { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 }; },
     onInitialize(fn: (agents: any[]) => Promise<void>) { initialize = fn; },
+    registerEndpoint(name: string, fn: (params: unknown, caller: any) => Promise<unknown>) { endpoints.set(name, fn); },
     onShutdown(fn: () => Promise<void>) { shutdown = fn; }, emit() {},
   }, { get(target, key: string) { return key in target ? (target as any)[key] : () => {}; } });
   try {
@@ -61,7 +63,20 @@ test.each(["before-swap", "after-old-rename", "after-both-renames", "after-db-co
     const row = JSON.parse((reopened.query("SELECT data FROM catalog WHERE name='demo'").get() as any).data);
     expect(row.history.selectedCommit).toBe(expectedHead);
     if (boundary === "catalog-mismatch") expect(row.description).toBe("externally edited metadata");
-    expect(reopened.query("SELECT id FROM journal WHERE id=?").get(operationId) === null).toBe(!unresolved); reopened.close();
+    const journalData = reopened.query("SELECT data FROM journal WHERE id=?").get(operationId) as { data: string } | null;
+    expect(journalData === null).toBe(!unresolved); reopened.close();
+    if (boundary === "catalog-mismatch") {
+      const activeFile = await readFile(join(canonical, "SKILL.md"), "utf8"), rowBefore = JSON.stringify(row), journalBefore = journalData?.data;
+      await expect(endpoints.get("skills.deleteRepository")!({ name: "demo", source: sourceValue, expectedStatus: "ready" }, { kind: "client", id: "test" }))
+        .rejects.toMatchObject({ code: "DELETE_BLOCKED" });
+      const after = new Database(join(dataDir, "skills.sqlite"), { readonly: true });
+      expect((after.query("SELECT data FROM catalog WHERE name='demo'").get() as any).data).toBe(rowBefore);
+      expect((after.query("SELECT data FROM journal WHERE id=?").get(operationId) as any).data).toBe(journalBefore);
+      after.close();
+      expect(await readFile(join(canonical, "SKILL.md"), "utf8")).toBe(activeFile);
+      expect((await stat(canonical)).isDirectory()).toBe(true);
+      expect((await stat(stage)).isDirectory()).toBe(true);
+    }
     if (unresolved) {
       expect((await lstat(lock)).isSymbolicLink()).toBe(true);
       expect((await stat(stage)).isDirectory()).toBe(true);
