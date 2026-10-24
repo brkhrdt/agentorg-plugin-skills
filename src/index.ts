@@ -18,7 +18,8 @@ import { LocalSkillImporter } from "./local-import.ts";
 import { localSkillImportSupported } from "./local-source.ts";
 import { classifyRepositoryLocator } from "./source-locator.ts";
 import { isTerminalOperation } from "./operation-status.ts";
-import { migrateCanonicalCheckout } from "./canonical-store.ts";
+import { migrateCanonicalCheckout, fastForwardCanonicalCheckout, rollbackCanonicalUpdate } from "./canonical-store.ts";
+import { migrateMetadataDatabase } from "./metadata-store.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
@@ -90,11 +91,14 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     // canonical Git repositories live under the server's data directory.
     const legacyRoot = join(await realpath(options.home ?? homedir()), ".agentorg", "skills", scope);
     await privateDirectory(legacyRoot);
-    const canonicalRoot = join(await realpath(host.dataDir), "skills");
+    const dataRoot = await realpath(host.dataDir);
+    const canonicalRoot = join(dataRoot, "skills");
     await privateDirectory(canonicalRoot);
     const root = legacyRoot;
-    const db = new Database(join(root, "skills.sqlite"), { create: true });
-    await chmod(join(root, "skills.sqlite"), 0o600);
+    const legacyDbPath = join(legacyRoot, "skills.sqlite");
+    const dbPath = join(dataRoot, "skills.sqlite");
+    const db = new Database(dbPath, { create: true });
+    await chmod(dbPath, 0o600);
     db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS meta(version INTEGER NOT NULL);
       INSERT INTO meta SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM meta);
@@ -103,6 +107,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS repository_state(name TEXT NOT NULL, url TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(name,url));
       CREATE TABLE IF NOT EXISTS reconciliation(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);`);
+    migrateMetadataDatabase(db, legacyDbPath);
     migrateCatalog(db);
     const rows = <T>(table: string): T[] => db.query(`SELECT data FROM ${table} ORDER BY rowid`).all().map((r: any) => JSON.parse(r.data));
     const put = (table: "installations" | "journal", id: string, value: unknown) => db.query(`INSERT OR REPLACE INTO ${table} VALUES (?,?)`).run(id, JSON.stringify(value));
@@ -378,7 +383,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     host.registerCapability("skills", {
       settingsNamespace: "skills", serverSettingsNamespace: "skills",
       endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", registerRepository: "skills.registerRepository",
-        retireRepository: "skills.retireRepository", restoreRepository: "skills.restoreRepository", deleteRepository: "skills.deleteRepository", ...(supportsLocalImport ? { addFromPath: "skills.addFromPath" } : {}) },
+        retireRepository: "skills.retireRepository", restoreRepository: "skills.restoreRepository", deleteRepository: "skills.deleteRepository",
+        updateRepository: "skills.updateRepository", revertRepository: "skills.revertRepository", updateAgent: "skills.updateAgent",
+        ...(supportsLocalImport ? { addFromPath: "skills.addFromPath" } : {}) },
       localImport: supportsLocalImport, localImportHistory: supportsLocalImport ? "preserve-v1" : undefined,
       repositoryRegistration: { version: 1, sourceKinds: supportsLocalImport ? ["https", "server-path"] : ["https"], history: "preserve-v1" },
       catalogManagement: { version: 1, semantics: "reversible-retirement-v1", sourceIdentity: "name+source-v1" }, version: 1,
@@ -864,6 +871,32 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       return { agentId: agent.id, name: item.name, head: canonicalHead, updated: true, retainedPrevious: backup };
     }));
+    host.registerEndpoint("skills.updateRepository", (params, caller) => exclusive(() => catalogPublish(async () => {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 2 ||
+          typeof (params as any).name !== "string" || !idPattern.test((params as any).name) || typeof (params as any).expectedHead !== "string")
+        fail("Expected exactly {name, expectedHead}", "INVALID_PARAMS");
+      const item = skill((params as any).name);
+      if (item.path !== join(canonicalRoot, item.name) || !isDescendant(canonicalRoot, await realpath(item.path)))
+        fail("Skill is not in the canonical owner-controlled store", "FORBIDDEN");
+      let upstream: string;
+      if (item.source.kind === "git") upstream = source(item.source.gitUrl, false);
+      else {
+        upstream = await realpath(item.source.path);
+        if (await git(upstream, "rev-parse", "--show-toplevel") !== upstream) fail("Local source is not a Git repository root", "UNSUPPORTED_SOURCE");
+      }
+      const result = await fastForwardCanonicalCheckout({ canonicalPath: item.path, source: upstream, expectedHead: (params as any).expectedHead, timeoutMs: effectiveConfig().gitTimeoutMs });
+      try {
+        const description = await metadata(item.path, item.name);
+        const updated = { ...item, description, history: { ...item.history, selectedCommit: result.head } };
+        db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=?").run(JSON.stringify(updated), item.name))();
+        host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: result.head });
+        return { skill: exposedSkill(updated), head: result.head, retainedPreviousRepository: result.backup, installedAgentsUnchanged: true };
+      } catch (error) {
+        await rollbackCanonicalUpdate(item.path, result.backup);
+        throw error;
+      }
+    })));
     host.registerEndpoint("skills.revertRepository", (params, caller) => exclusive(async () => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 3 ||
