@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile, readFile, rename, lstat, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, rename, lstat, stat, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -88,6 +88,42 @@ test.each(["before-swap", "after-old-rename", "after-both-renames", "after-db-co
     }
     await shutdown?.();
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("shutdown waits for an in-flight Git registration and rejects new registrations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skills-registration-shutdown-")), dataDir = join(root, "data"), home = join(root, "home");
+  const bin = join(root, "bin"), entered = join(root, "clone-entered"), release = join(root, "release-clone");
+  await mkdir(bin); await mkdir(home); await mkdir(dataDir, { recursive: true });
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  await writeFile(join(bin, "git"), `#!/bin/sh\ncase " $* " in *" clone "*) touch "${entered}"; while [ ! -f "${release}" ]; do sleep 0.02; done; exit 1;; esac\nexec "${realGit}" "$@"\n`);
+  await chmod(join(bin, "git"), 0o755);
+  const oldPath = process.env.PATH!, hooks: Array<() => Promise<void>> = [], endpoints = new Map<string, Function>();
+  process.env.PATH = `${bin}:${oldPath}`;
+  const host: any = new Proxy({ dataDir,
+    async request(method: string) { if (method === "organization.snapshot") return { capabilities: {}, agents: [], operations: [] }; throw new Error(method); },
+    registerServerSettings() {}, serverSettings() { return { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 }; },
+    registerEndpoint(name: string, fn: Function) { endpoints.set(name, fn); }, onShutdown(fn: () => Promise<void>) { hooks.push(fn); }, emit() {},
+  }, { get(target, key: string) { return key in target ? (target as any)[key] : () => {}; } });
+  try {
+    await createSkillsPlugin({ home }).setup(host);
+    const caller = { kind: "client", id: "test" };
+    const registration = endpoints.get("skills.add")!({ name: "delayed", gitUrl: "https://github.com/example/delayed" }, caller).then(() => undefined, (error: unknown) => error);
+    const deadline = Date.now() + 5_000;
+    while (!(await Bun.file(entered).exists())) { if (Date.now() > deadline) throw new Error("Git clone did not reach its gate"); await new Promise(resolve => setTimeout(resolve, 20)); }
+    let shutdownDone = false;
+    const shutdown = hooks[0]!().then(() => { shutdownDone = true; });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(shutdownDone).toBe(false);
+    await expect(endpoints.get("skills.add")!({ name: "later", gitUrl: "https://github.com/example/later" }, caller)).rejects.toMatchObject({ code: "SHUTTING_DOWN" });
+    await writeFile(release, "release");
+    const error = await registration;
+    expect(String(error)).toContain("Catalog checkout retained");
+    expect(String(error)).not.toContain("Cannot use a closed database");
+    await shutdown;
+    const reopened = new Database(join(dataDir, "skills.sqlite"), { readonly: true });
+    expect((reopened.query("SELECT count(*) AS count FROM journal").get() as any).count).toBe(1);
+    reopened.close();
+  } finally { process.env.PATH = oldPath; await writeFile(release, "release").catch(() => {}); await rm(root, { recursive: true, force: true }); }
 });
 
 test("server settings are registered before migration reads and plugin can restart against its dataDir DB", async () => {

@@ -584,6 +584,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       });
     });
     async function registerCatalog(expectedName: string | undefined, inputUrl: unknown, unified = false): Promise<Skill> {
+      if (shuttingDown) fail("Skills plugin is shutting down", "SHUTTING_DOWN");
       if (expectedName !== undefined && (typeof expectedName !== "string" || expectedName.length > 64 || !idPattern.test(expectedName))) fail("Invalid skill name");
       const url = source(inputUrl, options.allowLocalSources ?? false);
       const claimName = expectedName ?? `source-${hash(url)}`;
@@ -642,6 +643,17 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
     }
     const activeLocalImports = new Set<Promise<unknown>>();
+    const activeCatalogRegistrations = new Set<Promise<unknown>>();
+    function trackCatalogRegistration<T>(work: () => Promise<T>): Promise<T> {
+      if (shuttingDown) return Promise.reject(Object.assign(new Error("Skills plugin is shutting down"), { code: "SHUTTING_DOWN" }));
+      const operation = Promise.resolve().then(() => {
+        if (shuttingDown) fail("Skills plugin is shutting down", "SHUTTING_DOWN");
+        return work();
+      });
+      activeCatalogRegistrations.add(operation);
+      void operation.finally(() => activeCatalogRegistrations.delete(operation)).catch(() => {});
+      return operation;
+    }
     const localImporter = new LocalSkillImporter({
       centralRoot: canonicalRoot, stagingRoot: join(root, "local-import-staging"), maxCatalogEntries: effectiveConfig().maxCatalogEntries,
       gitTimeoutMs: () => effectiveConfig().gitTimeoutMs,
@@ -1075,7 +1087,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         let url: string;
         try { url = canonicalSkillRepositoryUrl(classified.source); }
         catch (error) { fail((error as Error).message, "INVALID_PARAMS"); }
-        return registerCatalog(undefined, url, true);
+        return trackCatalogRegistration(() => registerCatalog(undefined, url, true));
       }
       if (!supportsLocalImport) fail("Server-side path registration is unsupported on this host", "UNSUPPORTED_SOURCE");
       return runLocalImport(classified.source, { baseDir: localImportBase, home: homedir() }, true).then(exposedSkill);
@@ -1249,7 +1261,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).some(k => !["name", "gitUrl"].includes(k))) fail("Expected {name, gitUrl}");
       const { name, gitUrl } = params as any;
-      try { return await registerCatalog(name, gitUrl); }
+      try { return await trackCatalogRegistration(() => registerCatalog(name, gitUrl)); }
       catch (error) {
         const code = (error as any)?.code;
         if (!['INVALID_PARAMS', 'DUPLICATE', 'LIMIT'].includes(code))
@@ -1293,7 +1305,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       if (sweepTimer) clearInterval(sweepTimer);
       for (const timer of retryTimers.values()) clearTimeout(timer);
       retryTimers.clear();
-      await Promise.allSettled([tail, publishTail, reconciliationWorker, ...activeLocalImports].filter(Boolean) as Promise<unknown>[]);
+      await Promise.allSettled([tail, publishTail, reconciliationWorker, ...activeLocalImports, ...activeCatalogRegistrations].filter(Boolean) as Promise<unknown>[]);
       db.close();
     });
   } };
