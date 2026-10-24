@@ -382,3 +382,15 @@ async function validateImportedObjectInventory(path: string, timeoutMs: number):
 export function git(cwd: string, ...args: string[]): Promise<string> {
   return gitWithTimeout(cwd, 60_000, ...args);
 }
+
+/** Explicit owner revert. Never discards dirty/untracked canonical work. */
+export async function revertCleanRepository(path: string, expectedHead: string, targetCommit: string, timeoutMs = 60_000): Promise<string> {
+  if (!/^[0-9a-f]{40}$/.test(expectedHead) || !/^[0-9a-f]{40}$/.test(targetCommit)) throw new Error("Commit IDs must be full SHA-1 object IDs");
+  const head = await gitWithTimeout(path, timeoutMs, "rev-parse", "HEAD");
+  if (head !== expectedHead) throw Object.assign(new Error("Canonical HEAD changed; refresh before reverting"), { code: "CONFLICT" });
+  if (await gitWithTimeout(path, timeoutMs, "status", "--porcelain", "--untracked-files=all")) throw Object.assign(new Error("Canonical worktree is dirty; commit or preserve changes before reverting"), { code: "DIRTY_WORKTREE" });
+  const target = await gitWithTimeout(path, timeoutMs, "rev-parse", "--verify", `${targetCommit}^{commit}`);
+  if (target !== targetCommit) throw new Error("Revert target is not a commit in canonical history");
+  await gitWithTimeout(path, timeoutMs, "reset", "--hard", targetCommit);
+  return targetCommit;
+}

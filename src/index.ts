@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve, parse, relative, sep } from "node:path";
-import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import type { ServerPlugin, MutationChange } from "agent-organization/plugin";
 import type { AgentRecord, Settings } from "agent-organization/types";
 import { z } from "zod";
@@ -10,7 +10,7 @@ import { isDeepStrictEqual } from "node:util";
 export const skillStatesSchema = z.record(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64), z.enum(["unavailable", "available", "installed"]));
 export type SkillStates = z.infer<typeof skillStatesSchema>;
 export const states = (settings: Settings) => settings.extensions?.skills as SkillStates | undefined;
-import { cloneManagedRepository, cloneRemoteRepository, gitWithTimeout, managedHead, normalizeRemoteBranches, validateRemoteHistory } from "./git.ts";
+import { cloneManagedRepository, clonePinnedSkill, cloneRemoteRepository, gitWithTimeout, managedHead, normalizeRemoteBranches, validateRemoteHistory, revertCleanRepository } from "./git.ts";
 import { canonicalSkillRepositoryUrl, skillsServerSettings } from "./config.ts";
 import { migrateCatalog, notifyAfterCatalogCommit, sourceIdentity, type CatalogSkill, type SkillSource } from "./catalog.ts";
 import { checkCheckoutLimits, readSkillMetadata } from "./skill-content.ts";
@@ -18,6 +18,7 @@ import { LocalSkillImporter } from "./local-import.ts";
 import { localSkillImportSupported } from "./local-source.ts";
 import { classifyRepositoryLocator } from "./source-locator.ts";
 import { isTerminalOperation } from "./operation-status.ts";
+import { migrateCanonicalCheckout } from "./canonical-store.ts";
 
 export interface Skill extends CatalogSkill {}
 interface Installation { generation: string; agentId: string; skill: string; path: string; remote: string; status: "staged" | "active" | "retained"; pending: boolean; error?: string }
@@ -85,8 +86,13 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     const supportsLocalImport = await localSkillImportSupported();
     // Scope independent organizations by canonical data directory; never open core SQLite.
     const scope = hash(await realpath(host.dataDir));
-    const root = join(await realpath(options.home ?? homedir()), ".agentorg", "skills", scope);
-    await privateDirectory(root);
+    // Legacy plugin-home remains the metadata/journal location during migration;
+    // canonical Git repositories live under the server's data directory.
+    const legacyRoot = join(await realpath(options.home ?? homedir()), ".agentorg", "skills", scope);
+    await privateDirectory(legacyRoot);
+    const canonicalRoot = join(await realpath(host.dataDir), "skills");
+    await privateDirectory(canonicalRoot);
+    const root = legacyRoot;
     const db = new Database(join(root, "skills.sqlite"), { create: true });
     await chmod(join(root, "skills.sqlite"), 0o600);
     db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
@@ -102,6 +108,23 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     const put = (table: "installations" | "journal", id: string, value: unknown) => db.query(`INSERT OR REPLACE INTO ${table} VALUES (?,?)`).run(id, JSON.stringify(value));
     const dropJournal = (id: string) => db.query("DELETE FROM journal WHERE id=?").run(id);
     const catalog = () => rows<Skill>("catalog");
+    // Copy-before-switch migration. Each row is committed only after the named
+    // destination has been verified; legacy trees and DB remain untouched.
+    for (const item of catalog()) {
+      const resolved = await realpath(item.path).catch(() => item.path);
+      if (resolved !== join(canonicalRoot, item.name) && !isDescendant(legacyRoot, resolved)) {
+        // Older/hand-authored ledgers may point outside the managed legacy root.
+        // Preserve them for operator repair rather than copying unowned data.
+        host.emit("skills.error", { message: `Canonical migration skipped for ${item.name}: legacy checkout is outside the managed root` });
+        continue;
+      }
+      const canonicalPath = await migrateCanonicalCheckout({ name: item.name, source: item.path, legacyRoot, canonicalRoot,
+        timeoutMs: (host.serverSettings("skills") as { gitTimeoutMs?: number }).gitTimeoutMs ?? 60_000 });
+      if (item.path !== canonicalPath) {
+        const migrated = { ...item, path: canonicalPath };
+        db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=?").run(JSON.stringify(migrated), item.name))();
+      }
+    }
     const skill = (name: string) => catalog().find(s => s.name === name) ?? fail(`Unknown skill ${name}`);
     const knownSelection = (name: string) => catalog().some(item => item.name === name) || desiredRepositories().some(item => item.name === name) || repositoryStates().some(item => item.name === name);
     function selectionSkill(name: string): Skill {
@@ -466,7 +489,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const claim = claimIdentity(claimName, url);
       if (!claim) fail("Repository registration is already in progress for this source", "DUPLICATE");
       let derivedClaim: string | undefined, name = expectedName;
-      const path = join(root, hash(url) + "-" + randomUUID());
+      let path = join(root, hash(url) + "-" + randomUUID());
       const journalId = `catalog-${randomUUID()}`;
       try {
         if (catalog().some(s => s.gitUrl === url || (expectedName && s.name === expectedName)) || unified && desiredRepositories().some(repository => repository.gitUrl === url || expectedName && repository.name === expectedName)) fail("Skill repository source or name already registered or configured as a legacy seed", "DUPLICATE");
@@ -497,6 +520,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           throw Object.assign(new Error(`Catalog history retained at ${path}: ${(error as Error).message}`), { code: (error as any)?.code ?? "SOURCE_FAILED" });
         }
         const refManifest = [...manifest, ["HEAD", originalHead] as [string, string]].sort(([a], [b]) => a.localeCompare(b));
+        path = await migrateCanonicalCheckout({ name: name!, source: path, legacyRoot, canonicalRoot, timeoutMs: effectiveConfig().gitTimeoutMs });
         const record: Skill = { name: name!, source: { kind: "git", gitUrl: url }, gitUrl: url, description: description!, path, createdAt: new Date().toISOString(),
           history: { mode: "git-preserved", scope: "branches-tags-head-v1", selectedCommit, originalHead, refCount: refManifest.length, refManifest: hash(JSON.stringify(refManifest)) }, catalogStatus: "active" };
         await catalogPublish(() => db.transaction(() => {
@@ -518,10 +542,11 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     }
     const activeLocalImports = new Set<Promise<unknown>>();
     const localImporter = new LocalSkillImporter({
-      centralRoot: root, stagingRoot: join(root, "local-import-staging"), maxCatalogEntries: effectiveConfig().maxCatalogEntries,
+      centralRoot: canonicalRoot, stagingRoot: join(root, "local-import-staging"), maxCatalogEntries: effectiveConfig().maxCatalogEntries,
       gitTimeoutMs: () => effectiveConfig().gitTimeoutMs,
       putJournal: journal => put("journal", journal.id, journal),
       publish: async (record, identity, journalId, unified) => {
+        record.path = await migrateCanonicalCheckout({ name: record.name, source: record.path, legacyRoot, canonicalRoot, timeoutMs: effectiveConfig().gitTimeoutMs });
         await catalogPublish(() => db.transaction(() => {
           const entries = catalog();
           if (deletingCatalog.has(record.name)) fail(`Catalog skill ${record.name} is being permanently deleted`, "DELETE_IN_PROGRESS");
@@ -632,7 +657,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       const claim = claimIdentity(name, gitUrl);
       if (!claim) { update("pending", "Repository registration is already in progress"); return; }
-      const path = join(root, hash(name) + "-" + randomUUID());
+      let path = join(root, hash(name) + "-" + randomUUID());
       const journalId = `catalog-${randomUUID()}`;
       put("journal", journalId, { id: journalId, agentId: "catalog", revision, actions: [], path, repository: { name, gitUrl } });
       if (!update("pending")) { releaseIdentity(name, gitUrl, claim); return; }
@@ -644,6 +669,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
         await checkoutLimit(path);
         if (!await currentGeneration(generation, revision, fingerprint, name, gitUrl)) return;
+        path = await migrateCanonicalCheckout({ name, source: path, legacyRoot, canonicalRoot, timeoutMs: effectiveConfig().gitTimeoutMs });
         const record: Skill = { name, source: { kind: "git", gitUrl }, gitUrl, description, path, createdAt: new Date().toISOString(), history: { mode: "legacy-git" }, catalogStatus: "active" };
         await catalogPublish(() => db.transaction(() => {
           if (!currentGenerationSync(generation, revision, fingerprint, name, gitUrl)) return;
@@ -801,6 +827,60 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       scheduleReconciliation("requested", true);
       return { accepted: true, reconciliation: status };
     });
+    host.registerEndpoint("skills.updateAgent", (params, caller) => exclusive(async () => {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 2 ||
+          typeof (params as any).agentId !== "string" || typeof (params as any).name !== "string" || !idPattern.test((params as any).name))
+        fail("Expected exactly {agentId, name}", "INVALID_PARAMS");
+      const agent = await host.request("agent.get", { agentId: (params as any).agentId }, server) as AgentRecord;
+      if (states(agent.settings)?.[(params as any).name] !== "installed") fail("Skill is not installed for this agent", "INVALID_PARAMS");
+      const item = skill((params as any).name), dest = join(installRoot(agent.settings.cwd!), item.name);
+      const old = installations().find(i => i.agentId === agent.id && i.skill === item.name && i.path === dest && i.status === "active");
+      if (!old) fail("Installed checkout is not ready", "SKILL_NOT_READY");
+      await own(old);
+      if (await git(dest, "status", "--porcelain", "--untracked-files=all")) fail("Agent worktree is dirty; preserve or commit its changes before updating", "DIRTY_WORKTREE");
+      const canonicalHead = await managedHead(item.path, effectiveConfig().gitTimeoutMs);
+      const currentHead = await managedHead(dest, effectiveConfig().gitTimeoutMs);
+      if (canonicalHead === currentHead) return { agentId: agent.id, name: item.name, head: currentHead, updated: false };
+      const generation = randomUUID(), stage = join(agent.settings.cwd!, ".agents", "agentorg-recovery", scope, `update-${generation}`);
+      const backup = join(agent.settings.cwd!, ".agents", "agentorg-recovery", scope, `before-update-${old.generation}`);
+      await privateDirectory(join(stage, ".."));
+      const next: Installation = { generation, agentId: agent.id, skill: item.name, path: stage, remote: `agent-${agent.id}-${generation}`, status: "staged", pending: false };
+      put("installations", generation, next);
+      await clonePinnedSkill(item.path, stage, canonicalHead, effectiveConfig().gitTimeoutMs);
+      await metadata(stage, item.name); await checkoutLimit(stage);
+      await writeFile(join(stage, ".git", "agentorg-skills.json"), JSON.stringify({ scope, generation, agentId: agent.id, skill: item.name }), { mode: 0o600 });
+      await own(next);
+      try {
+        if (await exists(backup)) fail(`Update backup already exists: ${backup}`, "COLLISION");
+        await rename(dest, backup);
+        try { await rename(stage, dest); }
+        catch (error) { await rename(backup, dest); throw error; }
+        old.path = backup; old.status = "retained"; put("installations", old.generation, old);
+        next.path = dest; next.status = "active"; put("installations", generation, next);
+      } catch (error) {
+        // Keep staging/backup artifacts for recovery; never remove agent data.
+        throw error;
+      }
+      return { agentId: agent.id, name: item.name, head: canonicalHead, updated: true, retainedPrevious: backup };
+    }));
+    host.registerEndpoint("skills.revertRepository", (params, caller) => exclusive(async () => {
+      clientOnly(caller);
+      if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 3 ||
+          typeof (params as any).name !== "string" || !idPattern.test((params as any).name) ||
+          typeof (params as any).expectedHead !== "string" || typeof (params as any).targetCommit !== "string")
+        fail("Expected exactly {name, expectedHead, targetCommit}", "INVALID_PARAMS");
+      const item = skill((params as any).name);
+      if (item.path !== join(canonicalRoot, item.name) || !isDescendant(canonicalRoot, await realpath(item.path)))
+        fail("Skill is not in the canonical owner-controlled store", "FORBIDDEN");
+      const head = await revertCleanRepository(item.path, (params as any).expectedHead, (params as any).targetCommit, effectiveConfig().gitTimeoutMs);
+      const description = await metadata(item.path, item.name);
+      const updated = { ...item, description, history: { ...item.history, selectedCommit: head } };
+      db.transaction(() => db.query("UPDATE catalog SET data=? WHERE name=?").run(JSON.stringify(updated), item.name))();
+      host.emit("skills.catalog_changed", { name: item.name, status: "ready", commit: head });
+      // Existing agent installs intentionally remain pinned until an explicit clean update.
+      return { skill: exposedSkill(updated), head, installedAgentsUnchanged: true };
+    }));
     host.registerEndpoint("skills.registerRepository", async (params, caller) => {
       clientOnly(caller);
       if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params as object).length !== 1 || typeof (params as any).source !== "string") fail("Expected exactly {source}");
@@ -922,7 +1002,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
           for (const item of relatedInstallations) await verifyInstallation(item);
           if (await exists(current.path)) {
             const centralInfo = await lstat(current.path);
-            if (!centralInfo.isDirectory() || centralInfo.isSymbolicLink() || !isDescendant(root, await realpath(current.path)))
+            if (!centralInfo.isDirectory() || centralInfo.isSymbolicLink() || !isDescendant(canonicalRoot, await realpath(current.path)))
               fail(`Refusing to delete unverified central skill directory for ${name}`, "DELETE_BLOCKED");
           } else if (!isRetired(current)) fail(`Central skill directory for ${name} is missing`, "DELETE_BLOCKED");
 
