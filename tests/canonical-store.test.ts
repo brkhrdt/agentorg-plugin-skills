@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile, lstat } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { migrateCanonicalCheckout } from "../src/canonical-store.ts";
+import { migrateCanonicalCheckout, fastForwardCanonicalCheckout } from "../src/canonical-store.ts";
 import { revertCleanRepository } from "../src/git.ts";
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
@@ -25,6 +25,25 @@ test("canonical migration atomically copies and verifies full history while reta
     expect(await readFile(join(source, "extra"), "utf8")).toBe("history\n");
     expect(await migrateCanonicalCheckout({ name: "sample", source, legacyRoot: legacy, canonicalRoot: canonical })).toBe(path);
     await expect(migrateCanonicalCheckout({ name: "../evil", source, legacyRoot: legacy, canonicalRoot: canonical })).rejects.toThrow(/name/i);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("explicit canonical update fast-forwards from a local Git source; dirty, diverged, or invalid updates leave canonical HEAD unchanged", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skills-ff-update-")), source = join(root, "source"), canonical = join(root, "skills", "sample");
+  try {
+    await mkdir(source); await mkdir(join(root, "skills")); git(source, "init", "-q"); git(source, "config", "user.email", "x@y.invalid"); git(source, "config", "user.name", "x");
+    await writeFile(join(source, "SKILL.md"), "---\nname: sample\ndescription: test\n---\nfirst\n"); git(source, "add", "."); git(source, "commit", "-qm", "first");
+    git(root, "clone", "--no-hardlinks", source, canonical);
+    const first = git(canonical, "rev-parse", "HEAD");
+    await writeFile(join(source, "extra"), "second\n"); git(source, "add", "."); git(source, "commit", "-qm", "second");
+    const updated = await fastForwardCanonicalCheckout({ canonicalPath: canonical, source, expectedHead: first });
+    expect(updated.head).toBe(git(source, "rev-parse", "HEAD"));
+    expect(git(canonical, "rev-list", "--count", "HEAD")).toBe("2");
+    await writeFile(join(source, "extra"), "third\n"); git(source, "commit", "-qam", "third");
+    await writeFile(join(canonical, "local"), "dirty\n");
+    const cleanHead = git(canonical, "rev-parse", "HEAD");
+    await expect(fastForwardCanonicalCheckout({ canonicalPath: canonical, source, expectedHead: cleanHead })).rejects.toMatchObject({ code: "DIRTY_WORKTREE" });
+    expect(git(canonical, "rev-parse", "HEAD")).toBe(cleanHead);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
