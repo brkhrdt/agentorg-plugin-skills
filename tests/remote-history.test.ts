@@ -42,6 +42,9 @@ test("full managed clones and independent installs retain supported history and 
     expect(await git(install, "rev-parse", "--is-shallow-repository")).toBe("true");
     expect(await git(install, "rev-list", "--count", "HEAD")).toBe("1");
     expect(await git(install, "remote")).toBe("");
+    expect(await git(install, "show-ref", "--tags").catch(() => "")).toBe("");
+    expect(await git(install, "rev-parse", "--is-shallow-repository")).toBe("true");
+    expect(await git(install, "rev-list", "--count", "HEAD")).toBe("1");
     expect(await git(install, "show-ref", "--heads")).not.toContain("alternate");
     expect(await git(install, "symbolic-ref", "-q", "HEAD").catch(() => "")).toBe("");
     expect(await readFile(await (await import("node:fs/promises")).realpath(join(install, "scripts", "current.txt")), "utf8")).toBe("second\n");

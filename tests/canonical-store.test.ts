@@ -68,6 +68,20 @@ test("invalid skill identity in an upstream update never replaces canonical chec
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("canonical files roll back when the transactional catalog publish callback fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skills-publish-failure-")), source = join(root, "source"), canonical = join(root, "skills", "sample");
+  try {
+    await mkdir(source); await mkdir(join(root, "skills"));
+    git(source, "init", "-q"); git(source, "config", "user.email", "x@y.invalid"); git(source, "config", "user.name", "x");
+    await writeFile(join(source, "SKILL.md"), "---\nname: sample\ndescription: fixture\n---\none\n"); git(source, "add", "."); git(source, "commit", "-qm", "one");
+    git(root, "clone", "--no-hardlinks", source, canonical); const before = git(canonical, "rev-parse", "HEAD");
+    await writeFile(join(source, "extra"), "two\n"); git(source, "add", "."); git(source, "commit", "-qm", "two");
+    await expect(fastForwardCanonicalCheckout({ canonicalPath: canonical, source, expectedHead: before }, async () => { throw new Error("injected ledger failure"); })).rejects.toThrow(/injected ledger failure/);
+    expect(git(canonical, "rev-parse", "HEAD")).toBe(before);
+    expect(await readFile(join(canonical, "SKILL.md"), "utf8")).toContain("name: sample");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("owner revert is explicit, compare-and-swap fenced, and refuses dirty worktrees", async () => {
   const root = await mkdtemp(join(tmpdir(), "skills-revert-")), repo = join(root, "skills", "sample");
   try {
@@ -76,13 +90,18 @@ test("owner revert is explicit, compare-and-swap fenced, and refuses dirty workt
     await writeFile(join(repo, "SKILL.md"), "---\nname: sample\ndescription: fixture\n---\none\n"); git(repo, "add", "."); git(repo, "commit", "-qm", "one");
     const first = git(repo, "rev-parse", "HEAD");
     await writeFile(join(repo, "SKILL.md"), "---\nname: sample\ndescription: fixture\n---\ntwo\n"); git(repo, "commit", "-qam", "two");
-    const second = git(repo, "rev-parse", "HEAD");
-    const reverted = await prepareCanonicalRevert({ canonicalPath: repo, expectedHead: second, targetCommit: first });
+    await writeFile(join(repo, "SKILL.md"), "---\nname: wrong\ndescription: invalid identity\n---\ninvalid\n"); git(repo, "commit", "-qam", "invalid identity");
+    const invalid = git(repo, "rev-parse", "HEAD");
+    await writeFile(join(repo, "SKILL.md"), "---\nname: sample\ndescription: fixture\n---\nrestored\n"); git(repo, "commit", "-qam", "restored identity");
+    const current = git(repo, "rev-parse", "HEAD");
+    await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: current, targetCommit: invalid })).rejects.toThrow(/name|identity/i);
+    expect(git(repo, "rev-parse", "HEAD")).toBe(current);
+    const reverted = await prepareCanonicalRevert({ canonicalPath: repo, expectedHead: current, targetCommit: first });
     expect(reverted.head).toBe(first);
     expect(await readFile(join(repo, "SKILL.md"), "utf8")).toContain("one");
-    await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: second, targetCommit: first })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: current, targetCommit: first })).rejects.toMatchObject({ code: "CONFLICT" });
     await writeFile(join(repo, "untracked"), "keep\n");
-    await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: first, targetCommit: second })).rejects.toMatchObject({ code: "DIRTY_WORKTREE" });
+    await expect(prepareCanonicalRevert({ canonicalPath: repo, expectedHead: first, targetCommit: invalid })).rejects.toMatchObject({ code: "DIRTY_WORKTREE" });
     expect(await readFile(join(repo, "untracked"), "utf8")).toBe("keep\n");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
