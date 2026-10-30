@@ -21,7 +21,7 @@ const waitFor = async (check: () => boolean | Promise<boolean>, timeoutMs = 8_00
   }
 };
 
-test("TUI configures a local skill live, installs it, calls authenticated MCP, then removes it into recovery", async () => {
+test("TUI installs a registered Git skill, calls authenticated MCP, and leaves user work on deselection", async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-acceptance-e2e-"));
   const dataDir = join(dir, "data"), socketPath = join(dataDir, "server.sock");
   const home = join(dir, "home"), work = join(dir, "work"), repo = join(dir, "source");
@@ -38,46 +38,29 @@ test("TUI configures a local skill live, installs it, calls authenticated MCP, t
       return { command: process.execPath, args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")], consumesEnv: ["AGENTORG_SKILL_FILES"] };
     } });
   } };
-  const plugins = () => [harness, createSkillsPlugin({ home, allowLocalSources: true })];
+  const plugins = () => [harness, createSkillsPlugin({ home })];
   let server: OrganizationServer | undefined;
   let admin: OrganizationClient | undefined;
   let ui: ReturnType<typeof terminalClient> | undefined;
   let mcp: Client | undefined;
   try {
-    // Configure the seed through the actual server-settings form. Local sources
-    // are accepted here only because this embedded test explicitly opts in.
     server = await OrganizationServer.start({ dataDir, socketPath, plugins: plugins() });
     const serverPid = process.pid;
     admin = await OrganizationClient.connect(socketPath);
-    ui = terminalClient(socketPath, dir);
-    await ui.visible("No active agents. Press n");
-    ui.keys("v"); await ui.visible("CLIENT ONLY"); ui.keys("s"); await ui.visible("Server settings");
-    ui.keys("\x1b[B".repeat(3) + "\r"); await ui.visible("Skills · server-wide · revision 0");
-    ui.keys("\r"); await ui.visible("Repositories"); ui.keys("\r");
-    await ui.visible("No configurations. Press a to add."); ui.keys("a"); await ui.visible("Repositories: New entry");
-    ui.keys("\r"); await ui.visible("Skill name · Lowercase letters"); ui.keys("\x15alpha\r"); await ui.visible("Repositories: New entry");
-    ui.keys("\x1b[B\r"); await ui.visible("HTTPS Git URL · Public HTTPS"); ui.keys(`\x15${repo}\r`); await ui.visible("Repositories: New entry");
-    ui.keys("S"); await ui.visible("Repositories"); ui.keys("S"); await ui.visible("Skills · server-wide · revision 0");
-    ui.keys("S"); await ui.visible("Confirm server-wide"); ui.keys("y"); await ui.visible("Skills · server-wide · revision 1");
-    expect(ui.screen()).not.toContain("RESTART REQUIRED");
-    await waitFor(async () => {
-      try { return (await admin!.request<any>("skills.list")).skills.some((skill: any) => skill.name === "alpha"); }
-      catch { return false; }
-    });
-    expect(process.pid).toBe(serverPid);
+    const registered = await admin.request<any>("skills.registerRepository", { source: repo });
+    expect(registered).toMatchObject({ name: "alpha", description: "Alpha local acceptance fixture" });
+    expect(registered).not.toHaveProperty("history");
+    const catalog = await admin.request<any>("skills.list");
+    expect(catalog.skills).toHaveLength(1);
+    expect(catalog.skills[0]).toMatchObject({ name: "alpha", source: { kind: "local", path: repo } });
+    const persisted = await admin.request<any>("organization.settings.get", { namespace: "skills" });
+    expect(persisted.values.directory).toBe("skills");
+    expect(persisted.restartRequired).toEqual([]);
     let snapshot: any;
     await waitFor(async () => {
       try { snapshot = await admin!.request("organization.snapshot"); return true; }
       catch (error: any) { if (error.code === "NOT_READY") return false; throw error; }
     });
-    const catalog = await admin.request<any>("skills.list");
-    expect(catalog.skills).toHaveLength(1);
-    expect(catalog.skills[0]).toMatchObject({ name: "alpha", gitUrl: repo, description: "Alpha local acceptance fixture" });
-    const persisted = await admin.request<any>("organization.settings.get", { namespace: "skills" });
-    expect(persisted.values.repositories).toEqual([{ name: "alpha", gitUrl: repo }]);
-    expect(persisted.restartRequired).toEqual([]);
-
-    // Create and select the discovered skill using ordinary TUI form controls.
     ui = terminalClient(socketPath, dir);
     await ui.visible("No active agents. Press n");
     await Bun.sleep(250); // Let the asynchronous snapshot capability/catalog discovery finish.
@@ -121,8 +104,8 @@ test("TUI configures a local skill live, installs it, calls authenticated MCP, t
     expect(listing.skills).toContainEqual(expect.objectContaining({ name: "alpha", state: "installed" }));
     await mcp.close(); mcp = undefined;
 
-    // Add user work to the managed checkout; removing the selection must unload
-    // it, retain this work under recovery, and preserve the shared catalog/ref.
+    // Add user work to the managed checkout; removing the selection unloads it
+    // but deliberately leaves the mutable clone in place.
     const userWork = join(installRoot(work), "alpha", "user-work.txt");
     await writeFile(userWork, "keep this local work\n");
     ui.keys("e");
@@ -142,17 +125,12 @@ test("TUI configures a local skill live, installs it, calls authenticated MCP, t
     });
     expect(ui.screen()).toContain("acceptance-worker");
     await waitFor(async () => (await launchRecords()).at(-1)?.files.length === 0);
-    expect(await Bun.file(activeSkill).exists()).toBe(false);
-    const recoveryRoot = join(work, ".agents", "agentorg-recovery");
-    const scopes = await readdir(recoveryRoot);
-    const recovered: string[] = [];
-    for (const scope of scopes) for (const generation of await readdir(join(recoveryRoot, scope))) recovered.push(join(recoveryRoot, scope, generation));
-    const workCopies = await Promise.all(recovered.map(path => readFile(join(path, "user-work.txt"), "utf8").catch(() => "")));
-    expect(workCopies).toContain("keep this local work\n");
+    expect(await Bun.file(activeSkill).exists()).toBe(true);
+    expect(await readFile(userWork, "utf8")).toBe("keep this local work\n");
     const after = await admin.request<any>("skills.list");
     expect(after.skills).toHaveLength(1);
-    const refs = await git(catalog.skills[0].path, "for-each-ref", "--format=%(refname)", "refs/agentorg-recovery");
-    expect(refs).toContain("refs/agentorg-recovery/");
+    expect(after.skills[0]).not.toHaveProperty("history");
+    expect(await git(join(installRoot(work), "alpha"), "remote")).toBe("");
   } finally {
     if (mcp) await mcp.close().catch(() => {});
     if (ui) await ui.close().catch(() => {});

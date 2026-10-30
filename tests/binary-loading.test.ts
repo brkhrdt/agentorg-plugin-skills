@@ -36,19 +36,19 @@ test("compiled host loads the separate skills module and exposes coded errors", 
     }
     expect(snapshot.capabilities.plugins.skills).toEqual({
       settingsNamespace: "skills", serverSettingsNamespace: "skills",
-      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", addFromPath: "skills.addFromPath" }, localImport: true, version: 1,
+      endpoints: { list: "skills.list", registerRepository: "skills.registerRepository" },
+      repositoryRegistration: { version: 2, sourceKinds: ["https", "server-path"], semantics: "committed-head-v2" }, version: 1,
     });
     const settings = await client.request<any>("organization.settings.list");
     expect(settings.groups.find((group: any) => group.namespace === "skills")).toMatchObject({
-      defaults: { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
-      fields: [{ key: "repositories", effect: "immediate" }, { key: "gitTimeoutMs", effect: "immediate" }, { key: "maxCatalogEntries", effect: "immediate" }],
+      defaults: { directory: "skills", gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
+      fields: [{ key: "directory", effect: "restart" }, { key: "gitTimeoutMs", effect: "immediate" }, { key: "maxCatalogEntries", effect: "immediate" }],
     });
     const catalog = await client.request<any>("skills.list");
     expect(catalog.skills).toEqual([]);
-    expect(catalog.retained).toEqual([]);
-    expect(catalog.reconciliation).toMatchObject({ state: "ready", desiredRevision: 0, entries: [] });
+    expect(catalog).toEqual({ skills: [] });
     try {
-      await client.request("skills.add", { name: "bad", gitUrl: "ssh://localhost/skill" });
+      await client.request("skills.registerRepository", { source: "ssh://localhost/skill" });
       throw new Error("Unexpected success");
     } catch (error: any) { expect(error.code).toBe("INVALID_PARAMS"); }
   } finally {

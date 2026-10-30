@@ -46,15 +46,16 @@ test("source and bundled plugin expose identical settings, capability and MCP co
     const source = await observe(createSkillsPlugin({ home: sourceDir }), join(dir, "source-host"));
     const compiled = await observe(bundled.createSkillsPlugin({ home: bundleDir }), join(dir, "bundle-host"));
     expect(compiled).toEqual(source);
-    expect(source.capability).toEqual({
-      settingsNamespace: "skills", serverSettingsNamespace: "skills", localImport: true,
-      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", addFromPath: "skills.addFromPath" }, version: 1,
+    expect(source.capability).toMatchObject({
+      settingsNamespace: "skills", serverSettingsNamespace: "skills",
+      repositoryRegistration: { version: 2, sourceKinds: ["https", "server-path"], semantics: "committed-head-v2" },
+      endpoints: { list: "skills.list", registerRepository: "skills.registerRepository" }, version: 1,
     });
     expect(source.settings).toMatchObject({
-      namespace: "skills", version: 1,
-      defaults: { repositories: [], gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
+      namespace: "skills", version: 2,
+      defaults: { directory: "skills", gitTimeoutMs: 60_000, maxCatalogEntries: 256 },
       fields: [
-        { key: "repositories", effect: "immediate", editor: "list" },
+        { key: "directory", effect: "restart", editor: "text" },
         { key: "gitTimeoutMs", effect: "immediate", min: 1_000, max: 60_000 },
         { key: "maxCatalogEntries", effect: "immediate", min: 1, max: 256 },
       ],

@@ -6,10 +6,11 @@ import { createSkillsPlugin } from "../src/index.ts";
 import { createLocalSkillFixture } from "./helpers/local-skill.ts";
 
 function advertisesLocalImport(descriptor: any): boolean {
-  return descriptor?.localImport === true && descriptor?.endpoints?.addFromPath === "skills.addFromPath";
+  return descriptor?.repositoryRegistration?.version === 2 && descriptor.repositoryRegistration.semantics === "committed-head-v2" &&
+    descriptor.repositoryRegistration.sourceKinds?.includes("server-path") && descriptor.endpoints?.registerRepository === "skills.registerRepository";
 }
 
-test("plain local skill fixture has the planned import inputs and no Git metadata", async () => {
+test("plain fixture contains otherwise-valid skill metadata but no Git repository", async () => {
   const fixture = await createLocalSkillFixture();
   try {
     expect(await readFile(join(fixture.path, "SKILL.md"), "utf8")).toContain("name: fixture-skill");
@@ -18,31 +19,24 @@ test("plain local skill fixture has the planned import inputs and no Git metadat
     expect(await readFile(join(fixture.path, ".gitignore"), "utf8")).toContain("ignored-payload.txt");
     await access(join(fixture.path, "ignored-payload.txt"));
     await expect(access(join(fixture.path, ".git"))).rejects.toThrow();
-  } finally {
-    await fixture.cleanup();
-  }
+  } finally { await fixture.cleanup(); }
 });
 
-test("local import capability is explicit while preserving the existing Git contract", async () => {
-  const dir = await createLocalSkillFixture();
-  const org = new Organization(join(dir.root, "server.sock"), join(dir.root, "data"));
+test("registration advertises the committed-HEAD contract and rejects a plain directory", async () => {
+  const fixture = await createLocalSkillFixture();
+  const org = new Organization(join(fixture.root, "server.sock"), join(fixture.root, "data"));
   try {
-    await org.use(createSkillsPlugin({ home: dir.root }));
+    await org.use(createSkillsPlugin({ home: fixture.root }));
     const snapshot = await org.request("organization.snapshot", {}, { kind: "client", id: "test" }) as any;
     const descriptor = snapshot.capabilities.plugins.skills;
-    expect(descriptor).toMatchObject({
-      version: 1,
-      settingsNamespace: "skills",
-      serverSettingsNamespace: "skills",
-      localImport: true,
-      endpoints: { list: "skills.list", add: "skills.add", reconcile: "skills.reconcile", addFromPath: "skills.addFromPath" },
-    });
-    expect(advertisesLocalImport({ version: descriptor.version, endpoints: { addFromPath: "skills.addFromPath" } })).toBe(false);
+    expect(descriptor).toMatchObject({ version: 1, settingsNamespace: "skills", serverSettingsNamespace: "skills",
+      repositoryRegistration: { version: 2, semantics: "committed-head-v2", sourceKinds: ["https", "server-path"] },
+      endpoints: { list: "skills.list", registerRepository: "skills.registerRepository" } });
     expect(advertisesLocalImport(descriptor)).toBe(true);
-    await expect(org.request("skills.add", { name: "local", gitUrl: dir.path }, { kind: "client", id: "test" }))
-      .rejects.toMatchObject({ code: "INVALID_PARAMS" });
-  } finally {
-    await org.close();
-    await dir.cleanup();
-  }
+    expect(descriptor.endpoints).not.toHaveProperty("updateAgent");
+    await expect(org.request("skills.registerRepository", { source: fixture.path }, { kind: "client", id: "test" }))
+      .rejects.toMatchObject({ code: "UNSUPPORTED_SOURCE" });
+    await expect(org.request("skills.addFromPath", { path: fixture.path }, { kind: "client", id: "test" }))
+      .rejects.toMatchObject({ code: "METHOD_NOT_FOUND" });
+  } finally { await org.close(); await fixture.cleanup(); }
 });

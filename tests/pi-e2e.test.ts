@@ -43,11 +43,11 @@ writeFileSync(${JSON.stringify(proof)},JSON.stringify({tools:pi.getAllTools().ma
     } };
     server = await OrganizationServer.start({
       dataDir: join(dir, "data"), socketPath: join(dir, "server.sock"),
-      plugins: [createPiPlugin(), createSkillsPlugin({ home: join(dir, "skills-home"), allowLocalSources: true }), probe],
+      plugins: [createPiPlugin(), createSkillsPlugin({ home: join(dir, "skills-home") }), probe],
       limits: { startTimeoutMs: 20_000 },
     });
     client = await OrganizationClient.connect(join(dir, "server.sock"));
-    await client.request("skills.add", { name: "explicit", gitUrl: repository });
+    await client.request("skills.registerRepository", { source: repository });
     const created = await client.wait(await client.request<Operation>("agent.create", { settings: {
       harness: "pi", model: "gpt-4.1", provider: "openai", cwd: dir,
       extensions: { skills: { explicit: "installed" } },

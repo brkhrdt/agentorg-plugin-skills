@@ -96,12 +96,13 @@ async function waitMcp(client: Client, accepted: any) {
 
     const cleared = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: {} } } });
     expect(cleared.status).toBe("completed"); expect(states((cleared.result as AgentRecord).settings)).toEqual({});
-    expect(await readdir(installRoot(child.settings.cwd!))).toEqual([]);
+    expect(await readdir(installRoot(child.settings.cwd!))).toEqual(["alpha"]);
+    expect(await readFile(alphaFile, "utf8")).toContain("alpha-local-proof");
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: root.id })).settings)).toEqual({ alpha: "installed", beta: "available" });
   } finally { await f.cleanup(); }
 });
 
-test("local installations are independent, retain identity/remotes and recover work after source deletion and restart", async () => {
+test("agent clones stay independent and are never synchronized to catalog or upstream", async () => {
   const f = await createLocalLifecycle();
   try {
     const alpha = await f.addSkill("alpha", "source-proof");
@@ -110,48 +111,22 @@ test("local installations are independent, retain identity/remotes and recover w
     const aOp = await f.run("agent.create", { parentId: root.id, settings: { harness: "skill-consumer", model: "test", cwd: aCwd, extensions: { skills: { alpha: "installed" } } } });
     const bOp = await f.run("agent.create", { parentId: root.id, settings: { harness: "skill-consumer", model: "test", cwd: bCwd, extensions: { skills: { alpha: "installed" } } } });
     expect(aOp.status).toBe("completed"); expect(bOp.status).toBe("completed");
-    const a = aOp.result as AgentRecord, b = bOp.result as AgentRecord;
-    const aDir = join(installRoot(aCwd), "alpha"), bDir = join(installRoot(bCwd), "alpha"), central = alpha.record.path;
-    expect(aDir).not.toBe(bDir); expect(await git(aDir, "rev-parse", "--show-toplevel")).not.toBe(await git(bDir, "rev-parse", "--show-toplevel"));
-    const markerA = JSON.parse(await readFile(join(aDir, ".git", "agentorg-skills.json"), "utf8"));
-    const markerB = JSON.parse(await readFile(join(bDir, ".git", "agentorg-skills.json"), "utf8"));
-    expect(markerA).toMatchObject({ agentId: a.id, skill: "alpha" }); expect(markerB).toMatchObject({ agentId: b.id, skill: "alpha" });
-    expect(markerA.generation).not.toBe(markerB.generation);
-    expect(await readFile(join(aDir, "identity.marker"), "utf8")).toContain("source-proof");
-    await writeFile(join(aDir, "identity.marker"), "agent-a-only\n");
-    expect(await readFile(join(bDir, "identity.marker"), "utf8")).toContain("source-proof");
-    expect(await readFile(join(alpha.source, "identity.marker"), "utf8")).toContain("source-proof");
-    expect(await readFile(join(central, "identity.marker"), "utf8")).toContain("source-proof");
-    expect(await git(central, "remote")).toContain(`agent-${a.id}-`);
-
+    const a = aOp.result as AgentRecord;
+    const aDir = join(installRoot(aCwd), "alpha"), bDir = join(installRoot(bCwd), "alpha"), store = alpha.record.path;
     await git(aDir, "config", "user.email", "fixture@example.test"); await git(aDir, "config", "user.name", "Fixture");
-    await writeFile(join(aDir, "committed-work.txt"), "recover this commit\n"); await git(aDir, "add", "."); await git(aDir, "commit", "-m", "agent work");
-    const commit = await git(aDir, "rev-parse", "HEAD");
-    await writeFile(join(aDir, "dirty-work.txt"), "retain dirty work\n");
-    expect((await f.run("agent.remove", { agentId: a.id })).status).toBe("completed");
-    const deadline = Date.now() + 5_000;
-    let refs = "";
-    while (Date.now() < deadline) {
-      refs = await git(central, "for-each-ref", "--format=%(objectname)", "refs/agentorg-recovery");
-      if (refs.includes(commit)) break;
-      await Bun.sleep(20);
-    }
-    expect(refs).toContain(commit);
-    const remoteName = (await git(central, "remote")).split("\n").find(name => name.startsWith(`agent-${a.id}-`));
-    expect(remoteName).toBeTruthy();
-    expect(await git(central, "remote", "get-url", remoteName!)).toBe(aDir); // Recovery remote points to the retained workspace.
-    expect(await readFile(join(aDir, "dirty-work.txt"), "utf8")).toContain("retain dirty work"); // Removed workspaces stay archived.
-    expect(await readFile(join(bDir, "identity.marker"), "utf8")).toContain("source-proof");
+    await writeFile(join(aDir, "agent-work.txt"), "private work\n"); await git(aDir, "add", "."); await git(aDir, "commit", "-m", "agent work");
+    expect(await Bun.file(join(bDir, "agent-work.txt")).exists()).toBe(false);
+    expect(await Bun.file(join(store, "agent-work.txt")).exists()).toBe(false);
+    expect(await git(aDir, "remote")).toBe("");
+    expect(await git(bDir, "remote")).toBe("");
 
-    await rm(alpha.source, { recursive: true, force: true });
-    await f.restart();
-    const persisted = await f.client.request<any>("skills.list");
-    expect(persisted.skills.find((skill: Skill) => skill.name === "alpha").path).toBe(central);
-    expect(await readFile(join(central, "SKILL.md"), "utf8")).toContain("source-proof");
-    const freshCwd = join(f.workspace, "after-source-delete"); await mkdir(freshCwd);
-    const fresh = await f.run("agent.create", { parentId: root.id, settings: { harness: "skill-consumer", model: "test", cwd: freshCwd, extensions: { skills: { alpha: "installed" } } } });
-    expect(fresh.status).toBe("completed");
-    expect(await readFile(join(installRoot(freshCwd), "alpha/SKILL.md"), "utf8")).toContain("source-proof");
+    await git(store, "config", "user.email", "operator@example.test"); await git(store, "config", "user.name", "Operator");
+    await writeFile(join(store, "promoted.txt"), "operator promotion\n");
+    await git(store, "add", "."); await git(store, "commit", "-m", "operator promotion");
+    expect(await Bun.file(join(bDir, "promoted.txt")).exists()).toBe(false);
+    expect(await Bun.file(join(aDir, "promoted.txt")).exists()).toBe(false);
+    expect((await f.run("agent.remove", { agentId: a.id })).status).toBe("completed");
+    expect(await readFile(join(aDir, "agent-work.txt"), "utf8")).toBe("private work\n");
   } finally { await f.cleanup(); }
 });
 

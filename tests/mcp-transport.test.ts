@@ -62,7 +62,7 @@ async function createFixture(withSkills = true) {
   } };
   const server = await OrganizationServer.start({
     dataDir: join(dir, "data"), socketPath: join(dir, "data/server.sock"),
-    plugins: [harness, ...(withSkills ? [createSkillsPlugin({ home: dir, allowLocalSources: true })] : [])],
+    plugins: [harness, ...(withSkills ? [createSkillsPlugin({ home: dir })] : [])],
   });
   servers.push(server);
   const client = await OrganizationClient.connect(server.organization.socketPath);
@@ -81,7 +81,7 @@ async function createFixture(withSkills = true) {
   }
   const catalog: Skill[] = [];
   if (withSkills) {
-    catalog.push(await client.request<Skill>("skills.add", { name: "alpha", gitUrl: source }));
+    catalog.push(await client.request<Skill>("skills.registerRepository", { source }));
     for (const name of ["beta", "gamma"]) {
       const repo = join(dir, `source-${name}`);
       await mkdir(repo);
@@ -90,7 +90,7 @@ async function createFixture(withSkills = true) {
       await git(repo, "config", "user.name", "Test");
       await writeFile(join(repo, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} MCP fixture\n---\n# Instructions\n`);
       await git(repo, "add", "."); await git(repo, "commit", "-m", "skill fixture");
-      catalog.push(await client.request<Skill>("skills.add", { name, gitUrl: repo }));
+      catalog.push(await client.request<Skill>("skills.registerRepository", { source: repo }));
     }
     await run("agent.modify", { agentId: root.id, settings: { extensions: { skills: { alpha: "available", beta: "available" } } } });
   }
@@ -248,7 +248,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect((await waitThroughMcp(f.mcp, resultText(replacement))).status).toBe("completed");
     let current = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
     expect(states(current.settings)).toEqual({ beta: "available" });
-    expect(await Bun.file(join(installRoot(child.settings.cwd!), "alpha/SKILL.md")).exists()).toBe(false);
+    expect(await Bun.file(join(installRoot(child.settings.cwd!), "alpha/SKILL.md")).exists()).toBe(true);
 
     const denied = await f.mcp.callTool({ name: "modify_subagent", arguments: {
       agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: { gamma: "available" } } },
@@ -283,7 +283,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect((await waitThroughMcp(f.mcp, resultText(cleared))).status).toBe("completed");
     current = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
     expect(states(current.settings)).toEqual({});
-    expect(await Bun.file(betaManagedFile).exists()).toBe(false);
+    expect(await Bun.file(betaManagedFile).exists()).toBe(true);
 
     const siblingOp = await f.mcp.callTool({ name: "create_subagent", arguments: {
       settings: { harness: "fixture", model: "test", cwd: join(f.workspace, "other") },

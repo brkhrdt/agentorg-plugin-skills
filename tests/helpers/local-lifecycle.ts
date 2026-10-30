@@ -6,6 +6,7 @@ import { OrganizationClient } from "../../../agentorg/src/client.ts";
 import type { AgentRecord, Operation } from "../../../agentorg/src/types.ts";
 import type { ServerPlugin } from "../../../agentorg/src/plugin.ts";
 import { createSkillsPlugin, type Skill } from "../../src/index.ts";
+import { git } from "../../src/git.ts";
 
 export async function createLocalLifecycle(options: { disabled?: boolean; corruptSkillEnv?: boolean } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "skills-local-lifecycle-"));
@@ -36,7 +37,9 @@ export async function createLocalLifecycle(options: { disabled?: boolean; corrup
     await mkdir(source);
     await writeFile(join(source, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} local lifecycle fixture\n---\n\nRead and report marker: ${marker}\n`);
     await writeFile(join(source, "identity.marker"), marker + "\n");
-    const record = await client.request<Skill>("skills.addFromPath", { path: source });
+    await git(source, "init", "--initial-branch=main"); await git(source, "config", "user.name", "Local Fixture"); await git(source, "config", "user.email", "fixture@example.invalid");
+    await git(source, "add", "."); await git(source, "commit", "-m", "local skill fixture");
+    const record = await client.request<Skill>("skills.registerRepository", { source });
     return { source, marker, record };
   }
   async function createAgent(name: string, skills?: Record<string, "unavailable" | "available" | "installed">, harnessName = "skill-consumer") {

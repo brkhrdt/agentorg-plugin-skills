@@ -1,7 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { chmod, lstat, mkdir, readFile, readlink, writeFile, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, readlink, writeFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -33,6 +32,11 @@ async function runGit(cwd: string, timeoutMs: number, isolate: boolean, ...args:
 export function gitWithTimeout(cwd: string, timeoutMs: number, ...args: string[]): Promise<string> {
   return runGit(cwd, timeoutMs, false, ...args);
 }
+export const git = (cwd: string, ...args: string[]) => gitWithTimeout(cwd, 60_000, ...args);
+/** Run read-only validation with ambient Git variables/config removed (for untrusted source worktrees). */
+export function safeSourceGitWithTimeout(cwd: string, timeoutMs: number, ...args: string[]): Promise<string> {
+  return runGit(cwd, timeoutMs, true, ...args);
+}
 function safeSnapshotGit(cwd: string, timeoutMs: number, ...args: string[]): Promise<string> {
   return runGit(cwd, timeoutMs, true, ...args);
 }
@@ -40,7 +44,7 @@ function safeSnapshotGit(cwd: string, timeoutMs: number, ...args: string[]): Pro
 const snapshotConfig = [
   "core.autocrlf=false", "core.safecrlf=false", "core.filemode=true", "core.symlinks=true",
   "core.attributesFile=/dev/null", "core.excludesFile=/dev/null", "core.hooksPath=/dev/null",
-  "commit.gpgsign=false", "tag.gpgsign=false", "user.name=AgentOrg Skills Snapshot", "user.email=skills@agentorg.invalid",
+  "commit.gpgsign=false", "tag.gpgsign=false",
 ] as const;
 async function snapshotGit(path: string, timeoutMs: number, ...args: string[]) {
   const config = snapshotConfig.flatMap(value => ["-c", value]);
@@ -127,11 +131,10 @@ async function validateSnapshotIndex(path: string, timeoutMs: number): Promise<n
   });
 }
 
-/** Initialize a local-only, one-commit repository without source remotes/history or executing repository content. */
+/** Clone one source branch into an isolated store checkout; do not fetch tags or other branches. */
 export async function cloneRemoteRepository(source: string, destination: string, timeoutMs = 60_000): Promise<void> {
-  await safeSnapshotGit(dirname(destination), timeoutMs, "clone", "--no-checkout", "--no-hardlinks", "--no-single-branch", "--", source, destination);
-  await configureSnapshotWorktree(destination, timeoutMs, false);
-  await snapshotGit(destination, timeoutMs, "fetch", "--force", "--no-tags", "origin", "+refs/tags/*:refs/tags/*");
+  await safeSnapshotGit(dirname(destination), timeoutMs, "clone", "--single-branch", "--no-tags", "--no-checkout", "--no-hardlinks", "--no-local", "--", source, destination);
+  await configureSnapshotWorktree(destination, timeoutMs);
   await snapshotGit(destination, timeoutMs, "checkout", "--force", "HEAD");
   await snapshotGit(destination, timeoutMs, "config", "--local", "--unset", "core.hooksPath");
   await checkCheckoutStatus(destination, timeoutMs);
@@ -148,7 +151,7 @@ async function checkCheckoutStatus(path: string, timeoutMs: number) {
 export async function clonePinnedSkill(source: string, destination: string, commit: string, timeoutMs = 60_000): Promise<void> {
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Invalid canonical skill commit");
   await safeSnapshotGit(dirname(destination), timeoutMs, "clone", "--depth=1", "--no-tags", "--no-checkout", "--no-hardlinks", "--no-local", "--single-branch", "--", source, destination);
-  await configureSnapshotWorktree(destination, timeoutMs, false);
+  await configureSnapshotWorktree(destination, timeoutMs);
   await snapshotGit(destination, timeoutMs, "checkout", "--detach", "--force", commit);
   await snapshotGit(destination, timeoutMs, "remote", "remove", "origin").catch(() => "");
   await snapshotGit(destination, timeoutMs, "config", "--local", "--unset", "core.hooksPath");
@@ -166,227 +169,17 @@ async function exists(path: string): Promise<boolean> {
 }
 
 export async function cloneManagedRepository(source: string, destination: string, timeoutMs = 60_000): Promise<void> {
-  const commit = await managedHead(source, timeoutMs);
+  const commit = await snapshotGit(source, timeoutMs, "rev-parse", "HEAD");
   await clonePinnedSkill(source, destination, commit, timeoutMs);
 }
 
-export async function cloneLocalSnapshot(source: string, destination: string, timeoutMs = 60_000): Promise<void> {
-  await safeSnapshotGit(source, timeoutMs, "clone", "--no-checkout", "--no-hardlinks", "--template=", "--", source, destination);
-  await configureSnapshotWorktree(destination, timeoutMs, false);
-  await snapshotGit(destination, timeoutMs, "checkout", "--force", "HEAD");
-  await snapshotGit(destination, timeoutMs, "config", "--local", "--unset", "core.hooksPath");
-  await checkCheckoutStatus(destination, timeoutMs);
-}
-
-async function configureSnapshotWorktree(path: string, timeoutMs: number, includeSnapshotIdentity: boolean) {
+async function configureSnapshotWorktree(path: string, timeoutMs: number) {
   const info = join(path, ".git", "info");
   await mkdir(info, { recursive: true, mode: 0o700 });
   await chmod(info, 0o700);
   await writeFile(join(info, "attributes"), "* -text -filter -ident -working-tree-encoding\n", { mode: 0o600, flag: "wx" });
   for (const value of snapshotConfig) {
-    if (!includeSnapshotIdentity && value.startsWith("user.")) continue;
     const separator = value.indexOf("=");
     await snapshotGit(path, timeoutMs, "config", "--local", value.slice(0, separator), value.slice(separator + 1));
   }
-}
-
-export async function initializeRepositoryShell(path: string, timeoutMs = 60_000): Promise<void> {
-  await snapshotGit(path, timeoutMs, "init", "--quiet", "--template=", "--initial-branch=main");
-  await configureSnapshotWorktree(path, timeoutMs, true);
-}
-
-export async function initializeLocalSnapshot(path: string, timeoutMs = 60_000): Promise<void> {
-  await initializeRepositoryShell(path, timeoutMs);
-  const info = join(path, ".git", "info");
-  await snapshotGit(path, timeoutMs, "add", "--force", "--all", "--", ".");
-  await snapshotGit(path, timeoutMs, "commit", "--quiet", "--no-gpg-sign", "-m", "Import local skill snapshot");
-
-  const top = await snapshotGit(path, timeoutMs, "rev-parse", "--show-toplevel");
-  if (top !== await realpath(path)) throw new Error("Local snapshot Git root mismatch");
-  const parents = await snapshotGit(path, timeoutMs, "rev-list", "--parents", "-n", "1", "HEAD");
-  if (parents.trim().split(/\s+/).length !== 1) throw new Error("Local snapshot unexpectedly has parent history");
-  if (await snapshotGit(path, timeoutMs, "remote") !== "") throw new Error("Local snapshot unexpectedly has Git remotes");
-  if (await snapshotGit(path, timeoutMs, "status", "--porcelain", "--untracked-files=all") !== "") throw new Error("Local snapshot worktree differs from its index");
-  const stage = await readFile(join(path, ".git", "index"));
-  if (stage.byteLength === 0) throw new Error("Local snapshot Git index is empty");
-  // Reject symlinks/gitlinks even if a hostile or malformed index somehow contains one.
-  await validateSnapshotIndex(path, timeoutMs);
-  const infoStat = await lstat(info);
-  if (!infoStat.isDirectory() || infoStat.isSymbolicLink()) throw new Error("Local snapshot Git metadata is invalid");
-}
-
-/** Validate full managed HTTPS clone history without modifying its selected commit. */
-export async function managedHead(path: string, timeoutMs: number): Promise<string> {
-  return snapshotGit(path, timeoutMs, "rev-parse", "HEAD");
-}
-
-export async function indexImportedPack(path: string, packPath: string, timeoutMs: number): Promise<void> {
-  await snapshotGit(path, timeoutMs, "index-pack", "--strict", "--index-version=2", packPath);
-}
-
-export async function normalizeRemoteBranches(path: string, timeoutMs: number): Promise<Array<[string, string]>> {
-  const remoteRefs = await snapshotGit(path, timeoutMs, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/origin");
-  const manifest: Array<[string, string]> = [];
-  for (const line of remoteRefs.split("\n").filter(Boolean)) {
-    const [ref, oid] = line.split(" ");
-    if (!ref || !oid || ref === "refs/remotes/origin/HEAD") continue;
-    const branch = ref.slice("refs/remotes/origin/".length);
-    if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..") || branch.includes("//") || branch.startsWith(".") || branch.endsWith(".lock")) throw new Error("Remote advertised an unsupported branch ref");
-    const target = `refs/heads/${branch}`;
-    await snapshotGit(path, timeoutMs, "update-ref", target, oid);
-    manifest.push([target, oid]);
-  }
-  const tags = await snapshotGit(path, timeoutMs, "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags");
-  for (const line of tags.split("\n").filter(Boolean)) { const [ref, oid] = line.split(" "); if (ref && oid) manifest.push([ref, oid]); }
-  return manifest;
-}
-
-export async function validateRemoteHistory(path: string, timeoutMs: number): Promise<string> {
-  const output = await snapshotGit(path, timeoutMs, "for-each-ref", "--format=%(refname) %(objectname) %(objecttype) %(*objectname) %(*objecttype)");
-  const rows = output.split("\n").filter(Boolean);
-  if (rows.length > 12_290) throw Object.assign(new Error("Git source ref inventory exceeds supported bounds"), { code: "LIMIT" });
-  let supportedRefCount = 0;
-  for (const line of rows) {
-    const [ref, oid, type, peeledOid, peeledType] = line.split(" ");
-    const supported = ref?.startsWith("refs/heads/") || ref?.startsWith("refs/tags/") || ref?.startsWith("refs/remotes/origin/");
-    if (!supported || !oid || !/^[0-9a-f]{40}$/.test(oid)) throw new Error("Cloned Git ref manifest is invalid");
-    if (ref === "refs/remotes/origin/HEAD") continue;
-    if (ref?.startsWith("refs/remotes/origin/") || ref?.startsWith("refs/tags/")) {
-      if (++supportedRefCount > 4096) throw Object.assign(new Error("Git source exceeds 4,096 supported branch/tag refs"), { code: "LIMIT" });
-    }
-    const isTag = ref?.startsWith("refs/tags/");
-    const pointsToCommit = type === "commit" || isTag && type === "tag" && peeledType === "commit" && /^[0-9a-f]{40}$/.test(peeledOid ?? "");
-    if (!pointsToCommit) throw Object.assign(new Error(`Supported Git ref does not resolve to a commit: ${ref}`), { code: "INCOMPLETE_HISTORY" });
-  }
-  const head = await snapshotGit(path, timeoutMs, "rev-parse", "HEAD");
-  await snapshotGit(path, timeoutMs, "fsck", "--full", "--strict", "--no-reflogs", "--no-dangling");
-  await validateImportedObjectInventory(path, timeoutMs);
-  return head;
-}
-
-/** Validate imported objects and append a dirty working-tree snapshot using only managed metadata. */
-export async function preserveImportedHistory(path: string, timeoutMs: number, selectedHead?: string): Promise<{ selected?: string; dirtyCommit?: string }> {
-  const refs = await snapshotGit(path, timeoutMs, "for-each-ref", "--format=%(refname) %(objectname) %(objecttype) %(*objectname) %(*objecttype)");
-  const refRows = refs.split("\n").filter(Boolean);
-  if (refRows.length > 4096) throw Object.assign(new Error("Imported Git exceeds 4,096 refs"), { code: "LIMIT" });
-  for (const line of refRows) {
-    const [ref, oid, type, peeledOid, peeledType] = line.split(" ");
-    if (!ref || !/^refs\/(heads|tags)\/[A-Za-z0-9._/-]+$/.test(ref) || !/^[0-9a-f]{40}$/.test(oid ?? "")) throw new Error("Imported Git ref manifest is invalid");
-    const isTag = ref.startsWith("refs/tags/");
-    const pointsToCommit = type === "commit" || isTag && type === "tag" && peeledType === "commit" && /^[0-9a-f]{40}$/.test(peeledOid ?? "");
-    if (!pointsToCommit) throw Object.assign(new Error(`Supported Git ref does not resolve to a commit: ${ref}`), { code: "INCOMPLETE_HISTORY" });
-  }
-  if (selectedHead) {
-    const commit = await snapshotGit(path, timeoutMs, "rev-parse", "--verify", `${selectedHead}^{commit}`).catch(() => "");
-    if (commit !== selectedHead) throw Object.assign(new Error("Selected Git HEAD is missing or is not a commit"), { code: "INCOMPLETE_HISTORY" });
-  }
-  await snapshotGit(path, timeoutMs, "fsck", "--full", "--strict", "--no-reflogs", "--no-dangling");
-  await validateImportedObjectInventory(path, timeoutMs);
-  if (selectedHead) await validateSelectedTreeNoGitlinks(path, selectedHead, timeoutMs);
-  await snapshotGit(path, timeoutMs, "add", "--force", "--all", "--", ".");
-  const worktreeTree = await snapshotGit(path, timeoutMs, "write-tree");
-  let clean = false;
-  if (selectedHead) {
-    const sourceTree = await snapshotGit(path, timeoutMs, "rev-parse", "--verify", `${selectedHead}^{tree}`);
-    clean = sourceTree === worktreeTree;
-  }
-  if (clean) return { selected: selectedHead };
-  const args = ["commit-tree", worktreeTree];
-  if (selectedHead) args.push("-p", selectedHead);
-  args.push("-m", selectedHead ? "Import local skill working tree" : "Import local skill repository");
-  const commit = await snapshotGit(path, timeoutMs, ...args);
-  const branch = `refs/heads/agentorg-import-${randomUUID()}`;
-  await snapshotGit(path, timeoutMs, "update-ref", branch, commit);
-  await writeFile(join(path, ".git", "HEAD"), `ref: ${branch}\n`, { mode: 0o600 });
-  const head = await snapshotGit(path, timeoutMs, "rev-parse", "HEAD");
-  if (head !== commit) throw new Error("Managed import branch did not select the snapshot commit");
-  await snapshotGit(path, timeoutMs, "reset", "--mixed", "HEAD");
-  if (await snapshotGit(path, timeoutMs, "status", "--porcelain", "--untracked-files=all") !== "") throw new Error("Imported working tree differs from its snapshot commit");
-  return { selected: commit, dirtyCommit: commit };
-}
-
-async function validateSelectedTreeNoGitlinks(path: string, head: string, timeoutMs: number): Promise<void> {
-  const config = snapshotConfig.flatMap(value => ["-c", value]);
-  const args = ["-c", "protocol.allow=never", "-C", path, ...config, "ls-tree", "-r", "-z", "--full-tree", head];
-  const child = spawn("git", args, { env: gitEnvironment(true), stdio: ["ignore", "pipe", "pipe"] });
-  await new Promise<void>((resolve, reject) => {
-    let header = Buffer.alloc(0), pathBytes = 0, readingPath = false, count = 0, stderrBytes = 0, stderr = "", failure: Error | undefined;
-    const abort = (error: Error) => { if (!failure) { failure = error; child.kill("SIGKILL"); } };
-    const timer = setTimeout(() => abort(new Error(`Git selected-tree validation timed out after ${timeoutMs}ms`)), timeoutMs);
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (failure) return;
-      for (const byte of chunk) {
-        if (!readingPath) {
-          if (byte === 9) {
-            const fields = header.toString("ascii").split(" ");
-            if (fields[0] === "160000") { abort(Object.assign(new Error("Selected skill tree contains a gitlink/submodule"), { code: "UNSUPPORTED_SOURCE" })); break; }
-            if (!/^(?:100(?:644|755)|120000)$/.test(fields[0] ?? "") || fields.length !== 3 || !/^[0-9a-f]{40}$/.test(fields[2] ?? "")) { abort(new Error("Selected skill tree contains an unsupported entry")); break; }
-            readingPath = true; pathBytes = 0;
-          } else { if (header.byteLength >= 128) { abort(new Error("Malformed selected Git tree entry")); break; } header = Buffer.concat([header, Buffer.from([byte])]); }
-        } else if (byte === 0) {
-          if (++count > 20_000) { abort(Object.assign(new Error("Selected Git tree exceeds 20,000 entries"), { code: "LIMIT" })); break; }
-          header = Buffer.alloc(0); readingPath = false; pathBytes = 0;
-        } else if (++pathBytes > 4096) { abort(Object.assign(new Error("Selected Git tree path exceeds OS bounds"), { code: "LIMIT" })); break; }
-      }
-    });
-    child.stderr.on("data", (chunk: Buffer) => { stderrBytes += chunk.byteLength; if (stderrBytes > 1024 * 1024) abort(new Error("Git tree diagnostics exceeded 1 MiB")); else stderr += chunk.toString("utf8"); });
-    child.once("error", error => abort(error));
-    child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      if (failure) reject(failure);
-      else if (code !== 0) reject(new Error(`Git selected-tree validation failed (${signal ?? code}): ${stderr.trim()}`));
-      else if (readingPath || header.byteLength) reject(new Error("Truncated selected Git tree"));
-      else resolve();
-    });
-  });
-}
-
-async function validateImportedObjectInventory(path: string, timeoutMs: number): Promise<void> {
-  const config = snapshotConfig.flatMap(value => ["-c", value]);
-  const args = ["-c", "protocol.allow=never", "-C", path, ...config, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)"];
-  const child = spawn("git", args, { env: gitEnvironment(true), stdio: ["ignore", "pipe", "pipe"] });
-  await new Promise<void>((resolve, reject) => {
-    let buffer = "", count = 0, bytes = 0, stderrBytes = 0, stderr = "", failure: Error | undefined;
-    const abort = (error: Error) => { if (!failure) { failure = error; child.kill("SIGKILL"); } };
-    const timer = setTimeout(() => abort(new Error(`Git object validation timed out after ${timeoutMs}ms`)), timeoutMs);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      if (failure) return;
-      buffer += chunk;
-      let newline: number;
-      while ((newline = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
-        const match = /^[0-9a-f]{40} (?:blob|tree|commit|tag) ([0-9]+)$/.exec(line);
-        if (!match) { abort(new Error("Malformed Git object inventory")); return; }
-        if (++count > 100_000) { abort(Object.assign(new Error("Git history exceeds 100,000 objects"), { code: "LIMIT" })); return; }
-        bytes += Number(match[1]);
-        if (!Number.isSafeInteger(bytes) || bytes > 256 * 1024 * 1024) { abort(Object.assign(new Error("Expanded Git history exceeds 256 MiB"), { code: "LIMIT" })); return; }
-      }
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrBytes += chunk.byteLength;
-      if (stderrBytes > 1024 * 1024) abort(new Error("Git object validation diagnostics exceeded 1 MiB"));
-      else stderr += chunk.toString("utf8");
-    });
-    child.once("error", error => abort(error));
-    child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      if (failure) reject(failure);
-      else if (code !== 0) reject(new Error(`Git object inventory failed (${signal ?? code}): ${stderr.trim()}`));
-      else if (buffer) reject(new Error("Truncated Git object inventory"));
-      else resolve();
-    });
-  });
-}
-
-export function git(cwd: string, ...args: string[]): Promise<string> {
-  return gitWithTimeout(cwd, 60_000, ...args);
-}
-
-/** Validate checked-out Git index/tree structure, symlink confinement and clean status. */
-export async function validateManagedCheckout(path: string, timeoutMs = 60_000): Promise<void> {
-  await validateSnapshotIndex(path, timeoutMs);
-  const head = await snapshotGit(path, timeoutMs, "rev-parse", "HEAD");
-  await validateSelectedTreeNoGitlinks(path, head, timeoutMs);
-  await checkCheckoutStatus(path, timeoutMs);
 }
