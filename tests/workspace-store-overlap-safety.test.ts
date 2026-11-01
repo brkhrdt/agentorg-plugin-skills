@@ -151,6 +151,54 @@ test("workspace-backed stores permit active cwd modification and spawned reads a
   }
 });
 
+test("active cwd modification and session replacement retain reads in the configured overlapping dataDir/store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skills-active-overlap-session-"));
+  const dataDir = join(root, ".org"), home = join(root, "home"), store = join(dataDir, "skills");
+  const initialCwd = join(root, "initial-workspace"), cwd = join(store, "agent-workspace");
+  await mkdir(store, { recursive: true }); await mkdir(home, { recursive: true });
+  await mkdir(initialCwd, { recursive: true }); await mkdir(cwd, { recursive: true });
+  const catalogSkill = join(store, "overlap-skill"); await repository(catalogSkill, "overlap-skill");
+  const sentinel = join(dataDir, "overlap-sentinel.txt"); await writeFile(sentinel, "configured-overlap-data-proof");
+  const installed = join(cwd, ".agents", "skills", "overlap-skill");
+  const hostOptions = await createConfiguredOptions(root, dataDir, home, [
+    { path: sentinel },
+    { path: join(installed, "SKILL.md") },
+    { path: join(installed, ".git", "agentorg-skills.json") },
+  ]);
+  let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
+  try {
+    server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
+    const created = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd: initialCwd } }));
+    expect(created.status, JSON.stringify(created)).toBe("completed");
+    const moved = await client.wait(await client.request<any>("agent.modify", {
+      agentId: created.agentId,
+      settings: { cwd, extensions: { skills: { "overlap-skill": "installed" } } },
+    }));
+    expect(moved.status, JSON.stringify(moved)).toBe("completed");
+
+    const promptAndAssertReads = async (text: string) => {
+      const operation = await client!.request<any>("agent.prompt", { agentId: created.agentId, text });
+      const completed = await client!.wait(operation);
+      expect(completed.status, JSON.stringify(completed)).toBe("completed");
+      const proof = (await promptProofs(root)).filter((entry: any) => entry.agentId === created.agentId).at(-1);
+      expect(proof.cwd).toBe(cwd);
+      expect(proof.paths).toEqual([join(installed, "SKILL.md")]);
+      expect(proof.content).toContain("Instructions");
+      expect(proof.access[0].content).toBe("configured-overlap-data-proof");
+      expect(proof.access[1].content).toContain("Instructions");
+      expect(proof.access[2].content).toContain('"agentId"');
+      return proof;
+    };
+    await promptAndAssertReads("prove active cwd modification reads");
+    const beforeReplace = await client.request<any>("agent.get", { agentId: created.agentId });
+    const replaced = await client.wait(await client.request<any>("agent.replace_session", { agentId: created.agentId }));
+    expect(replaced.status, JSON.stringify(replaced)).toBe("completed");
+    const afterReplace = await client.request<any>("agent.get", { agentId: created.agentId });
+    expect(afterReplace.sessionId).not.toBe(beforeReplace.sessionId);
+    await promptAndAssertReads("prove replacement session reads");
+  } finally { await closeHost(client, server); await rm(root, { recursive: true, force: true }); }
+});
+
 test("workspace overlap permits nested stores while preserving installation-root and removed-agent boundaries", async () => {
   for (const mode of ["nested", "install-equal", "install-inside", "sibling-prefix", "removed"] as const) {
     const root = await mkdtemp(join(tmpdir(), `skills-workspace-store-control-${mode}-`));
