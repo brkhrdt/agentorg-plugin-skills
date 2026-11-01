@@ -119,7 +119,6 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     }
     const skill = (name: string) => catalog().find(s => s.name === name) ?? fail(`Unknown skill ${name}`);
     const knownSelection = (name: string) => catalog().some(item => item.name === name);
-    function selectionSkill(name: string): Skill { return skill(name); }
     const exposedSkill = (item: Skill): Skill & { origin: "manual" } => ({ ...item, origin: "manual" });
     const installations = () => rows<Installation>("installations");
     const installation = (generation: string) => installations().find(i => i.generation === generation)!;
@@ -171,7 +170,9 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       await own(i, from);
       await privateDirectory(join(to, ".."));
       await rename(from, to);
+      const info = await lstat(to);
       i.path = to; i.status = forward ? "active" : "staged";
+      i.fsDevice = info.dev; i.fsInode = info.ino;
       putInstallation(i.generation, i);
     }
     async function compensate(installBatch: InstallBatch) {
@@ -185,13 +186,17 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       const nextStates = states(settings) ?? {};
       const previousStates = context.creating ? {} : (states(context.previous?.settings ?? agent.settings) ?? {});
       for (const [name, state] of Object.entries(nextStates)) {
-        if (!knownSelection(name)) fail(`Unknown skill ${name}`);
-        const item = catalog().find(skill => skill.name === name);
-        if (!item) {
-          if (state !== "unavailable") selectionSkill(name);
-          continue;
+        if (knownSelection(name)) continue;
+        const existed = Object.prototype.hasOwnProperty.call(previousStates, name);
+        const previousState = previousStates[name];
+        if (!existed) fail(`Unknown skill ${name}`);
+        if (state === "installed") {
+          const currentPath = join(installRoot(settings.cwd!), name);
+          const owned = installations().find(i => i.agentId === agent.id && i.skill === name && i.path === currentPath);
+          if (previousState !== "installed" || !owned || !await exists(currentPath)) fail(`Unknown skill ${name}`);
         }
-
+        if (state === previousState || state === "unavailable" || previousState === "installed" && state === "available") continue;
+        fail(`Unknown skill ${name}`);
       }
       if (context.selectionSupplied && context.caller.kind === "agent") {
         const parent = await host.request("agent.get", { agentId: context.caller.id }, server) as AgentRecord;
@@ -248,7 +253,6 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       }
       const result: string[] = [];
       for (const [name, state] of selected(states(agent.settings))) {
-        skill(name);
         if (state !== "installed") continue;
         const path = join(installRoot(agent.settings.cwd!), name);
         const i = installations().find(i => i.agentId === agent.id && i.skill === name && i.path === path);
@@ -261,9 +265,7 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
     host.registerSettings({
       namespace: "skills",
       validate(value) {
-        const parsed = skillStatesSchema.parse(value);
-        for (const name of Object.keys(parsed)) if (!knownSelection(name)) fail(`Unknown skill ${name}`);
-        return parsed;
+        return skillStatesSchema.parse(value);
       },
       launchKey: value => selected(value as SkillStates).filter(([, state]) => state === "installed").map(([name]) => name).sort(),
     });
@@ -324,11 +326,12 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       for (const agent of agents.filter(item => !item.removedAt)) {
         const cwd = await realpath(agent.settings.cwd ?? process.cwd());
         const install = installRoot(cwd);
-        if (canonicalRoot === install || isDescendant(canonicalRoot, install) || isDescendant(install, canonicalRoot))
+        // A store may contain the managed install tree when it is also the workspace or
+        // an ancestor of it, but may not be placed at/inside the managed installation root.
+        if (canonicalRoot === install || isDescendant(install, canonicalRoot))
           fail(`Skills store overlaps the installation root for agent ${agent.id}`, "INVALID_PATH");
-        if (canonicalRoot === cwd || isDescendant(canonicalRoot, cwd) || isDescendant(cwd, canonicalRoot) ||
-            dataRoot === cwd || isDescendant(dataRoot, cwd) || isDescendant(cwd, dataRoot))
-          fail(`Skills store or server data directory overlaps the accessible workspace for agent ${agent.id}`, "INVALID_PATH");
+        // Workspace/data-dir and workspace/skills-store overlap is intentionally allowed:
+        // container policy, not application path validation, controls agent access.
       }
       await exclusive(async () => {
         for (const agent of agents.filter(item => !item.removedAt)) await launchPaths(agent);
