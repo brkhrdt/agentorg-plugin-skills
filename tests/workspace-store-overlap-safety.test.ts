@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -213,6 +213,6 @@ test("symlinked store and managed install path are rejected", async () => {
     const result = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd, extensions: { skills: { "selected-skill": "installed" } } } }));
     expect(result.status).toBe("failed");
     expect(result.error?.message).toMatch(/cannot traverse a symlink/i);
-    expect(await Bun.file(join(external, "selected-skill")).exists()).toBe(false);
+    expect(await readdir(external)).toEqual([]);
   } finally { await closeHost(client, server); await rm(installCase, { recursive: true, force: true }); }
 });
