@@ -1,7 +1,7 @@
 import { appendFileSync } from "node:fs";
 import type { ServerPlugin } from "agent-organization/plugin";
 
-export interface SkillHarnessOptions { bunExecutable: string; consumerPath: string; proofPath: string; accessPaths?: string[] }
+export interface SkillHarnessOptions { bunExecutable: string; consumerPath: string; proofPath: string; accessPaths?: Array<{ path: string; mode?: "sqlite-header" }> }
 
 export function createSkillHarnessPlugin(options: SkillHarnessOptions): ServerPlugin {
   return { apiVersion: 1, name: "skills-e2e-harness", setup(host) {

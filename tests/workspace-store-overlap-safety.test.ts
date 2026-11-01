@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { OrganizationServer } from "../../agentorg/src/server.ts";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
 import { createSkillsPlugin } from "../src/index.ts";
+import { Store } from "../../agentorg/src/store.ts";
 import { git } from "../src/git.ts";
 import { createSkillHarnessPlugin } from "./fixtures/skill-harness.ts";
 
@@ -27,7 +28,7 @@ async function plugin(home: string) {
   return bundled.createSkillsPlugin({ home });
 }
 
-function options(root: string, dataDir: string, home: string, accessPaths: string[] = []) {
+function options(root: string, dataDir: string, home: string, accessPaths: Array<{ path: string; mode?: "sqlite-header" }> = []) {
   return {
     dataDir,
     socketPath: join(dataDir, "org.sock"),
@@ -42,7 +43,7 @@ function options(root: string, dataDir: string, home: string, accessPaths: strin
   };
 }
 
-async function createConfiguredOptions(root: string, dataDir: string, home: string, accessPaths: string[] = []) {
+async function createConfiguredOptions(root: string, dataDir: string, home: string, accessPaths: Array<{ path: string; mode?: "sqlite-header" }> = []) {
   const hostOptions = options(root, dataDir, home, accessPaths);
   hostOptions.plugins.push(await plugin(home));
   return hostOptions;
@@ -51,6 +52,18 @@ async function createConfiguredOptions(root: string, dataDir: string, home: stri
 async function closeHost(client?: OrganizationClient, server?: OrganizationServer) {
   client?.close();
   await server?.close();
+}
+
+async function proofRecords(root: string) {
+  return (await readFile(join(root, "proof.jsonl"), "utf8")).trim().split("\n").map((line: string) => JSON.parse(line));
+}
+
+async function promptProofs(root: string) {
+  return (await proofRecords(root)).filter((entry: any) => entry.event === "prompt");
+}
+
+async function launchProofs(root: string) {
+  return (await proofRecords(root)).filter((entry: any) => entry.event === "launch");
 }
 
 async function restartedFailure(hostOptions: ReturnType<typeof options>, expectedCode: string, message: RegExp) {
@@ -64,27 +77,39 @@ async function restartedFailure(hostOptions: ReturnType<typeof options>, expecte
   expect(failure.message).toMatch(message);
 }
 
-test("workspace-backed store installations launch explicitly and survive restart", async () => {
+test("workspace-backed stores permit active cwd modification and spawned reads across restart", async () => {
   for (const mode of ["equal", "contains"] as const) {
     const root = await mkdtemp(join(tmpdir(), `skills-workspace-store-positive-${mode}-`));
-    const dataDir = join(root, "server-data"), home = join(root, "home");
+    const dataDir = join(root, "server-data"), home = join(root, "home"), initialCwd = join(root, "initial-workspace");
     const store = mode === "equal" ? join(root, "workspace") : join(root, "repo-store");
     const cwd = mode === "equal" ? store : join(store, "workspace");
-    await mkdir(dataDir, { recursive: true }); await mkdir(home, { recursive: true }); await mkdir(cwd, { recursive: true });
-    await repository(join(store, "workspace-skill"));
-    const hostOptions = await createConfiguredOptions(root, dataDir, home);
+    await mkdir(dataDir, { recursive: true }); await mkdir(home, { recursive: true }); await mkdir(initialCwd, { recursive: true }); await mkdir(cwd, { recursive: true });
+    const catalogSkill = join(store, "workspace-skill");
+    await repository(catalogSkill);
+    const hostOptions = await createConfiguredOptions(root, dataDir, home, [{ path: join(catalogSkill, "SKILL.md") }]);
     let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
     try {
       server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
-      const created = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd } }));
+      const created = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd: initialCwd } }));
       expect(created.status, JSON.stringify(created)).toBe("completed");
-      await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }));
+      const moved = await client.wait(await client.request<any>("agent.modify", { agentId: created.agentId, settings: { cwd } }));
+      expect(moved.status, JSON.stringify(moved)).toBe("completed");
+      const prompt = async (text: string) => {
+        const operation = await client!.request<any>("agent.prompt", { agentId: created.agentId, text });
+        expect((await client!.wait(operation)).status, JSON.stringify(operation)).toBe("completed");
+      };
+      await prompt("read catalog from overlapping store");
+      const overlapProof = (await promptProofs(root)).at(-1);
+      expect(overlapProof.access).toEqual([{ path: join(catalogSkill, "SKILL.md"), content: expect.stringContaining("Instructions") }]);
+      expect(overlapProof.content).toBe("");
+
+      expect((await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }))).status).toBe("completed");
       await client.request("organization.settings.update", { namespace: "skills", expectedRevision: 0, patch: { directory: store } });
       client.close(); client = undefined; await server.close(); server = undefined;
 
       server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
       const discovered = await client.request<any>("skills.list");
-      expect(discovered.skills.map((skill: any) => skill.path)).toEqual([join(store, "workspace-skill")]);
+      expect(discovered.skills.map((skill: any) => skill.path)).toEqual([catalogSkill]);
       expect(discovered.skills.some((skill: any) => skill.path.includes(".agents") || skill.path === cwd)).toBe(false);
       const selected = await client.wait(await client.request<any>("agent.modify", { agentId: created.agentId, settings: { extensions: { skills: { "workspace-skill": "installed" } } } }));
       expect(selected.status, JSON.stringify(selected)).toBe("completed");
@@ -93,17 +118,20 @@ test("workspace-backed store installations launch explicitly and survive restart
       expect(await Bun.file(join(cwd, "skills.sqlite")).exists()).toBe(false);
       const launched = await client.wait(await client.request<any>("agent.restart", { agentId: created.agentId }));
       expect(launched.status, JSON.stringify(launched)).toBe("completed");
-      const proof = (await readFile(join(root, "proof.jsonl"), "utf8")).trim().split("\n").map((line: string) => JSON.parse(line)).at(-1);
-      expect(proof.files).toEqual([join(installed, "SKILL.md")]);
-      expect(await git(join(store, "workspace-skill"), "status", "--porcelain")).toBe("");
+      await prompt("read installed skill");
+      const proof = (await promptProofs(root)).at(-1);
+      expect(proof.paths).toEqual([join(installed, "SKILL.md")]);
+      expect(proof.content).toContain("Instructions");
+      expect(proof.access[0].content).toContain("Instructions");
+      expect(await git(catalogSkill, "status", "--porcelain")).toBe("");
       expect(await git(installed, "status", "--porcelain")).toBe("");
-      expect(await git(installed, "rev-parse", "HEAD")).toBe(await git(join(store, "workspace-skill"), "rev-parse", "HEAD"));
+      expect(await git(installed, "rev-parse", "HEAD")).toBe(await git(catalogSkill, "rev-parse", "HEAD"));
 
-      await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }));
+      expect((await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }))).status).toBe("completed");
       client.close(); client = undefined; await server.close(); server = undefined;
       server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
       const afterRestart = await client.request<any>("skills.list");
-      expect(afterRestart.skills.map((skill: any) => skill.path)).toEqual([join(store, "workspace-skill")]);
+      expect(afterRestart.skills.map((skill: any) => skill.path)).toEqual([catalogSkill]);
       expect(afterRestart.skills.some((skill: any) => skill.path.includes(".agents") || skill.path.includes("workspace/.agents"))).toBe(false);
       const db = new Database(join(dataDir, "skills.sqlite"));
       try {
@@ -111,12 +139,14 @@ test("workspace-backed store installations launch explicitly and survive restart
         expect(rows).toHaveLength(1);
         expect(JSON.parse(rows[0]!.data).path).toBe(installed);
       } finally { db.close(); }
-      expect(await git(join(store, "workspace-skill"), "status", "--porcelain")).toBe("");
+      expect(await git(catalogSkill, "status", "--porcelain")).toBe("");
       expect(await git(installed, "status", "--porcelain")).toBe("");
       const relaunched = await client.wait(await client.request<any>("agent.restart", { agentId: created.agentId }));
       expect(relaunched.status, JSON.stringify(relaunched)).toBe("completed");
-      const nextProof = (await readFile(join(root, "proof.jsonl"), "utf8")).trim().split("\n").map((line: string) => JSON.parse(line)).at(-1);
-      expect(nextProof.files).toEqual([join(installed, "SKILL.md")]);
+      await prompt("read installed skill after server restart");
+      const nextProof = (await promptProofs(root)).at(-1);
+      expect(nextProof.paths).toEqual([join(installed, "SKILL.md")]);
+      expect(nextProof.content).toContain("Instructions");
     } finally { await closeHost(client, server); await rm(root, { recursive: true, force: true }); }
   }
 });
@@ -164,7 +194,12 @@ test("dataDir overlap allows spawned skill agents to read data, catalog, and met
     await repository(catalogSkill, "data-skill");
     const sentinel = join(dataDir, "read-sentinel.txt"); await writeFile(sentinel, `data:${mode}`);
     const installed = join(cwd, ".agents", "skills", "data-skill");
-    const accessPaths = [sentinel, join(dataDir, "skills.sqlite"), join(catalogSkill, "SKILL.md"), join(installed, ".git", "agentorg-skills.json")];
+    const accessPaths = [
+      { path: sentinel },
+      { path: join(dataDir, "skills.sqlite"), mode: "sqlite-header" as const },
+      { path: join(catalogSkill, "SKILL.md") },
+      { path: join(installed, ".git", "agentorg-skills.json") },
+    ];
     const hostOptions = await createConfiguredOptions(root, dataDir, home, accessPaths);
     let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
     try {
@@ -176,24 +211,98 @@ test("dataDir overlap allows spawned skill agents to read data, catalog, and met
         expect((await client!.wait(operation)).status).toBe("completed");
       };
       await prompt();
-      await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }));
+      const stopped = await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }));
+      expect(stopped.status, JSON.stringify(stopped)).toBe("completed");
       client.close(); client = undefined; await server.close(); server = undefined;
       server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
       expect((await client.request<any>("organization.snapshot", {})).agents).toHaveLength(1);
-      await client.wait(await client.request<any>("agent.restart", { agentId: created.agentId }));
+      const relaunched = await client.wait(await client.request<any>("agent.restart", { agentId: created.agentId }));
+      expect(relaunched.status, JSON.stringify(relaunched)).toBe("completed");
       await prompt();
-      const proofs = (await readFile(join(root, "proof.jsonl"), "utf8")).trim().split("\n").map((line: string) => JSON.parse(line)).filter((entry: any) => entry.event === "prompt");
+      const proofs = await promptProofs(root);
       expect(proofs).toHaveLength(2);
       for (const proof of proofs) {
         expect(proof.paths).toEqual([join(installed, "SKILL.md")]);
         expect(proof.content).toContain("Instructions");
         expect(proof.access[0].content).toBe(`data:${mode}`);
-        expect(proof.access[1].content).toStartWith("SQLite format 3");
+        expect(proof.access[1]).toEqual({ path: join(dataDir, "skills.sqlite"), bytesRead: 16, header: "SQLite format 3\u0000" });
         expect(proof.access[2].content).toContain("Instructions");
         expect(proof.access[3].content).toContain('"agentId"');
       }
     } finally { await closeHost(client, server); await rm(root, { recursive: true, force: true }); }
   }
+});
+
+test.each([true, false])("overlapping installed-skill agent recovery (recover=%s) launches only when enabled", async recover => {
+  const root = await mkdtemp(join(tmpdir(), `skills-overlap-recovery-${recover}-`));
+  const dataDir = join(root, ".org"), home = join(root, "home"), store = join(dataDir, "skills");
+  const parentCwd = join(root, "parent-workspace"), childCwd = join(store, "child-workspace");
+  await mkdir(dataDir, { recursive: true }); await mkdir(home, { recursive: true });
+  await mkdir(parentCwd, { recursive: true }); await mkdir(childCwd, { recursive: true });
+  const catalogSkill = join(store, "recovery-skill"); await repository(catalogSkill, "recovery-skill");
+  const sentinel = join(dataDir, "recovery-sentinel.txt"); await writeFile(sentinel, "recovery-data-dir-proof");
+  const installedSkill = join(childCwd, ".agents", "skills", "recovery-skill", "SKILL.md");
+  const hostOptions = await createConfiguredOptions(root, dataDir, home, [{ path: sentinel }, { path: installedSkill }]);
+  let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
+  try {
+    server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
+    const parentCreated = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd: parentCwd } }));
+    expect(parentCreated.status, JSON.stringify(parentCreated)).toBe("completed");
+    const parentId = parentCreated.agentId;
+    const childCreated = await client.wait(await client.request<any>("agent.create", { parentId, settings: { harness: "skill-consumer", model: "test", cwd: childCwd, extensions: { skills: { "recovery-skill": "installed" } } } }));
+    expect(childCreated.status, JSON.stringify(childCreated)).toBe("completed");
+    const childId = childCreated.agentId;
+    const promptChild = async (label: string) => {
+      const operation = await client!.request<any>("agent.prompt", { agentId: childId, text: label });
+      const completed = await client!.wait(operation);
+      expect(completed.status, JSON.stringify(completed)).toBe("completed");
+      const proof = (await promptProofs(root)).filter((entry: any) => entry.agentId === childId).at(-1);
+      expect(proof.cwd).toBe(childCwd);
+      expect(proof.paths).toEqual([installedSkill]);
+      expect(proof.content).toContain("Instructions");
+      expect(proof.access.map((entry: any) => entry.content)).toEqual(["recovery-data-dir-proof", expect.stringContaining("Instructions")]);
+      return proof;
+    };
+    await promptChild("before simulated crash");
+    const initialLaunchCount = (await launchProofs(root)).length;
+    expect(initialLaunchCount).toBe(2);
+    expect((await client.request<any>("agent.get", { agentId: childId })).settings.cwd).toBe(childCwd);
+
+    await closeHost(client, server); client = undefined; server = undefined;
+    // Model an abrupt prior process termination: graceful close marks records stopped, so
+    // restore persisted eligibility only, leaving generations/session/skill metadata intact.
+    const persisted = new Store(join(dataDir, "organization.sqlite"));
+    try {
+      for (const agent of persisted.agents())
+        if (agent.id === parentId || agent.id === childId) persisted.saveAgent({ ...agent, state: "running" });
+    } finally { persisted.close(); }
+
+    server = await OrganizationServer.start({ ...hostOptions, recover });
+    client = await OrganizationClient.connect(hostOptions.socketPath);
+    const snapshot = await client.request<any>("organization.snapshot", {});
+    expect(snapshot.agents.find((agent: any) => agent.id === parentId).state).toBe(recover ? "idle" : "stopped");
+    expect(snapshot.agents.find((agent: any) => agent.id === childId).state).toBe(recover ? "idle" : "stopped");
+    let launches = await launchProofs(root);
+    if (recover) {
+      expect(launches).toHaveLength(initialLaunchCount + 2);
+      expect(launches.slice(-2).map((entry: any) => entry.agentId)).toEqual([parentId, childId]);
+      await promptChild("after automatic recovery");
+      const restarted = await client.wait(await client.request<any>("agent.restart_subtree", { agentId: parentId }));
+      expect(restarted.status, JSON.stringify(restarted)).toBe("completed");
+      launches = await launchProofs(root);
+      expect(launches).toHaveLength(initialLaunchCount + 4);
+      expect(launches.slice(-2).map((entry: any) => entry.agentId)).toEqual([parentId, childId]);
+      await promptChild("after overlapping subtree restart");
+    } else {
+      expect(launches).toHaveLength(initialLaunchCount);
+      const explicit = await client.wait(await client.request<any>("agent.restart", { agentId: childId }));
+      expect(explicit.status, JSON.stringify(explicit)).toBe("completed");
+      launches = await launchProofs(root);
+      expect(launches).toHaveLength(initialLaunchCount + 1);
+      expect(launches.at(-1).agentId).toBe(childId);
+      await promptChild("after explicit restart following recover false");
+    }
+  } finally { await closeHost(client, server); await rm(root, { recursive: true, force: true }); }
 });
 
 test("skills store equal to or containing dataDir keeps setup-time rejection", async () => {
