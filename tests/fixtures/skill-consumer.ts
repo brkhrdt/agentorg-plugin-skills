@@ -12,7 +12,9 @@ acp.agent({ name: "local-skill-consumer" })
     const requested = ctx.params.prompt.map(block => block.type === "text" ? block.text : "").join(" ");
     const paths: string[] = JSON.parse(process.env.AGENTORG_SKILL_FILES ?? "[]");
     const content = (await Promise.all(paths.map(path => readFile(path, "utf8")))).join("\n");
-    const proof = { event: "prompt", agentId: process.env.SKILLS_E2E_AGENT_ID, sessionId, paths, requested, content };
+    const accessPaths: string[] = JSON.parse(process.env.SKILLS_E2E_ACCESS_PATHS ?? "[]");
+    const access = await Promise.all(accessPaths.map(async path => ({ path, content: await readFile(path, "utf8") })));
+    const proof = { event: "prompt", agentId: process.env.SKILLS_E2E_AGENT_ID, sessionId, paths, requested, content, access };
     if (process.env.SKILLS_E2E_PROOF) await appendFile(process.env.SKILLS_E2E_PROOF, JSON.stringify(proof) + "\n");
     await ctx.client.notify("session/update", { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${requested}\n${content}` } } });
     return { stopReason: "end_turn" };

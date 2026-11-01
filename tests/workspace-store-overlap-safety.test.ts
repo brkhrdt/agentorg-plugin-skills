@@ -27,7 +27,7 @@ async function plugin(home: string) {
   return bundled.createSkillsPlugin({ home });
 }
 
-function options(root: string, dataDir: string, home: string) {
+function options(root: string, dataDir: string, home: string, accessPaths: string[] = []) {
   return {
     dataDir,
     socketPath: join(dataDir, "org.sock"),
@@ -36,13 +36,14 @@ function options(root: string, dataDir: string, home: string) {
         bunExecutable: process.execPath,
         consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"),
         proofPath: join(root, "proof.jsonl"),
+        accessPaths,
       }),
     ],
   };
 }
 
-async function createConfiguredOptions(root: string, dataDir: string, home: string) {
-  const hostOptions = options(root, dataDir, home);
+async function createConfiguredOptions(root: string, dataDir: string, home: string, accessPaths: string[] = []) {
+  const hostOptions = options(root, dataDir, home, accessPaths);
   hostOptions.plugins.push(await plugin(home));
   return hostOptions;
 }
@@ -150,26 +151,47 @@ test("workspace overlap permits nested stores while preserving installation-root
   }
 });
 
-test("dataDir overlap directions allow agent initialization and restart", async () => {
+test("dataDir overlap allows spawned skill agents to read data, catalog, and metadata on restart", async () => {
   for (const mode of ["equal", "data-ancestor", "workspace-ancestor"] as const) {
     const root = await mkdtemp(join(tmpdir(), `skills-data-overlap-${mode}-`));
     const dataDir = mode === "equal" ? join(root, "workspace")
       : mode === "workspace-ancestor" ? join(root, "workspace", ".org") : join(root, ".org");
     const cwd = mode === "equal" ? dataDir
       : mode === "data-ancestor" ? join(dataDir, "workspace") : join(root, "workspace");
-    const home = join(root, "home"), disjointStore = join(root, "separate-skill-store");
-    await mkdir(dataDir, { recursive: true }); await mkdir(cwd, { recursive: true }); await mkdir(home, { recursive: true });
-    const hostOptions = await createConfiguredOptions(root, dataDir, home);
+    const home = join(root, "home"), store = join(dataDir, "skills");
+    await mkdir(store, { recursive: true }); await mkdir(cwd, { recursive: true }); await mkdir(home, { recursive: true });
+    const catalogSkill = join(store, "data-skill");
+    await repository(catalogSkill, "data-skill");
+    const sentinel = join(dataDir, "read-sentinel.txt"); await writeFile(sentinel, `data:${mode}`);
+    const installed = join(cwd, ".agents", "skills", "data-skill");
+    const accessPaths = [sentinel, join(dataDir, "skills.sqlite"), join(catalogSkill, "SKILL.md"), join(installed, ".git", "agentorg-skills.json")];
+    const hostOptions = await createConfiguredOptions(root, dataDir, home, accessPaths);
     let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
     try {
       server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
-      const created = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd } }));
+      const created = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd, extensions: { skills: { "data-skill": "installed" } } } }));
       expect(created.status, JSON.stringify(created)).toBe("completed");
+      const prompt = async () => {
+        const operation = await client!.request<any>("agent.prompt", { agentId: created.agentId, text: "probe" });
+        expect((await client!.wait(operation)).status).toBe("completed");
+      };
+      await prompt();
       await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }));
-      await client.request("organization.settings.update", { namespace: "skills", expectedRevision: 0, patch: { directory: disjointStore } });
       client.close(); client = undefined; await server.close(); server = undefined;
       server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
       expect((await client.request<any>("organization.snapshot", {})).agents).toHaveLength(1);
+      await client.wait(await client.request<any>("agent.restart", { agentId: created.agentId }));
+      await prompt();
+      const proofs = (await readFile(join(root, "proof.jsonl"), "utf8")).trim().split("\n").map((line: string) => JSON.parse(line)).filter((entry: any) => entry.event === "prompt");
+      expect(proofs).toHaveLength(2);
+      for (const proof of proofs) {
+        expect(proof.paths).toEqual([join(installed, "SKILL.md")]);
+        expect(proof.content).toContain("Instructions");
+        expect(proof.access[0].content).toBe(`data:${mode}`);
+        expect(proof.access[1].content).toStartWith("SQLite format 3");
+        expect(proof.access[2].content).toContain("Instructions");
+        expect(proof.access[3].content).toContain('"agentId"');
+      }
     } finally { await closeHost(client, server); await rm(root, { recursive: true, force: true }); }
   }
 });
