@@ -326,9 +326,13 @@ export function createSkillsPlugin(options: Options = {}): ServerPlugin {
       for (const agent of agents.filter(item => !item.removedAt)) {
         const cwd = await realpath(agent.settings.cwd ?? process.cwd());
         const install = installRoot(cwd);
-        if (canonicalRoot === install || isDescendant(canonicalRoot, install) || isDescendant(install, canonicalRoot))
+        // A store may contain the managed install tree when it is also the workspace or
+        // an ancestor of it, but may not be placed at/inside the managed installation root.
+        if (canonicalRoot === install || isDescendant(install, canonicalRoot))
           fail(`Skills store overlaps the installation root for agent ${agent.id}`, "INVALID_PATH");
-        if (canonicalRoot === cwd || isDescendant(canonicalRoot, cwd) || isDescendant(cwd, canonicalRoot) ||
+        // Permit store==cwd and a store containing cwd; reject a store nested in the
+        // workspace. The server data directory remains disjoint in both directions.
+        if (isDescendant(cwd, canonicalRoot) ||
             dataRoot === cwd || isDescendant(dataRoot, cwd) || isDescendant(cwd, dataRoot))
           fail(`Skills store or server data directory overlaps the accessible workspace for agent ${agent.id}`, "INVALID_PATH");
       }
