@@ -120,7 +120,7 @@ test("workspace-backed store installations launch explicitly and survive restart
   }
 });
 
-test("workspace overlap controls reject nested stores but permit sibling-prefix and removed-agent layouts", async () => {
+test("workspace overlap permits nested stores while preserving installation-root and removed-agent boundaries", async () => {
   for (const mode of ["nested", "install-equal", "install-inside", "sibling-prefix", "removed"] as const) {
     const root = await mkdtemp(join(tmpdir(), `skills-workspace-store-control-${mode}-`));
     const dataDir = join(root, "server-data"), home = join(root, "home"), cwd = join(root, "workspace");
@@ -140,8 +140,8 @@ test("workspace overlap controls reject nested stores but permit sibling-prefix 
       else await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }));
       await client.request("organization.settings.update", { namespace: "skills", expectedRevision: 0, patch: { directory: store } });
       client.close(); client = undefined; await server.close(); server = undefined;
-      if (["nested", "install-equal", "install-inside"].includes(mode)) {
-        await restartedFailure(hostOptions, "INVALID_PATH", /overlaps?/i);
+      if (["install-equal", "install-inside"].includes(mode)) {
+        await restartedFailure(hostOptions, "INVALID_PATH", /installation root/i);
       } else {
         server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
         expect((await client.request<any>("organization.snapshot", {})).agents).toHaveLength(1);
@@ -150,7 +150,7 @@ test("workspace overlap controls reject nested stores but permit sibling-prefix 
   }
 });
 
-test("dataDir overlap directions reject independently of a disjoint skill store", async () => {
+test("dataDir overlap directions allow agent initialization and restart", async () => {
   for (const mode of ["equal", "data-ancestor", "workspace-ancestor"] as const) {
     const root = await mkdtemp(join(tmpdir(), `skills-data-overlap-${mode}-`));
     const dataDir = mode === "equal" ? join(root, "workspace")
@@ -168,7 +168,8 @@ test("dataDir overlap directions reject independently of a disjoint skill store"
       await client.wait(await client.request<any>("agent.stop", { agentId: created.agentId }));
       await client.request("organization.settings.update", { namespace: "skills", expectedRevision: 0, patch: { directory: disjointStore } });
       client.close(); client = undefined; await server.close(); server = undefined;
-      await restartedFailure(hostOptions, "INVALID_PATH", /server data directory overlaps the accessible workspace/i);
+      server = await OrganizationServer.start(hostOptions); client = await OrganizationClient.connect(hostOptions.socketPath);
+      expect((await client.request<any>("organization.snapshot", {})).agents).toHaveLength(1);
     } finally { await closeHost(client, server); await rm(root, { recursive: true, force: true }); }
   }
 });
