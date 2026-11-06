@@ -9,7 +9,7 @@
   "scripts": {
     "test": "vitest run",
     "check": "tsc --noEmit",
-    "build": "esbuild ./src/index.ts --bundle --platform=node --format=esm --outfile=dist/skills.js",
+    "build": "node scripts/build.mjs",
     "test:binary": "ORG_BINARY=../agentorg/dist/agentorg vitest run tests/binary-loading.test.ts"
   },
   "dependencies": {
