@@ -30,6 +30,7 @@ for (const mode of ["source", "compiled"] as const) test.skipIf(mode === "compil
       const pi = join(dir, "pi"); await mkdir(pi);
       await copyFile(join(import.meta.dirname, "../../agentorg-plugin-pi-agent/dist/index.js"), join(pi, "index.js"));
       await copyFile(join(import.meta.dirname, "../../agentorg-plugin-pi-agent/dist/pi-acp"), join(pi, "pi-acp")); await chmod(join(pi, "pi-acp"), 0o755);
+      await copyFile(join(import.meta.dirname, "../../agentorg-plugin-pi-agent/dist/pi-extension.ts"), join(pi, "pi-extension.ts"));
       const builtBundle = await bundlePlugin(join(import.meta.dirname, "../src/index.ts")); expect(builtBundle.success).toBe(true);
       await write(join(dir, "skills.js"), builtBundle.outputs[0]!);
       await writeFile(join(dir, "load.js"), `import {createSkillsPlugin} from './skills.js';export default createSkillsPlugin({home:${JSON.stringify(dir)}});`);
