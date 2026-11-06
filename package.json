@@ -19,6 +19,7 @@
   "devDependencies": {
     "@agentorg/plugin-pi-agent": "file:../agentorg-plugin-pi-agent",
     "@agentorg/plugin-unique-cwd": "file:../agentorg-plugin-unique-cwd",
+    "@agentclientprotocol/sdk": "1.7.0",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@types/node": "^22.0.0",
     "esbuild": "^0.25.0",
