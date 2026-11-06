@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { fileExists } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +27,6 @@ test("pinned install is genuinely shallow, detached and independent of canonical
     expect(git(install, "rev-list", "--count", "HEAD")).toBe("1");
     expect(git(install, "remote")).toBe("");
     expect(await readFile(join(install, "SKILL.md"), "utf8")).toBe("second\n");
-    expect(await Bun.file(join(install, ".git", "objects", "info", "alternates")).exists()).toBe(false);
+    expect(await fileExists(join(install, ".git", "objects", "info", "alternates"))).toBe(false);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

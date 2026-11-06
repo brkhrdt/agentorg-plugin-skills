@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { fileExists } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -10,7 +11,7 @@ import { createLocalLifecycle } from "./helpers/local-lifecycle.ts";
 
 const resultText = (result: any) => JSON.parse(result.content.find((item: any) => item.type === "text").text);
 async function connectMcp(f: Awaited<ReturnType<typeof createLocalLifecycle>>, agentId: string) {
-  const transport = new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dir, "../../agentorg/src/mcp-bridge.ts")],
+  const transport = new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
     env: { ...(process.env as Record<string, string>), ORG_SOCKET: f.socketPath, ORG_TOKEN: f.token(agentId) } });
   const client = new Client({ name: "local-skills-lifecycle", version: "1" });
   await client.connect(transport);
@@ -64,7 +65,7 @@ async function waitMcp(client: Client, accepted: any) {
     expect(rootInstall.status).toBe("completed");
     const rootInstalled = rootInstall.result as AgentRecord;
     expect(rootInstalled.revision).toBe(rootAfterGrant.revision + 1);
-    expect(await Bun.file(join(installRoot(root.settings.cwd!), "alpha", "SKILL.md")).exists()).toBe(true);
+    expect(await fileExists(join(installRoot(root.settings.cwd!), "alpha", "SKILL.md"))).toBe(true);
 
     const install = await f.run("agent.modify", { agentId: child.id, expectedRevision: (grant.result as AgentRecord).revision,
       settings: { extensions: { skills: { alpha: "installed", beta: "available" } } } });
@@ -92,7 +93,7 @@ async function waitMcp(client: Client, accepted: any) {
     const unchanged = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
     expect(unchanged.revision).toBe((omitted.result as AgentRecord).revision);
     expect(states(unchanged.settings)).toEqual({ alpha: "installed", beta: "available" });
-    expect(await Bun.file(alphaFile).exists()).toBe(true);
+    expect(await fileExists(alphaFile)).toBe(true);
 
     const cleared = await f.run("agent.modify", { agentId: child.id, settings: { extensions: { skills: {} } } });
     expect(cleared.status).toBe("completed"); expect(states((cleared.result as AgentRecord).settings)).toEqual({});
@@ -115,16 +116,16 @@ test("agent clones stay independent and are never synchronized to catalog or ups
     const aDir = join(installRoot(aCwd), "alpha"), bDir = join(installRoot(bCwd), "alpha"), store = alpha.record.path;
     await git(aDir, "config", "user.email", "fixture@example.test"); await git(aDir, "config", "user.name", "Fixture");
     await writeFile(join(aDir, "agent-work.txt"), "private work\n"); await git(aDir, "add", "."); await git(aDir, "commit", "-m", "agent work");
-    expect(await Bun.file(join(bDir, "agent-work.txt")).exists()).toBe(false);
-    expect(await Bun.file(join(store, "agent-work.txt")).exists()).toBe(false);
+    expect(await fileExists(join(bDir, "agent-work.txt"))).toBe(false);
+    expect(await fileExists(join(store, "agent-work.txt"))).toBe(false);
     expect(await git(aDir, "remote")).toBe("");
     expect(await git(bDir, "remote")).toBe("");
 
     await git(store, "config", "user.email", "operator@example.test"); await git(store, "config", "user.name", "Operator");
     await writeFile(join(store, "promoted.txt"), "operator promotion\n");
     await git(store, "add", "."); await git(store, "commit", "-m", "operator promotion");
-    expect(await Bun.file(join(bDir, "promoted.txt")).exists()).toBe(false);
-    expect(await Bun.file(join(aDir, "promoted.txt")).exists()).toBe(false);
+    expect(await fileExists(join(bDir, "promoted.txt"))).toBe(false);
+    expect(await fileExists(join(aDir, "promoted.txt"))).toBe(false);
     expect((await f.run("agent.remove", { agentId: a.id })).status).toBe("completed");
     expect(await readFile(join(aDir, "agent-work.txt"), "utf8")).toBe("private work\n");
   } finally { await f.cleanup(); }
@@ -149,7 +150,7 @@ test("agent MCP token lists and delegates local skills; authorization rejects un
     expect(childOp.status).toBe("completed");
     const child = childOp.result as AgentRecord;
     expect(states(child.settings)).toEqual({ alpha: "installed" });
-    expect(await Bun.file(join(installRoot(childCwd), "alpha/SKILL.md")).exists()).toBe(true);
+    expect(await fileExists(join(installRoot(childCwd), "alpha/SKILL.md"))).toBe(true);
 
     const denied = resultText(await mcp.callTool({ name: "modify_subagent", arguments: { agentId: child.id, settings: { extensions: { skills: { beta: "available" } } } } }));
     const deniedOp = await waitMcp(mcp, denied);
@@ -195,13 +196,13 @@ test("unsupported harness, missing installed checkout, corrupt launch environmen
     const missing = await f.run("agent.restart", { agentId: installed.id });
     expect(missing.status).toBe("failed");
     await rename(retainedCheckout, missingCheckout);
-    expect(await Bun.file(activeSkill).exists()).toBe(true); // Failure never destroys the agent copy.
+    expect(await fileExists(activeSkill)).toBe(true); // Failure never destroys the agent copy.
 
     await f.restart(false);
     expect((await f.client.request<any>("organization.snapshot")).capabilities.plugins.skills).toBeUndefined();
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: installed.id })).settings)).toEqual({ alpha: "installed" });
     const disabled = await f.run("agent.restart", { agentId: installed.id });
     expect(disabled.status).toBe("failed"); expect(disabled.error?.message).toMatch(/Enable the skills plugin/);
-    expect(await Bun.file(activeSkill).exists()).toBe(true);
+    expect(await fileExists(activeSkill)).toBe(true);
   } finally { await f.cleanup(); }
 });

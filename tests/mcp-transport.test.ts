@@ -1,4 +1,5 @@
-import { afterEach, expect, test } from "bun:test";
+import { fileExists, sleep } from "./helpers/runtime.ts";
+import { afterEach, expect, test } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +16,7 @@ const waitFor = async (predicate: () => boolean, timeout = 3_000) => {
   const start = Date.now();
   while (!predicate()) {
     if (Date.now() - start > timeout) throw new Error("Condition timed out");
-    await Bun.sleep(10);
+    await sleep(10);
   }
 };
 
@@ -53,7 +54,7 @@ async function createFixture(withSkills = true) {
     host.registerHarness({ name: "fixture", launch(context) {
       return {
         command: process.execPath,
-        args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")],
+        args: [join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")],
         cwd: context.agent.settings.cwd ?? process.cwd(),
         env: { ...process.env, ORG_SOCKET: context.socketPath, ORG_TOKEN: context.token },
         consumesEnv: ["AGENTORG_SKILL_FILES"],
@@ -98,7 +99,7 @@ async function createFixture(withSkills = true) {
   const runtime = (server.organization as any).runtimes.get(root.id);
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [join(import.meta.dir, "../../agentorg/src/mcp-bridge.ts")],
+    args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
     env: { ...(process.env as Record<string, string>), ORG_SOCKET: server.organization.socketPath, ORG_TOKEN: runtime.token },
   });
   const mcp = new Client({ name: "skills-transport-test", version: "1" });
@@ -108,7 +109,7 @@ async function createFixture(withSkills = true) {
     const runtime = (server.organization as any).runtimes.get(agentId);
     const peer = new Client({ name: "skills-transport-peer", version: "1" });
     await peer.connect(new StdioClientTransport({ command: process.execPath,
-      args: [join(import.meta.dir, "../../agentorg/src/mcp-bridge.ts")],
+      args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: server.organization.socketPath, ORG_TOKEN: runtime.token },
     }));
     mcpClients.push(peer);
@@ -150,8 +151,8 @@ test("disabling the skills plugin preserves installed selection and managed file
     const child = completed.result as AgentRecord;
     const alphaFile = join(installRoot(child.settings.cwd!), "alpha", "SKILL.md");
     const betaFile = join(installRoot(child.settings.cwd!), "beta", "SKILL.md");
-    expect(await Bun.file(alphaFile).exists()).toBe(true);
-    expect(await Bun.file(betaFile).exists()).toBe(true);
+    expect(await fileExists(alphaFile)).toBe(true);
+    expect(await fileExists(betaFile)).toBe(true);
 
     await f.mcp.close(); f.client.close(); await f.server.close();
     const disabled = await OrganizationServer.start({ dataDir: join(f.dir, "data"), socketPath: join(f.dir, "data/server.sock"), plugins: [f.harness] });
@@ -161,8 +162,8 @@ test("disabling the skills plugin preserves installed selection and managed file
     expect((await client.request<any>("organization.snapshot")).capabilities.plugins?.skills).toBeUndefined();
     const persisted = await client.request<AgentRecord>("agent.get", { agentId: child.id });
     expect(states(persisted.settings)).toEqual({ alpha: "installed", beta: "installed" });
-    expect(await Bun.file(alphaFile).exists()).toBe(true);
-    expect(await Bun.file(betaFile).exists()).toBe(true);
+    expect(await fileExists(alphaFile)).toBe(true);
+    expect(await fileExists(betaFile)).toBe(true);
   } finally { await f.mcp.close(); }
 });
 
@@ -222,7 +223,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect(completed.status).toBe("completed");
     const child = completed.result as AgentRecord;
     expect(states(child.settings)).toEqual({ alpha: "installed", beta: "available" });
-    expect(await Bun.file(join(installRoot(child.settings.cwd!), "alpha/SKILL.md")).exists()).toBe(true);
+    expect(await fileExists(join(installRoot(child.settings.cwd!), "alpha/SKILL.md"))).toBe(true);
 
     const omitted = await f.mcp.callTool({ name: "modify_subagent", arguments: { agentId: child.id, name: "retains-selection" } });
     expect(omitted.isError).not.toBe(true);
@@ -239,7 +240,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect(staleResult.status).toBe("failed");
     expect(staleResult.error?.code).toBe("CONFLICT");
     expect(states((await f.client.request<AgentRecord>("agent.get", { agentId: child.id })).settings)).toEqual({ alpha: "installed", beta: "available" });
-    expect(await Bun.file(join(installRoot(child.settings.cwd!), "alpha/SKILL.md")).exists()).toBe(true);
+    expect(await fileExists(join(installRoot(child.settings.cwd!), "alpha/SKILL.md"))).toBe(true);
 
     const replacement = await f.mcp.callTool({ name: "modify_subagent", arguments: {
       agentId: child.id, expectedRevision: retained.revision, settings: { extensions: { skills: { beta: "available" } } },
@@ -248,7 +249,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect((await waitThroughMcp(f.mcp, resultText(replacement))).status).toBe("completed");
     let current = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
     expect(states(current.settings)).toEqual({ beta: "available" });
-    expect(await Bun.file(join(installRoot(child.settings.cwd!), "alpha/SKILL.md")).exists()).toBe(true);
+    expect(await fileExists(join(installRoot(child.settings.cwd!), "alpha/SKILL.md"))).toBe(true);
 
     const denied = await f.mcp.callTool({ name: "modify_subagent", arguments: {
       agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: { gamma: "available" } } },
@@ -274,7 +275,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     current = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
     const betaManagedFile = join(installRoot(child.settings.cwd!), "beta", "SKILL.md");
     expect(states(current.settings)).toEqual({ beta: "installed" });
-    expect(await Bun.file(betaManagedFile).exists()).toBe(true);
+    expect(await fileExists(betaManagedFile)).toBe(true);
 
     const cleared = await f.mcp.callTool({ name: "modify_subagent", arguments: {
       agentId: child.id, expectedRevision: current.revision, settings: { extensions: { skills: {} } },
@@ -283,7 +284,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
     expect((await waitThroughMcp(f.mcp, resultText(cleared))).status).toBe("completed");
     current = await f.client.request<AgentRecord>("agent.get", { agentId: child.id });
     expect(states(current.settings)).toEqual({});
-    expect(await Bun.file(betaManagedFile).exists()).toBe(true);
+    expect(await fileExists(betaManagedFile)).toBe(true);
 
     const siblingOp = await f.mcp.callTool({ name: "create_subagent", arguments: {
       settings: { harness: "fixture", model: "test", cwd: join(f.workspace, "other") },
@@ -302,7 +303,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
 
     const invalidTransport = new StdioClientTransport({
       command: process.execPath,
-      args: [join(import.meta.dir, "../../agentorg/src/mcp-bridge.ts")],
+      args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: f.server.organization.socketPath, ORG_TOKEN: "forged-token" },
     });
     const invalidClient = new Client({ name: "invalid-capability-test", version: "1" });
@@ -312,7 +313,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
 
     const missingToken = new Client({ name: "missing-capability-test", version: "1" });
     await expect(missingToken.connect(new StdioClientTransport({
-      command: process.execPath, args: [join(import.meta.dir, "../../agentorg/src/mcp-bridge.ts")],
+      command: process.execPath, args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: f.server.organization.socketPath, ORG_TOKEN: undefined as any },
     }))).rejects.toThrow(/ORG_TOKEN|closed|exited/i);
 

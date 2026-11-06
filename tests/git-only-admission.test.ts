@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import { fileExists } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
+import { Database } from "../src/sqlite.ts";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,7 +20,7 @@ test("admission rejects valid non-Git skill directories before creating artifact
   });
   try {
     await expect(importer.import(fixture.path)).rejects.toMatchObject({ code: "UNSUPPORTED_SOURCE" });
-    expect(await Bun.file(join(central, "stage")).exists()).toBe(false);
+    expect(await fileExists(join(central, "stage"))).toBe(false);
     await gitWithTimeout(fixture.path, 10_000, "init");
     await gitWithTimeout(fixture.path, 10_000, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "add", "-A");
     await gitWithTimeout(fixture.path, 10_000, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "skill");

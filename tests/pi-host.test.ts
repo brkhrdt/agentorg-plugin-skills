@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { sleep, write, spawn, bundlePlugin } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,7 +13,7 @@ import { git } from "../src/git.ts";
 for (const mode of ["source", "compiled"] as const) test.skipIf(mode === "compiled" && !process.env.ORG_BINARY)(`${mode} host composes skills lifecycle and Pi explicit launch environment`, async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-pi-host-"));
   const dataDir = join(dir, "data"), cwd = join(dir, "work"), repo = join(dir, "repo");
-  let server: OrganizationServer | undefined, child: ReturnType<typeof Bun.spawn> | undefined, client: OrganizationClient | undefined;
+  let server: OrganizationServer | undefined, child: ReturnType<typeof spawn> | undefined, client: OrganizationClient | undefined;
   try {
     await mkdir(cwd); await mkdir(repo);
     await git(repo, "init", "--initial-branch=main"); await git(repo, "config", "user.email", "test@example.com"); await git(repo, "config", "user.name", "Test");
@@ -27,18 +28,18 @@ for (const mode of ["source", "compiled"] as const) test.skipIf(mode === "compil
       // Relocate the host, both plugins and native adapter; no source/module resolution at runtime.
       const binary = join(dir, "agentorg"); await copyFile(resolve(process.env.ORG_BINARY!), binary); await chmod(binary, 0o755);
       const pi = join(dir, "pi"); await mkdir(pi);
-      await copyFile(join(import.meta.dir, "../../agentorg-plugin-pi-agent/dist/index.js"), join(pi, "index.js"));
-      await copyFile(join(import.meta.dir, "../../agentorg-plugin-pi-agent/dist/pi-acp"), join(pi, "pi-acp")); await chmod(join(pi, "pi-acp"), 0o755);
-      const bundle = await Bun.build({ entrypoints: [join(import.meta.dir, "../src/index.ts")], target: "bun" }); expect(bundle.success).toBe(true);
-      await Bun.write(join(dir, "skills.js"), bundle.outputs[0]!);
+      await copyFile(join(import.meta.dirname, "../../agentorg-plugin-pi-agent/dist/index.js"), join(pi, "index.js"));
+      await copyFile(join(import.meta.dirname, "../../agentorg-plugin-pi-agent/dist/pi-acp"), join(pi, "pi-acp")); await chmod(join(pi, "pi-acp"), 0o755);
+      const builtBundle = await bundlePlugin(join(import.meta.dirname, "../src/index.ts")); expect(builtBundle.success).toBe(true);
+      await write(join(dir, "skills.js"), builtBundle.outputs[0]!);
       await writeFile(join(dir, "load.js"), `import {createSkillsPlugin} from './skills.js';export default createSkillsPlugin({home:${JSON.stringify(dir)}});`);
-      child = Bun.spawn([binary, "--data-dir", dataDir, "--plugin", join(pi, "index.js"), "--plugin", join(dir, "load.js")], { cwd: dir, stderr: "pipe", stdout: "ignore" });
+      child = spawn([binary, "--data-dir", dataDir, "--plugin", join(pi, "index.js"), "--plugin", join(dir, "load.js")], { cwd: dir, stderr: "pipe", stdout: "ignore" });
     }
-    for (let n = 0; n < 200 && !client; n++) { try { client = await OrganizationClient.connect(socket); } catch { await Bun.sleep(20); } }
+    for (let n = 0; n < 200 && !client; n++) { try { client = await OrganizationClient.connect(socket); } catch { await sleep(20); } }
     if (!client) throw new Error("Host failed to start");
-    for (let n = 0; n < 200; n++) { try { await client.request("organization.snapshot"); break; } catch (error: any) { if (error.code !== "NOT_READY") throw error; await Bun.sleep(20); } }
+    for (let n = 0; n < 200; n++) { try { await client.request("organization.snapshot"); break; } catch (error: any) { if (error.code !== "NOT_READY") throw error; await sleep(20); } }
     await client.request("skills.registerRepository", { source: repo });
-    const fakePi = join(import.meta.dir, "../../agentorg-plugin-pi-agent/tests/fixtures/fake-pi.ts");
+    const fakePi = join(import.meta.dirname, "../../agentorg-plugin-pi-agent/tests/fixtures/fake-pi.ts");
     const created = await client.wait(await client.request<Operation>("agent.create", { settings: { harness: "pi", model: "test-model", provider: "test-provider", cwd, options: { executable: fakePi }, extensions: { skills: { alpha: "installed" } } } }));
     expect(created.status, created.error?.message).toBe("completed");
     const agent = created.result as AgentRecord;

@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { spawnSync, commandExists } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import { createPiPlugin } from "../../agentorg-plugin-pi-agent/src/index.ts";
 import { createSkillsPlugin } from "../src/index.ts";
 
 // Real Pi, offline/dummy credentials, extension command only: no model calls.
-test.skipIf(!Bun.which("pi"))("a selected managed skill reaches Pi explicitly while organization MCP tools remain available", async () => {
+test.skipIf(!commandExists("pi"))("a selected managed skill reaches Pi explicitly while organization MCP tools remain available", async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-pi-e2e-"));
   let server: OrganizationServer | undefined;
   let client: OrganizationClient | undefined;
@@ -20,7 +21,7 @@ test.skipIf(!Bun.which("pi"))("a selected managed skill reaches Pi explicitly wh
     const skill = (name: string) => `---\nname: ${name}\ndescription: ${name} fixture\n---\nInstructions\n`;
     await writeFile(join(repository, "SKILL.md"), skill("explicit"));
     const git = (args: string[]) => {
-      const result = Bun.spawnSync({ cmd: ["git", ...args], cwd: repository, stdout: "pipe", stderr: "pipe" });
+      const result = spawnSync({ cmd: ["git", ...args], cwd: repository, stdout: "pipe", stderr: "pipe" });
       if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
     };
     git(["init", "--initial-branch=main"]); git(["config", "user.email", "test@example.com"]); git(["config", "user.name", "Test"]);

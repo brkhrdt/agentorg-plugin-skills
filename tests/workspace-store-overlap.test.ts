@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -41,8 +41,8 @@ async function restartWithStoreAtWorkspace(mode: "equal" | "containing") {
     socketPath,
     plugins: [
       createSkillHarnessPlugin({
-        bunExecutable: process.execPath,
-        consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"),
+        nodeExecutable: process.execPath,
+        consumerPath: join(import.meta.dirname, "fixtures/skill-consumer.ts"),
         proofPath: join(root, "proof.jsonl"),
       }),
       await createPlugin(home),

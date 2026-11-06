@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { fileExists, fileText, write } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
 import { join } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { installRoot } from "../src/index.ts";
@@ -31,20 +32,20 @@ test("agent clones are independent mutable Git repositories and deselection/rest
     expect(aOp.status).toBe("completed"); expect(bOp.status).toBe("completed");
     const a = aOp.result as any, aDir = join(installRoot(aCwd), "mutable"), bDir = join(installRoot(bCwd), "mutable"), store = catalog.record.path;
     await git(aDir, "config", "user.name", "Agent A"); await git(aDir, "config", "user.email", "a@example.invalid");
-    await Bun.write(join(aDir, "agent-private.txt"), "agent-owned"); await git(aDir, "add", "."); await git(aDir, "commit", "-m", "agent change");
-    expect(await Bun.file(join(bDir, "agent-private.txt")).exists()).toBe(false);
-    expect(await Bun.file(join(store, "agent-private.txt")).exists()).toBe(false);
+    await write(join(aDir, "agent-private.txt"), "agent-owned"); await git(aDir, "add", "."); await git(aDir, "commit", "-m", "agent change");
+    expect(await fileExists(join(bDir, "agent-private.txt"))).toBe(false);
+    expect(await fileExists(join(store, "agent-private.txt"))).toBe(false);
     expect(await git(aDir, "remote")).toBe(""); expect(await git(bDir, "remote")).toBe("");
 
     const cleared = await f.run("agent.modify", { agentId: a.id, settings: { extensions: { skills: {} } } });
     expect(cleared.status).toBe("completed");
-    expect(await Bun.file(join(aDir, "agent-private.txt")).text()).toBe("agent-owned");
+    expect(await fileText(join(aDir, "agent-private.txt"))).toBe("agent-owned");
     await f.restart();
-    expect(await Bun.file(join(aDir, "agent-private.txt")).text()).toBe("agent-owned");
+    expect(await fileText(join(aDir, "agent-private.txt"))).toBe("agent-owned");
     const movedCwd = join(f.workspace, "agent-a-new"); await mkdir(movedCwd);
     const moved = await f.run("agent.modify", { agentId: a.id, settings: { cwd: movedCwd, extensions: { skills: { mutable: "installed" } } } });
     expect(moved.status).toBe("completed");
-    expect(await Bun.file(join(aDir, "agent-private.txt")).text()).toBe("agent-owned");
-    expect(await Bun.file(join(installRoot(movedCwd), "mutable", "SKILL.md")).exists()).toBe(true);
+    expect(await fileText(join(aDir, "agent-private.txt"))).toBe("agent-owned");
+    expect(await fileExists(join(installRoot(movedCwd), "mutable", "SKILL.md"))).toBe(true);
   } finally { await f.cleanup(); }
 });

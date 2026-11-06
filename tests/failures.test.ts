@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { Organization } from "../../agentorg/src/organization.ts";
 import { join } from "node:path";
 import { createLocalSkillFixture } from "./helpers/local-skill.ts";

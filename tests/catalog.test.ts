@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { sourceIdentity } from "../src/catalog.ts";
 
 test("catalog source identities preserve Git keys and encode local paths unambiguously", () => {

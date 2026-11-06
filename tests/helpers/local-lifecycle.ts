@@ -17,11 +17,11 @@ export async function createLocalLifecycle(options: { disabled?: boolean; corrup
     host.registerHarness({ name: "skill-consumer", listModels: () => [{ provider: "fixture", id: "test" }], launch(context) {
       const files = JSON.parse(context.env.AGENTORG_SKILL_FILES ?? "[]");
       launches.set(context.agent.id, files);
-      return { command: process.execPath, args: [join(import.meta.dir, "../fixtures/skill-consumer.ts")], cwd: context.agent.settings.cwd ?? process.cwd(),
+      return { command: process.execPath, args: [join(import.meta.dirname, "../fixtures/skill-consumer.ts")], cwd: context.agent.settings.cwd ?? process.cwd(),
         env: { ...context.env }, consumesEnv: ["AGENTORG_SKILL_FILES"] };
     } });
     host.registerHarness({ name: "unsupported-skill-consumer", listModels: () => [{ provider: "fixture", id: "test" }], launch() {
-      return { command: process.execPath, args: [join(import.meta.dir, "../fixtures/skill-consumer.ts")] };
+      return { command: process.execPath, args: [join(import.meta.dirname, "../fixtures/skill-consumer.ts")] };
     } });
   } };
   const corrupt: ServerPlugin = { apiVersion: 1, name: "corrupt-skill-env", setup(host) {

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { classifyRepositoryLocator } from "../src/source-locator.ts";
 
 test.each([

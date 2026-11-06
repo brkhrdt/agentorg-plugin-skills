@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { commandExists } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
@@ -6,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // Runs the actual installed Pi CLI without a prompt, credentials or model/network calls.
-test.skipIf(!Bun.which("pi"))("Pi --no-skills retains explicit files and excludes ambient skills", async () => {
+test.skipIf(!commandExists("pi"))("Pi --no-skills retains explicit files and excludes ambient skills", async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-pi-"));
   await mkdir(join(dir, ".agents/skills/ambient"), { recursive: true });
   const skill = (name: string) => `---\nname: ${name}\ndescription: ${name} fixture\n---\nInstructions\n`;

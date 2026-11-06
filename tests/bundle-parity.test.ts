@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { write, bundlePlugin } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,7 +12,7 @@ import { createSkillsPlugin } from "../src/index.ts";
 const harness: ServerPlugin = { apiVersion: 1, name: "fixture", setup(host) {
   host.registerHarness({ name: "fixture", launch(context) {
     return { consumesEnv: ["AGENTORG_SKILL_FILES"], command: process.execPath,
-      args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")] };
+      args: [join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")] };
   } });
 } };
 
@@ -38,10 +39,10 @@ test("source and bundled plugin expose identical settings, capability and MCP co
   try {
     const sourceDir = join(dir, "source"), bundleDir = join(dir, "bundle");
     await mkdir(sourceDir); await mkdir(bundleDir);
-    const built = await Bun.build({ entrypoints: [resolve(import.meta.dir, "../src/index.ts")], target: "bun" });
-    expect(built.success, built.logs.map(log => log.message).join("\n")).toBe(true);
+    const builtBundle = await bundlePlugin(resolve(import.meta.dirname, "../src/index.ts"));
+    expect(builtBundle.success).toBe(true);
     const bundlePath = join(dir, "skills.js");
-    await Bun.write(bundlePath, built.outputs[0]!);
+    await write(bundlePath, builtBundle.outputs[0]!);
     const bundled = await import(pathToFileURL(bundlePath).href) as { createSkillsPlugin(options: { home: string }): ServerPlugin };
     const source = await observe(createSkillsPlugin({ home: sourceDir }), join(dir, "source-host"));
     const compiled = await observe(bundled.createSkillsPlugin({ home: bundleDir }), join(dir, "bundle-host"));

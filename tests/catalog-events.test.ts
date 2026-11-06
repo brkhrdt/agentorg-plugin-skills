@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { notifyAfterCatalogCommit } from "../src/catalog.ts";
 
 test("successful catalog notification emits once without reporting an error", () => {

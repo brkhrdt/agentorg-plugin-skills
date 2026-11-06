@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { validateSkillsConfig, skillsServerSettings, skillsStartupDefaults } from "../src/config.ts";
 import { ServerSettingsRegistry } from "../../agentorg/src/server-settings.ts";
 

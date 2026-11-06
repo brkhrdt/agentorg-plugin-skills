@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import { fileExists } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
+import { Database } from "../src/sqlite.ts";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -34,8 +35,8 @@ function options(root: string, dataDir: string, home: string, accessPaths: Array
     socketPath: join(dataDir, "org.sock"),
     plugins: [
       createSkillHarnessPlugin({
-        bunExecutable: process.execPath,
-        consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"),
+        nodeExecutable: process.execPath,
+        consumerPath: join(import.meta.dirname, "fixtures/skill-consumer.ts"),
         proofPath: join(root, "proof.jsonl"),
         accessPaths,
       }),
@@ -114,8 +115,8 @@ test("workspace-backed stores permit active cwd modification and spawned reads a
       const selected = await client.wait(await client.request<any>("agent.modify", { agentId: created.agentId, settings: { extensions: { skills: { "workspace-skill": "installed" } } } }));
       expect(selected.status, JSON.stringify(selected)).toBe("completed");
       const installed = join(cwd, ".agents", "skills", "workspace-skill");
-      expect(await Bun.file(join(dataDir, "skills.sqlite")).exists()).toBe(true);
-      expect(await Bun.file(join(cwd, "skills.sqlite")).exists()).toBe(false);
+      expect(await fileExists(join(dataDir, "skills.sqlite"))).toBe(true);
+      expect(await fileExists(join(cwd, "skills.sqlite"))).toBe(false);
       const launched = await client.wait(await client.request<any>("agent.restart", { agentId: created.agentId }));
       expect(launched.status, JSON.stringify(launched)).toBe("completed");
       await prompt("read installed skill");

@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import { OrganizationServer } from "../../agentorg/src/server.ts";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
 import { createPiPlugin } from "../../agentorg-plugin-pi-agent/src/index.ts";
@@ -19,8 +20,8 @@ try {
   await writeFile(join(repository, "SKILL.md"), "---\nname: live-proof\ndescription: Live proof skill\n---\nWhen asked to demonstrate this skill, read `proof.txt` and reply with its exact contents, with no other text.\n");
   await writeFile(join(repository, "proof.txt"), "LIVE_SKILL_PROOF_7f3d91");
   const git = (...args: string[]) => {
-    const result = Bun.spawnSync({ cmd: ["git", ...args], cwd: repository, stdout: "pipe", stderr: "pipe" });
-    if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+    try { execFileSync("git", args, { cwd: repository, stdio: "pipe" }); }
+    catch (error: any) { throw new Error(error.stderr?.toString() ?? error.message); }
   };
   git("init", "--initial-branch=main"); git("config", "user.name", "Demo"); git("config", "user.email", "demo@example.invalid");
   git("add", "."); git("commit", "-m", "skill");

@@ -20,15 +20,17 @@ Changing the store path does not copy or migrate repositories. Existing selectio
 
 ## Development and checks
 
-A live Pi demonstration (requires Pi CLI, provider OAuth/API credentials, and the configured `PI_PROVIDER`/`PI_MODEL`) is available as `bun scripts/live-pi-skill-demo.ts`. It creates a fresh temporary organization dataDir, commits a local skill repository, registers it, installs it into a real Pi-backed agent, and verifies the model follows the skill instruction.
+Development and runtime require Node.js 24 or newer (the plugin uses Node's built-in `node:sqlite`). Tests run under Vitest; builds use esbuild.
 
-From this feature copy:
+A live Pi demonstration (requires Pi CLI, provider OAuth/API credentials, and the configured `PI_PROVIDER`/`PI_MODEL`) is available as `node --experimental-strip-types scripts/live-pi-skill-demo.ts`. It creates a fresh temporary organization dataDir, commits a local skill repository, registers it, installs it into a real Pi-backed agent, and verifies the model follows the skill instruction.
+
+From this feature copy, using npm:
 
 ```sh
-bun install
-bun run check
-bun test
-bun run build
+npm install
+npm run check
+npm test
+npm run build
 ```
 
 The tests include local Git fixtures and do not require network access for primary coverage. The real Pi harness requires a configured Pi provider account for a model-mediated skill-use demonstration. No claim of a live model run should be inferred from unit tests.

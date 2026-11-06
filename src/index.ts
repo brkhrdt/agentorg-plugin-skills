@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database } from "./sqlite.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve, parse, relative, sep } from "node:path";

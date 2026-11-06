@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { skillsServerSettings, validateSkillsConfig } from "../src/config.ts";
 
 test("directory and bounded Git settings are public while seed configuration is retired", () => {

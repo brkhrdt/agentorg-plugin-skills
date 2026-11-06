@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import { fileExists } from "./helpers/runtime.ts";
+import { expect, test } from "vitest";
+import { Database } from "../src/sqlite.ts";
 import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,7 +58,7 @@ test("verified installed clone survives a store switch without catalog fallback"
   const dataDir = join(root, "data"), home = join(root, "home"), custom = join(root, "custom-store"), source = join(root, "source-skill"), cwd = join(root, "work");
   await mkdir(home); await mkdir(dataDir, { recursive: true }); await mkdir(cwd); await repository(source, "selected-skill");
   const proofPath = join(root, "proof.jsonl"), socketPath = join(dataDir, "org.sock");
-  const options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ bunExecutable: process.execPath, consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"), proofPath }), createSkillsPlugin({ home })] };
+  const options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ nodeExecutable: process.execPath, consumerPath: join(import.meta.dirname, "fixtures/skill-consumer.ts"), proofPath }), createSkillsPlugin({ home })] };
   let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
   try {
     server = await OrganizationServer.start(options); client = await OrganizationClient.connect(socketPath);
@@ -93,7 +94,7 @@ test("verified installed clone survives a store switch without catalog fallback"
     const cwdChange = await client.wait(await client.request<any>("agent.modify", { agentId: created.agentId, settings: { cwd: movedCwd } }));
     expect(cwdChange.status).toBe("failed");
     expect((await client.request<any>("agent.get", { agentId: created.agentId })).settings.cwd).toBe(cwd);
-    expect(await Bun.file(join(movedCwd, ".agents", "skills", "selected-skill")).exists()).toBe(false);
+    expect(await fileExists(join(movedCwd, ".agents", "skills", "selected-skill"))).toBe(false);
     await writeFile(markerPath, JSON.stringify({ ...JSON.parse(marker), generation: "tampered" }));
     client.close(); client = undefined; await server.close(); server = undefined;
     await expect(OrganizationServer.start(options)).rejects.toThrow(/Managed checkout identity mismatch/);
@@ -117,7 +118,7 @@ test("failed mutation compensation restores staged checkout and filesystem ident
   const failurePlugin = { apiVersion: 1 as const, name: "fail-install-apply", setup(host: any) {
     host.beforeMutation((context: any) => context.method === "agent.create" ? { apply() { throw new Error("forced post-install failure"); }, rollback() {}, committed() {} } : undefined);
   } };
-  const socketPath = join(dataDir, "org.sock"), options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ bunExecutable: process.execPath, consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home }), failurePlugin] };
+  const socketPath = join(dataDir, "org.sock"), options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ nodeExecutable: process.execPath, consumerPath: join(import.meta.dirname, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home }), failurePlugin] };
   let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
   try {
     server = await OrganizationServer.start(options); client = await OrganizationClient.connect(socketPath);
@@ -125,7 +126,7 @@ test("failed mutation compensation restores staged checkout and filesystem ident
     expect(failed.status).toBe("failed");
     expect(failed.error?.message).toContain("forced post-install failure");
     const destination = join(cwd, ".agents", "skills", "selected-skill");
-    expect(await Bun.file(destination).exists()).toBe(false);
+    expect(await fileExists(destination)).toBe(false);
     const db = new Database(join(dataDir, "skills.sqlite"));
     try {
       const row = db.query("SELECT data FROM installations").get() as { data: string };
@@ -143,7 +144,7 @@ test("legacy installation ledger rows without filesystem identity remain validat
   const root = await mkdtemp(join(tmpdir(), "skills-legacy-ledger-"));
   const dataDir = join(root, "data"), store = join(dataDir, "skills"), home = join(root, "home"), cwd = join(root, "work");
   await mkdir(store, { recursive: true }); await mkdir(home); await mkdir(cwd); await repository(join(store, "selected-skill"), "selected-skill");
-  const socketPath = join(dataDir, "org.sock"), options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ bunExecutable: process.execPath, consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home })] };
+  const socketPath = join(dataDir, "org.sock"), options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ nodeExecutable: process.execPath, consumerPath: join(import.meta.dirname, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home })] };
   let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
   try {
     server = await OrganizationServer.start(options); client = await OrganizationClient.connect(socketPath);
@@ -169,7 +170,7 @@ test("physical store relocation preserves catalog identity and agent-owned insta
   const root = await mkdtemp(join(tmpdir(), "skills-store-relocation-"));
   const dataDir = join(root, "data"), store = join(dataDir, "skills"), relocated = join(root, "relocated-store"), home = join(root, "home"), cwd = join(root, "work");
   await mkdir(store, { recursive: true }); await mkdir(home); await mkdir(cwd); await repository(join(store, "selected-skill"), "selected-skill");
-  const socketPath = join(dataDir, "org.sock"), options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ bunExecutable: process.execPath, consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home })] };
+  const socketPath = join(dataDir, "org.sock"), options = { dataDir, socketPath, plugins: [createSkillHarnessPlugin({ nodeExecutable: process.execPath, consumerPath: join(import.meta.dirname, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home })] };
   let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
   try {
     server = await OrganizationServer.start(options); client = await OrganizationClient.connect(socketPath);
@@ -203,7 +204,7 @@ test("custom store setting is restart-required and new root is scanned after res
   const dataDir = join(root, "data"), home = join(root, "home"), custom = join(root, "custom-store"), source = join(root, "source-skill"), workDir = join(root, "work");
   await mkdir(home); await mkdir(dataDir, { recursive: true }); await mkdir(workDir);
   await repository(source, "selected-skill");
-  const options = { dataDir, socketPath: join(dataDir, "org.sock"), plugins: [createSkillHarnessPlugin({ bunExecutable: process.execPath, consumerPath: join(import.meta.dir, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home })] };
+  const options = { dataDir, socketPath: join(dataDir, "org.sock"), plugins: [createSkillHarnessPlugin({ nodeExecutable: process.execPath, consumerPath: join(import.meta.dirname, "fixtures/skill-consumer.ts"), proofPath: join(root, "proof.jsonl") }), createSkillsPlugin({ home })] };
   let server: OrganizationServer | undefined, client: OrganizationClient | undefined;
   try {
     server = await OrganizationServer.start(options);

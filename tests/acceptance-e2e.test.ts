@@ -1,7 +1,8 @@
+import { fileExists, sleep } from "./helpers/runtime.ts";
 import { appendFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -17,7 +18,7 @@ const waitFor = async (check: () => boolean | Promise<boolean>, timeoutMs = 8_00
   const until = Date.now() + timeoutMs;
   while (!(await check())) {
     if (Date.now() >= until) throw new Error("Timed out waiting for end-to-end state");
-    await Bun.sleep(20);
+    await sleep(20);
   }
 };
 
@@ -35,7 +36,7 @@ test("TUI installs a registered Git skill, calls authenticated MCP, and leaves u
   const harness: ServerPlugin = { apiVersion: 1, name: "fixture", setup(host) {
     host.registerHarness({ name: "fixture", listModels: () => [{ provider: "fixture", id: "test" }], launch(context) {
       appendFileSync(launchLog, `${JSON.stringify({ files: JSON.parse(context.env.AGENTORG_SKILL_FILES ?? "[]"), token: context.token })}\n`);
-      return { command: process.execPath, args: [join(import.meta.dir, "../../agentorg/tests/fixtures/agent.ts")], consumesEnv: ["AGENTORG_SKILL_FILES"] };
+      return { command: process.execPath, args: [join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")], consumesEnv: ["AGENTORG_SKILL_FILES"] };
     } });
   } };
   const plugins = () => [harness, createSkillsPlugin({ home })];
@@ -63,7 +64,7 @@ test("TUI installs a registered Git skill, calls authenticated MCP, and leaves u
     });
     ui = terminalClient(socketPath, dir);
     await ui.visible("No active agents. Press n");
-    await Bun.sleep(250); // Let the asynchronous snapshot capability/catalog discovery finish.
+    await sleep(250); // Let the asynchronous snapshot capability/catalog discovery finish.
     ui.keys("n"); await ui.visible("Create agent · root");
     ui.keys("\r"); await ui.visible("Edit name"); ui.keys("\x15acceptance-worker\r"); await ui.visible("Create agent · root");
     ui.keys("\x1b[B\r"); await ui.visible("Select Agent"); await ui.visible("fixture"); ui.keys("\r"); await ui.visible("Create agent · root");
@@ -85,7 +86,7 @@ test("TUI installs a registered Git skill, calls authenticated MCP, and leaves u
     expect(agent.settings.extensions?.skills).toEqual({ alpha: "installed" });
     const activeSkill = join(installRoot(work), "alpha", "SKILL.md");
     expect(await readFile(activeSkill, "utf8")).toContain("Alpha local acceptance fixture");
-    await waitFor(() => Bun.file(launchLog).exists());
+    await waitFor(() => fileExists(launchLog));
     const launchRecords = () => readFile(launchLog, "utf8").then(text => text.trim().split("\n").map(line => JSON.parse(line)));
     const initialLaunch = (await launchRecords()).at(-1)!;
     expect(initialLaunch.files).toEqual([activeSkill]);
@@ -93,7 +94,7 @@ test("TUI installs a registered Git skill, calls authenticated MCP, and leaves u
 
     // Call through the real stdio MCP bridge with the live, agent-scoped token.
     const transport = new StdioClientTransport({ command: process.execPath,
-      args: [join(import.meta.dir, "../../agentorg/src/mcp-bridge.ts")],
+      args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: socketPath, ORG_TOKEN: initialLaunch.token },
     });
     mcp = new Client({ name: "skills-acceptance", version: "1" }); await mcp.connect(transport);
@@ -125,7 +126,7 @@ test("TUI installs a registered Git skill, calls authenticated MCP, and leaves u
     });
     expect(ui.screen()).toContain("acceptance-worker");
     await waitFor(async () => (await launchRecords()).at(-1)?.files.length === 0);
-    expect(await Bun.file(activeSkill).exists()).toBe(true);
+    expect(await fileExists(activeSkill)).toBe(true);
     expect(await readFile(userWork, "utf8")).toBe("keep this local work\n");
     const after = await admin.request<any>("skills.list");
     expect(after.skills).toHaveLength(1);
