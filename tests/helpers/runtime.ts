@@ -3,6 +3,14 @@ import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcess } fro
 import { build } from "esbuild";
 
 export const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+export function captureStream(stream: NodeJS.ReadableStream): Promise<string> {
+  return new Promise(resolve => {
+    const chunks: Buffer[] = [];
+    stream.on("data", chunk => chunks.push(Buffer.from(chunk)));
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    stream.on("error", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
 export async function fileExists(path: string) { try { await access(path); return true; } catch { return false; } }
 export const fileText = (path: string) => fsReadFile(path, "utf8");
 export const write = fsWriteFile;

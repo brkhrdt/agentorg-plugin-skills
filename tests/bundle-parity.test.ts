@@ -7,12 +7,13 @@ import { pathToFileURL } from "node:url";
 import { OrganizationServer } from "../../agentorg/src/server.ts";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
 import type { ServerPlugin } from "../../agentorg/src/plugin.ts";
+import { nodeTsxArgs } from "./helpers/node-tsx.ts";
 import { createSkillsPlugin } from "../src/index.ts";
 
 const harness: ServerPlugin = { apiVersion: 1, name: "fixture", setup(host) {
   host.registerHarness({ name: "fixture", launch(context) {
     return { consumesEnv: ["AGENTORG_SKILL_FILES"], command: process.execPath,
-      args: [join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")] };
+      args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")) };
   } });
 } };
 

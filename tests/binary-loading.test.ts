@@ -1,4 +1,4 @@
-import { fileExists, sleep, write, spawn, bundlePlugin } from "./helpers/runtime.ts";
+import { fileExists, sleep, write, spawn, bundlePlugin, captureStream } from "./helpers/runtime.ts";
 import { expect, test } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -41,13 +41,13 @@ export default { apiVersion: 1, name: "compiled-overlap", async setup(host) { ha
     const binary = resolve(process.env.ORG_BINARY ?? join(import.meta.dirname, "../../agentorg/dist/agentorg"));
     expect(await fileExists(binary)).toBe(true);
     child = spawn([binary, "--data-dir", dataDir, "--plugin", wrapper], { stdout: "ignore", stderr: "pipe" });
+    const stderrText = captureStream(child.stderr);
     for (let attempt = 0; attempt < 100 && !client; attempt++) {
       try { client = await OrganizationClient.connect(join(dataDir, "server.sock")); }
       catch { await sleep(20); }
     }
     if (!client) {
-      const stderr = child.stderr;
-      throw new Error(stderr && typeof stderr !== "number" ? await new Response(stderr).text() : "Compiled host did not open its socket");
+      throw new Error((await stderrText) || "Compiled host did not open its socket");
     }
     const created = await client.wait(await client.request<any>("agent.create", { settings: { harness: "skill-consumer", model: "test", cwd, extensions: { skills: { "binary-skill": "installed" } } } }));
     expect(created.status, JSON.stringify(created)).toBe("completed");
@@ -87,13 +87,13 @@ test("compiled host loads the separate skills module and exposes coded errors", 
     const binary = resolve(process.env.ORG_BINARY ?? join(import.meta.dirname, "../../agentorg/dist/agentorg"));
     expect(await fileExists(binary)).toBe(true);
     child = spawn([binary, "--data-dir", dataDir, "--plugin", wrapper], { stdout: "ignore", stderr: "pipe" });
+    const stderrText = captureStream(child.stderr);
     for (let attempt = 0; attempt < 100 && !client; attempt++) {
       try { client = await OrganizationClient.connect(join(dataDir, "server.sock")); }
       catch { await sleep(20); }
     }
     if (!client) {
-      const stderr = child!.stderr;
-      throw new Error(stderr && typeof stderr !== "number" ? await new Response(stderr).text() : "Compiled host did not open its socket");
+      throw new Error((await stderrText) || "Compiled host did not open its socket");
     }
     let snapshot: any;
     for (let attempt = 0; attempt < 100; attempt++) {

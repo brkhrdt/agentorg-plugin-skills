@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { OrganizationServer } from "../../agentorg/src/server.ts";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
 import type { AgentRecord } from "../../agentorg/src/types.ts";
+import { nodeTsxArgs } from "./helpers/node-tsx.ts";
 import type { ServerPlugin } from "../../agentorg/src/plugin.ts";
 import { terminalClient } from "../../agentorg-tui/tests/terminal.ts";
 import { createSkillsPlugin, installRoot } from "../src/index.ts";
@@ -36,7 +37,7 @@ test("TUI installs a registered Git skill, calls authenticated MCP, and leaves u
   const harness: ServerPlugin = { apiVersion: 1, name: "fixture", setup(host) {
     host.registerHarness({ name: "fixture", listModels: () => [{ provider: "fixture", id: "test" }], launch(context) {
       appendFileSync(launchLog, `${JSON.stringify({ files: JSON.parse(context.env.AGENTORG_SKILL_FILES ?? "[]"), token: context.token })}\n`);
-      return { command: process.execPath, args: [join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")], consumesEnv: ["AGENTORG_SKILL_FILES"] };
+      return { command: process.execPath, args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")), consumesEnv: ["AGENTORG_SKILL_FILES"] };
     } });
   } };
   const plugins = () => [harness, createSkillsPlugin({ home })];
@@ -94,7 +95,7 @@ test("TUI installs a registered Git skill, calls authenticated MCP, and leaves u
 
     // Call through the real stdio MCP bridge with the live, agent-scoped token.
     const transport = new StdioClientTransport({ command: process.execPath,
-      args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
+      args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")),
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: socketPath, ORG_TOKEN: initialLaunch.token },
     });
     mcp = new Client({ name: "skills-acceptance", version: "1" }); await mcp.connect(transport);

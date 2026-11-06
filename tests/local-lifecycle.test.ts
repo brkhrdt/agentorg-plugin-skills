@@ -5,13 +5,14 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { AgentRecord, Operation } from "../../agentorg/src/types.ts";
+import { nodeTsxArgs } from "./helpers/node-tsx.ts";
 import { installRoot, states, type Skill } from "../src/index.ts";
 import { git } from "../src/git.ts";
 import { createLocalLifecycle } from "./helpers/local-lifecycle.ts";
 
 const resultText = (result: any) => JSON.parse(result.content.find((item: any) => item.type === "text").text);
 async function connectMcp(f: Awaited<ReturnType<typeof createLocalLifecycle>>, agentId: string) {
-  const transport = new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
+  const transport = new StdioClientTransport({ command: process.execPath, args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")),
     env: { ...(process.env as Record<string, string>), ORG_SOCKET: f.socketPath, ORG_TOKEN: f.token(agentId) } });
   const client = new Client({ name: "local-skills-lifecycle", version: "1" });
   await client.connect(transport);

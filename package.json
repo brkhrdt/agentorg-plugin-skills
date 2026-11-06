@@ -26,6 +26,7 @@
     "vitest": "^3.2.4",
     "@xterm/headless": "^6.0.0",
     "agent-organization": "file:../agentorg",
+    "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }
 }

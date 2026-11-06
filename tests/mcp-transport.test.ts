@@ -9,6 +9,7 @@ import { OrganizationServer } from "../../agentorg/src/server.ts";
 import { OrganizationClient } from "../../agentorg/src/client.ts";
 import type { ServerPlugin } from "../../agentorg/src/plugin.ts";
 import type { AgentRecord, Operation } from "../../agentorg/src/types.ts";
+import { nodeTsxArgs } from "./helpers/node-tsx.ts";
 import { createSkillsPlugin, installRoot, states, type Skill } from "../src/index.ts";
 import { git } from "../src/git.ts";
 
@@ -54,7 +55,7 @@ async function createFixture(withSkills = true) {
     host.registerHarness({ name: "fixture", launch(context) {
       return {
         command: process.execPath,
-        args: [join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")],
+        args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/tests/fixtures/agent.ts")),
         cwd: context.agent.settings.cwd ?? process.cwd(),
         env: { ...process.env, ORG_SOCKET: context.socketPath, ORG_TOKEN: context.token },
         consumesEnv: ["AGENTORG_SKILL_FILES"],
@@ -99,7 +100,7 @@ async function createFixture(withSkills = true) {
   const runtime = (server.organization as any).runtimes.get(root.id);
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
+    args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")),
     env: { ...(process.env as Record<string, string>), ORG_SOCKET: server.organization.socketPath, ORG_TOKEN: runtime.token },
   });
   const mcp = new Client({ name: "skills-transport-test", version: "1" });
@@ -109,7 +110,7 @@ async function createFixture(withSkills = true) {
     const runtime = (server.organization as any).runtimes.get(agentId);
     const peer = new Client({ name: "skills-transport-peer", version: "1" });
     await peer.connect(new StdioClientTransport({ command: process.execPath,
-      args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
+      args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")),
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: server.organization.socketPath, ORG_TOKEN: runtime.token },
     }));
     mcpClients.push(peer);
@@ -303,7 +304,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
 
     const invalidTransport = new StdioClientTransport({
       command: process.execPath,
-      args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
+      args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")),
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: f.server.organization.socketPath, ORG_TOKEN: "forged-token" },
     });
     const invalidClient = new Client({ name: "invalid-capability-test", version: "1" });
@@ -313,7 +314,7 @@ test("authenticated MCP discovers skills tools, composes transformed schemas, an
 
     const missingToken = new Client({ name: "missing-capability-test", version: "1" });
     await expect(missingToken.connect(new StdioClientTransport({
-      command: process.execPath, args: [join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")],
+      command: process.execPath, args: nodeTsxArgs(join(import.meta.dirname, "../../agentorg/src/mcp-bridge.ts")),
       env: { ...(process.env as Record<string, string>), ORG_SOCKET: f.server.organization.socketPath, ORG_TOKEN: undefined as any },
     }))).rejects.toThrow(/ORG_TOKEN|closed|exited/i);
 
