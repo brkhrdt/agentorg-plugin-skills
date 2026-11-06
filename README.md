@@ -20,7 +20,7 @@ Changing the store path does not copy or migrate repositories. Existing selectio
 
 ## Development and checks
 
-Development and runtime require Node.js 24 or newer (the plugin uses Node's built-in `node:sqlite`). Tests run under Vitest; builds use esbuild.
+Development and runtime require Node.js 22.14 or newer. The plugin uses built-in `node:sqlite`, available in Node 22.14 but experimental in this release line (Node 24+ no longer emits the experimental warning). Tests run under Vitest; builds use esbuild.
 
 A live Pi demonstration (requires Pi CLI, provider OAuth/API credentials, and the configured `PI_PROVIDER`/`PI_MODEL`) is available as `node --experimental-strip-types scripts/live-pi-skill-demo.ts`. It creates a fresh temporary organization dataDir, commits a local skill repository, registers it, installs it into a real Pi-backed agent, and verifies the model follows the skill instruction.
 

@@ -2,7 +2,7 @@
   "name": "@agentorg/plugin-skills",
   "version": "0.1.0",
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": { "node": ">=22.14" },
   "exports": {
     ".": "./src/index.ts"
   },
