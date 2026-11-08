@@ -23,8 +23,9 @@ export function spawnSync(options: { cmd: string[]; cwd?: string; stdout?: strin
   const result = nodeSpawnSync(options.cmd[0]!, options.cmd.slice(1), { cwd: options.cwd, encoding: options.stdout === "pipe" ? "buffer" : undefined });
   return { ...result, exitCode: result.status, stdout: result.stdout, stderr: result.stderr };
 }
-export async function bundlePlugin(entrypoint: string) {
-  const result = await build({ entryPoints: [entrypoint], bundle: true, platform: "node", format: "esm", write: false });
+export async function bundlePlugin(entrypoint: string, includeRequireBanner = true) {
+  const result = await build({ entryPoints: [entrypoint], bundle: true, platform: "node", format: "esm", write: false,
+    ...(includeRequireBanner ? { banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" } } : {}) });
   return { success: true, outputs: result.outputFiles.map(file => file.contents) };
 }
 export const commandExists = (name: string) => {
