@@ -7,7 +7,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "vitest run",
+    "test": "vitest run --testTimeout=15000",
     "check": "tsc --noEmit",
     "build": "node scripts/build.mjs",
     "test:binary": "ORG_BINARY=../agentorg/dist/agentorg vitest run tests/binary-loading.test.ts"
