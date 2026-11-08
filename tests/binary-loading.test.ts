@@ -30,7 +30,7 @@ test("compiled core with bundled skills permits spawned reads from an overlappin
     const builtBundle = await bundlePlugin(resolve(import.meta.dirname, "../src/index.ts"));
     expect(builtBundle.success).toBe(true);
     const module = join(dir, "skills.js"); await write(module, builtBundle.outputs[0]!);
-    const wrapper = join(dir, "plugin.ts"), proofPath = join(dir, "proof.jsonl");
+    const wrapper = join(dir, "plugin.mjs"), proofPath = join(dir, "proof.jsonl");
     const harnessPath = resolve(import.meta.dirname, "./fixtures/skill-harness.ts");
     await writeFile(wrapper, `import { createSkillsPlugin } from ${JSON.stringify(module)};
 import { createSkillHarnessPlugin } from ${JSON.stringify(harnessPath)};
@@ -82,7 +82,7 @@ test("compiled host loads the separate skills module and exposes coded errors", 
     expect(builtBundle.success).toBe(true);
     const module = join(dir, 'skills.js');
     await write(module, builtBundle.outputs[0]!);
-    const wrapper = join(dir, "plugin.ts");
+    const wrapper = join(dir, "plugin.mjs");
     await writeFile(wrapper, `import {createSkillsPlugin} from ${JSON.stringify(module)}; export default createSkillsPlugin({home:${JSON.stringify(dir)}});`);
     const binary = resolve(process.env.ORG_BINARY ?? join(import.meta.dirname, "../../agentorg/dist/agentorg"));
     expect(await fileExists(binary)).toBe(true);
